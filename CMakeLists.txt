@@ -1,0 +1,106 @@
+cmake_minimum_required(VERSION 3.20)
+project(open-bambu-networking
+    VERSION 0.1.0
+    DESCRIPTION "Open-source replacement for Bambu Studio's bambu_networking plugin"
+    LANGUAGES CXX
+)
+
+# The plugin's reported version must have the same first-8-char prefix as
+# Bambu Studio's SLIC3R_VERSION. AppImage v02.05.02.51 expects prefix
+# "02.05.02"; source builds from the main branch currently expect "02.05.03".
+set(OBN_VERSION "02.05.02.99" CACHE STRING "Plugin version reported via bambu_network_get_version()")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Bambu Studio is built against libstdc++ new C++11 ABI; match it.
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Hide every symbol by default, explicitly export only the ABI functions via
+# __attribute__((visibility("default"))). Keeps the library slim and avoids
+# name clashes with Studio's own symbols.
+add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
+
+# --------------------------------------------------------------------------
+# libbambu_networking.so  (main plugin)
+# --------------------------------------------------------------------------
+
+add_library(bambu_networking SHARED
+    src/abi_meta.cpp
+    src/abi_lifecycle.cpp
+    src/abi_callbacks.cpp
+    src/abi_cloud.cpp
+    src/abi_lan.cpp
+    src/abi_user.cpp
+    src/abi_bind.cpp
+    src/abi_print.cpp
+    src/abi_presets.cpp
+    src/abi_http.cpp
+    src/abi_camera.cpp
+    src/abi_makerworld.cpp
+    src/abi_track.cpp
+    src/abi_ft.cpp
+    src/agent.cpp
+)
+
+target_include_directories(bambu_networking PRIVATE include)
+target_compile_definitions(bambu_networking PRIVATE
+    OBN_VERSION_STRING="${OBN_VERSION}"
+)
+
+# No "lib" prefix rename: output is literally "libbambu_networking.so"
+set_target_properties(bambu_networking PROPERTIES
+    OUTPUT_NAME "bambu_networking"
+    PREFIX      "lib"
+)
+
+# --------------------------------------------------------------------------
+# libBambuSource.so  (stub for camera; only needs to load)
+# --------------------------------------------------------------------------
+
+add_library(BambuSource SHARED stubs/BambuSource.cpp)
+set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
+
+# --------------------------------------------------------------------------
+# liblive555.so  (stub; used by the real BambuSource internally)
+# --------------------------------------------------------------------------
+
+add_library(live555 SHARED stubs/live555.cpp)
+set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
+
+# --------------------------------------------------------------------------
+# install (copies into <prefix>/plugins/)
+# --------------------------------------------------------------------------
+
+install(TARGETS bambu_networking BambuSource live555
+    LIBRARY DESTINATION plugins
+)
+
+# Studio's PresetUpdater expects this JSON to declare the cached version in
+# <data_dir>/ota/plugins/; we ship the same file so the updater trusts our
+# installation.
+configure_file(packaging/network_plugins.json.in
+    ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json
+    DESTINATION ota/plugins)
+
+# --------------------------------------------------------------------------
+# tests (compiled only if BUILD_TESTING is on)
+# --------------------------------------------------------------------------
+
+option(OBN_BUILD_TESTS "Build smoke tests" ON)
+if(OBN_BUILD_TESTS)
+    enable_testing()
+    add_executable(probe_plugin tests/probe_plugin.cpp)
+    target_include_directories(probe_plugin PRIVATE include)
+    target_link_libraries(probe_plugin PRIVATE dl)
+    add_test(NAME plugin_symbols
+        COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
+endif()
