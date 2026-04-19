@@ -127,6 +127,22 @@ public:
     // port 2021. Returns true if the listener is running after the call.
     bool start_discovery(bool enable, bool sending);
 
+    // Implements bambu_network_start_local_print: upload the .3mf over
+    // FTPS to the printer's storage, then publish a `project_file`
+    // command over the active LAN MQTT session. Runs synchronously on the
+    // caller's thread - Studio invokes this from its PrintJob worker.
+    // Returns BAMBU_NETWORK_* code; on failure stage == PrintingStageERROR.
+    int run_local_print_job(const BBL::PrintParams&   params,
+                            BBL::OnUpdateStatusFn     update_fn,
+                            BBL::WasCancelledFn       cancel_fn);
+
+    // Implements bambu_network_start_send_gcode_to_sdcard: upload only,
+    // no MQTT command. Used by Studio's access-code probe and by
+    // "Send to printer without starting a print".
+    int run_send_gcode_to_sdcard(const BBL::PrintParams& params,
+                                 BBL::OnUpdateStatusFn   update_fn,
+                                 BBL::WasCancelledFn     cancel_fn);
+
     // -----------------------------
     // Accessors used by stub returns.
     // -----------------------------

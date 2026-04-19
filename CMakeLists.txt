@@ -53,9 +53,11 @@ add_library(bambu_networking SHARED
     src/abi_ft.cpp
     src/agent.cpp
     src/cert_store.cpp
+    src/ftps.cpp
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
+    src/print_job.cpp
     src/ssdp.cpp
 )
 
@@ -125,6 +127,12 @@ if(OBN_BUILD_TESTS)
         src/log.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
+
+    add_executable(ftps_live_test tests/ftps_live_test.cpp
+        src/ftps.cpp
+        src/log.cpp)
+    target_include_directories(ftps_live_test PRIVATE include)
+    target_link_libraries(ftps_live_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp

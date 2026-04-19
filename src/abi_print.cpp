@@ -44,29 +44,27 @@ OBN_ABI int bambu_network_start_local_print_with_record(void* /*agent*/,
     return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
 }
 
-OBN_ABI int bambu_network_start_send_gcode_to_sdcard(void* /*agent*/,
+OBN_ABI int bambu_network_start_send_gcode_to_sdcard(void* agent,
                                                      BBL::PrintParams      params,
                                                      BBL::OnUpdateStatusFn update_fn,
-                                                     BBL::WasCancelledFn   /*cancel_fn*/,
+                                                     BBL::WasCancelledFn   cancel_fn,
                                                      BBL::OnWaitFn         /*wait_fn*/)
 {
     log_print_params("start_send_gcode_to_sdcard", params);
-    if (update_fn) update_fn(BBL::PrintingStageERROR,
-                             BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                             "obn: start_send_gcode_to_sdcard not implemented");
-    return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return a->run_send_gcode_to_sdcard(params, update_fn, cancel_fn);
 }
 
-OBN_ABI int bambu_network_start_local_print(void* /*agent*/,
+OBN_ABI int bambu_network_start_local_print(void* agent,
                                             BBL::PrintParams      params,
                                             BBL::OnUpdateStatusFn update_fn,
-                                            BBL::WasCancelledFn   /*cancel_fn*/)
+                                            BBL::WasCancelledFn   cancel_fn)
 {
     log_print_params("start_local_print", params);
-    if (update_fn) update_fn(BBL::PrintingStageERROR,
-                             BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                             "obn: start_local_print not implemented");
-    return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return a->run_local_print_job(params, update_fn, cancel_fn);
 }
 
 OBN_ABI int bambu_network_start_sdcard_print(void* /*agent*/,
