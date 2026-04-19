@@ -1,0 +1,192 @@
+#include "obn/log.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+#include <string>
+#include <strings.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+namespace obn::log {
+
+namespace {
+
+struct State {
+    std::mutex mu;
+    FILE*      fp          = nullptr;
+    bool       echo_stderr = true;
+    bool       explicit_path = false; // OBN_LOG_FILE set by user
+    Level      level       = LVL_DEBUG;
+    bool       initialized = false;
+};
+
+State& state()
+{
+    static State s;
+    return s;
+}
+
+Level parse_level(const char* s)
+{
+    if (!s || !*s) return LVL_DEBUG;
+    if (!::strcasecmp(s, "trace")) return LVL_TRACE;
+    if (!::strcasecmp(s, "debug")) return LVL_DEBUG;
+    if (!::strcasecmp(s, "info"))  return LVL_INFO;
+    if (!::strcasecmp(s, "warn"))  return LVL_WARN;
+    if (!::strcasecmp(s, "warning")) return LVL_WARN;
+    if (!::strcasecmp(s, "error")) return LVL_ERROR;
+    if (!::strcasecmp(s, "off"))   return LVL_OFF;
+    return LVL_DEBUG;
+}
+
+const char* level_name(Level l)
+{
+    switch (l) {
+    case LVL_TRACE: return "TRC";
+    case LVL_DEBUG: return "DBG";
+    case LVL_INFO:  return "INF";
+    case LVL_WARN:  return "WRN";
+    case LVL_ERROR: return "ERR";
+    default:        return "OFF";
+    }
+}
+
+// Must be called with State::mu held.
+void open_file_locked(State& s, const std::string& path)
+{
+    if (s.fp && s.fp != stderr) std::fclose(s.fp);
+    s.fp = std::fopen(path.c_str(), "a");
+    if (s.fp) {
+        std::setvbuf(s.fp, nullptr, _IOLBF, 4096);
+    }
+}
+
+void ensure_initialized_locked(State& s)
+{
+    if (s.initialized) return;
+    s.initialized = true;
+
+    if (const char* lv = std::getenv("OBN_LOG_LEVEL"))
+        s.level = parse_level(lv);
+
+    if (const char* e = std::getenv("OBN_LOG_STDERR"))
+        s.echo_stderr = !(e[0] == '0' && e[1] == '\0');
+
+    if (const char* p = std::getenv("OBN_LOG_FILE")) {
+        s.explicit_path = true;
+        if (*p) open_file_locked(s, p);
+    } else {
+        // Fallback path if Studio never calls configure_from_log_dir() or
+        // calls it with an empty string (e.g. when we run stand-alone tests).
+        open_file_locked(s, "/tmp/obn.log");
+    }
+}
+
+long tid()
+{
+    return static_cast<long>(::syscall(SYS_gettid));
+}
+
+void format_timestamp(char* buf, std::size_t n)
+{
+    using namespace std::chrono;
+    auto        now  = system_clock::now();
+    auto        tt   = system_clock::to_time_t(now);
+    auto        us   = duration_cast<microseconds>(now.time_since_epoch()).count() % 1'000'000;
+    std::tm     tm{};
+    ::localtime_r(&tt, &tm);
+    std::snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                  tm.tm_hour, tm.tm_min, tm.tm_sec,
+                  static_cast<long long>(us));
+}
+
+} // namespace
+
+void configure_from_log_dir(const std::string& log_dir)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    ensure_initialized_locked(s);
+    if (s.explicit_path || log_dir.empty()) return;
+    std::string path = log_dir;
+    if (path.back() != '/') path += '/';
+    path += "obn.log";
+    open_file_locked(s, path);
+    // Note: we do not log the switch here to avoid recursion.
+}
+
+Level threshold()
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    ensure_initialized_locked(s);
+    return s.level;
+}
+
+void emit(Level lvl, const char* file, int line, const char* func, const char* fmt, ...)
+{
+    auto& s = state();
+    char  ts[64];
+    format_timestamp(ts, sizeof(ts));
+
+    // Format the user message into a stack buffer; fall back to heap if it
+    // doesn't fit (rare).
+    char  small[1024];
+    char* msg     = small;
+    int   msg_len = 0;
+    {
+        va_list ap;
+        va_start(ap, fmt);
+        va_list ap2;
+        va_copy(ap2, ap);
+        msg_len = std::vsnprintf(small, sizeof(small), fmt, ap);
+        va_end(ap);
+        if (msg_len >= static_cast<int>(sizeof(small))) {
+            msg = static_cast<char*>(std::malloc(msg_len + 1));
+            if (msg) std::vsnprintf(msg, msg_len + 1, fmt, ap2);
+            else     msg = small;
+        }
+        va_end(ap2);
+    }
+
+    // File location: trim to basename to keep lines short.
+    const char* base = file;
+    if (file) {
+        for (const char* p = file; *p; ++p) if (*p == '/') base = p + 1;
+    }
+
+    std::lock_guard<std::mutex> lk(s.mu);
+    ensure_initialized_locked(s);
+
+    auto write_to = [&](FILE* f) {
+        if (!f) return;
+        std::fprintf(f, "%s [%3s] [%ld] %s:%d %s: %s\n",
+                     ts, level_name(lvl), tid(), base, line, func, msg);
+    };
+    write_to(s.fp);
+    if (s.echo_stderr) write_to(stderr);
+
+    if (msg != small) std::free(msg);
+}
+
+std::string redact(const std::string& in, std::size_t max_chars)
+{
+    std::string out;
+    out.reserve(std::min(in.size(), max_chars) + 3);
+    for (std::size_t i = 0; i < in.size() && i < max_chars; ++i) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        out.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.');
+    }
+    if (in.size() > max_chars) out += "...";
+    return out;
+}
+
+} // namespace obn::log

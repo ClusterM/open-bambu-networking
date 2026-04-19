@@ -3,21 +3,25 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/log.hpp"
 
 using obn::as_agent;
 
-OBN_ABI int bambu_network_change_user(void* /*agent*/, std::string /*user_info*/)
+OBN_ABI int bambu_network_change_user(void* /*agent*/, std::string user_info)
 {
+    OBN_INFO("change_user info_len=%zu", user_info.size());
     return BAMBU_NETWORK_SUCCESS;
 }
 
 OBN_ABI bool bambu_network_is_user_login(void* /*agent*/)
 {
+    OBN_TRACE("is_user_login -> false");
     return false;
 }
 
-OBN_ABI int bambu_network_user_logout(void* /*agent*/, bool /*request*/)
+OBN_ABI int bambu_network_user_logout(void* /*agent*/, bool request)
 {
+    OBN_INFO("user_logout request=%d", request);
     return BAMBU_NETWORK_SUCCESS;
 }
 

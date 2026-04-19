@@ -5,6 +5,17 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/log.hpp"
+
+// Forward declaration only: BBLModelTask is defined in Bambu Studio's
+// DeviceManager.hpp. We never dereference the pointer; we just need the type
+// name to match Studio's std::function<void(BBLModelTask*)> template
+// instantiation exactly. Getting the template parameter wrong is NOT merely
+// a style issue - std::function's type-erased invoker expects arguments at
+// specific offsets/layouts, and a mismatched instantiation silently
+// reinterprets (e.g.) an int as a pointer, which is how PID 459153 died
+// with SIGBUS inside StatusPanel::update_model_info.
+class BBLModelTask;
 
 using obn::as_agent;
 
@@ -39,11 +50,16 @@ OBN_ABI int bambu_network_get_model_publish_url(void* /*agent*/, std::string* ur
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_subtask(void*        /*agent*/,
-                                      void*        /*task*/,
-                                      std::function<void(int, std::string)> cb)
+OBN_ABI int bambu_network_get_subtask(void*          /*agent*/,
+                                      BBLModelTask*  task,
+                                      std::function<void(BBLModelTask*)> cb)
 {
-    if (cb) cb(-1, std::string{});
+    // Cloud-only endpoint: in LAN mode there is no subtask/model-task record
+    // to fetch. Do NOT invoke the callback with a fake pointer - the caller
+    // (StatusPanel::update_model_info) dereferences subtask->task_id
+    // unconditionally and would SIGBUS/SIGSEGV on any non-mappable address.
+    OBN_DEBUG("get_subtask task=%p cb=%d (stub: no callback)", (void*)task, cb ? 1 : 0);
+    (void)cb;
     return BAMBU_NETWORK_SUCCESS;
 }
 

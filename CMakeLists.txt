@@ -32,6 +32,9 @@ add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
 # libbambu_networking.so  (main plugin)
 # --------------------------------------------------------------------------
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
+
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
     src/abi_lifecycle.cpp
@@ -48,12 +51,16 @@ add_library(bambu_networking SHARED
     src/abi_track.cpp
     src/abi_ft.cpp
     src/agent.cpp
+    src/lan_session.cpp
+    src/log.cpp
+    src/mqtt_client.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include)
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
 )
+target_link_libraries(bambu_networking PRIVATE PkgConfig::MOSQUITTO)
 
 # No "lib" prefix rename: output is literally "libbambu_networking.so"
 set_target_properties(bambu_networking PROPERTIES
@@ -103,4 +110,19 @@ if(OBN_BUILD_TESTS)
     target_link_libraries(probe_plugin PRIVATE dl)
     add_test(NAME plugin_symbols
         COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
+
+    # Live test: skipped unless OBN_PRINTER_IP etc. are exported when ctest
+    # runs. Links against the same library as the plugin so it can exercise
+    # obn::Agent directly.
+    add_executable(lan_live_test tests/lan_live_test.cpp
+        src/agent.cpp
+        src/lan_session.cpp
+        src/log.cpp
+        src/mqtt_client.cpp)
+    target_include_directories(lan_live_test PRIVATE include)
+    target_compile_definitions(lan_live_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+    )
+    target_link_libraries(lan_live_test PRIVATE PkgConfig::MOSQUITTO)
+    add_test(NAME lan_live COMMAND lan_live_test)
 endif()

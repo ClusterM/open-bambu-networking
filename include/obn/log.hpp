@@ -1,0 +1,64 @@
+#pragma once
+
+#include <cstdarg>
+#include <cstdio>
+#include <string>
+
+// Minimal printf-style logger shared by all ABI implementations. Goals:
+//   * zero runtime dependencies beyond libc;
+//   * always-on (no macro stripping in release) so a deployed plugin can be
+//     diagnosed in-field by tailing a file;
+//   * thread-safe - mosquitto calls us on a background thread, Studio calls
+//     us on the main thread, and they often interleave.
+//
+// Configuration happens at first use through environment variables:
+//   OBN_LOG_FILE    path to log file. Default: <log_dir>/obn.log where
+//                   log_dir is whatever Studio passes to create_agent, or
+//                   /tmp/obn.log as a last resort.
+//   OBN_LOG_LEVEL   trace | debug | info | warn | error (default: debug).
+//   OBN_LOG_STDERR  0|1 (default: 1) - also echo to stderr.
+//
+// The logger intentionally leaks a static singleton: the plugin is unloaded
+// together with the process, so there is no cleanup hazard.
+
+namespace obn::log {
+
+enum Level : int {
+    LVL_TRACE = 0,
+    LVL_DEBUG = 1,
+    LVL_INFO  = 2,
+    LVL_WARN  = 3,
+    LVL_ERROR = 4,
+    LVL_OFF   = 5,
+};
+
+// Sets the log file path. Called from bambu_network_create_agent once Studio
+// gives us a log directory. Safe to call multiple times; no-op if
+// OBN_LOG_FILE was set explicitly via env.
+void configure_from_log_dir(const std::string& log_dir);
+
+// Low-level emitter. Use the OBN_* macros below instead of calling directly.
+void emit(Level lvl, const char* file, int line, const char* func, const char* fmt, ...)
+    __attribute__((format(printf, 5, 6)));
+
+// Current threshold, used by macros to skip argument evaluation when muted.
+Level threshold();
+
+// Truncates/sanitises a potentially secret-bearing string for safe logging.
+// Returns up to `max_chars` characters with any non-printable byte replaced
+// by '.'. Caller-owned std::string, so it is safe to use inside %s.
+std::string redact(const std::string& in, std::size_t max_chars = 40);
+
+} // namespace obn::log
+
+#define OBN_LOG_IMPL(lvl, ...)                                                  \
+    do {                                                                        \
+        if (::obn::log::threshold() <= (lvl))                                   \
+            ::obn::log::emit((lvl), __FILE__, __LINE__, __func__, __VA_ARGS__); \
+    } while (0)
+
+#define OBN_TRACE(...) OBN_LOG_IMPL(::obn::log::LVL_TRACE, __VA_ARGS__)
+#define OBN_DEBUG(...) OBN_LOG_IMPL(::obn::log::LVL_DEBUG, __VA_ARGS__)
+#define OBN_INFO(...)  OBN_LOG_IMPL(::obn::log::LVL_INFO,  __VA_ARGS__)
+#define OBN_WARN(...)  OBN_LOG_IMPL(::obn::log::LVL_WARN,  __VA_ARGS__)
+#define OBN_ERROR(...) OBN_LOG_IMPL(::obn::log::LVL_ERROR, __VA_ARGS__)

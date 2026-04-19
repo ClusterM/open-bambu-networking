@@ -2,10 +2,114 @@
 
 #include <utility>
 
+#include "obn/bambu_networking.hpp"
+#include "obn/log.hpp"
+
 namespace obn {
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent() = default;
+
+int Agent::connect_printer(std::string dev_id,
+                           std::string dev_ip,
+                           std::string username,
+                           std::string password,
+                           bool        use_ssl)
+{
+    // Studio calls connect_printer() again when the user switches to a
+    // different printer or re-enters the access code. Tear down any prior
+    // session cleanly so we don't leak MQTT threads.
+    {
+        std::unique_ptr<LanSession> prev;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            prev = std::move(lan_session_);
+        }
+        // prev.reset() happens outside the lock; destructor joins the MQTT
+        // loop thread which may call back into notify_local_connected under
+        // mu_.
+    }
+
+    auto session = std::make_unique<LanSession>(std::move(dev_id),
+                                                std::move(dev_ip),
+                                                std::move(username),
+                                                std::move(password),
+                                                use_ssl);
+
+    std::string sess_dev_id = session->dev_id();
+
+    int rc = session->start(
+        [this, sess_dev_id](int status, std::string msg) {
+            notify_local_connected(status, sess_dev_id, msg);
+        },
+        [this](std::string d, std::string json) {
+            notify_local_message(d, json);
+        });
+
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        std::lock_guard<std::mutex> lk(mu_);
+        lan_session_ = std::move(session);
+    }
+    return rc;
+}
+
+int Agent::disconnect_printer()
+{
+    std::unique_ptr<LanSession> session;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        session = std::move(lan_session_);
+    }
+    if (session) session->disconnect();
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+int Agent::send_message_to_printer(const std::string& dev_id,
+                                   const std::string& json_str,
+                                   int                qos)
+{
+    LanSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id)
+            session = lan_session_.get();
+    }
+    if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return session->publish_json(json_str, qos);
+}
+
+void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
+{
+    BBL::OnLocalConnectedFn cb;
+    BBL::QueueOnMainFn      queue;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cb    = on_local_connect_;
+        queue = queue_on_main_;
+    }
+    OBN_DEBUG("notify_local_connected status=%d dev=%s msg=%s cb=%d queued=%d",
+              status, dev_id.c_str(), msg.c_str(), cb ? 1 : 0, queue ? 1 : 0);
+    if (!cb) return;
+    auto invoke = [cb, status, dev_id, msg]() { cb(status, dev_id, msg); };
+    if (queue) queue(invoke);
+    else       invoke();
+}
+
+void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
+{
+    BBL::OnMessageFn cb;
+    {
+        // Per Studio's NetworkAgent wiring, local MQTT report messages go to
+        // on_local_message_. We intentionally do not marshal through
+        // queue_on_main_ here: DeviceManager.cpp does its own thread hop
+        // based on the JSON content (some update paths are fast-path).
+        std::lock_guard<std::mutex> lk(mu_);
+        cb = on_local_message_;
+    }
+    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d",
+              dev_id.c_str(), json.size(), cb ? 1 : 0);
+    if (cb) cb(dev_id, json);
+}
 
 void Agent::set_config_dir(std::string dir)
 {

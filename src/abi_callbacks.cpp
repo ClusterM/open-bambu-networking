@@ -1,6 +1,7 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/log.hpp"
 
 using obn::Agent;
 using obn::as_agent;
@@ -8,6 +9,7 @@ using obn::as_agent;
 #define OBN_CB_EXPORT(sym, method, cb_t)                            \
     OBN_ABI int sym(void* agent, BBL::cb_t fn)                      \
     {                                                               \
+        OBN_DEBUG(#sym " set=%d", fn ? 1 : 0);                      \
         if (auto* a = as_agent(agent)) {                            \
             a->method(std::move(fn));                               \
             return BAMBU_NETWORK_SUCCESS;                           \

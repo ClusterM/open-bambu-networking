@@ -10,6 +10,51 @@
 #include "obn/bambu_networking.hpp"
 
 namespace obn {
+namespace mqtt { class Client; }
+
+// Per-printer LAN MQTT session. Studio only holds one such connection at a
+// time (multi-printer LAN view is a future extension), so Agent owns a single
+// LanSession and tears it down before opening a new one.
+class LanSession {
+public:
+    LanSession(std::string dev_id,
+               std::string dev_ip,
+               std::string username,
+               std::string password,
+               bool        use_ssl);
+    ~LanSession();
+
+    LanSession(const LanSession&)            = delete;
+    LanSession& operator=(const LanSession&) = delete;
+
+    // Dispatches its two callbacks on the MQTT network thread; the receiver
+    // is responsible for queueing UI updates through Agent::queue_on_main.
+    using ConnectedCb = std::function<void(int status /*ConnectStatus*/, std::string msg)>;
+    using MessageCb   = std::function<void(std::string dev_id, std::string json)>;
+
+    // Starts the MQTT connection asynchronously and returns once loop_start
+    // succeeds. Returns a BAMBU_NETWORK_ERR_* code.
+    int start(ConnectedCb on_connected, MessageCb on_message);
+
+    int publish_json(const std::string& json_str, int qos);
+    int disconnect();
+
+    const std::string& dev_id() const { return dev_id_; }
+
+private:
+    std::string report_topic_() const;
+    std::string request_topic_() const;
+
+    std::string dev_id_;
+    std::string dev_ip_;
+    std::string username_;
+    std::string password_;
+    bool        use_ssl_;
+
+    std::unique_ptr<mqtt::Client> client_;
+    ConnectedCb                   on_connected_;
+    MessageCb                     on_message_;
+};
 
 // The Agent object is created per Studio call to bambu_network_create_agent().
 // For now it is an inert carrier for registered callbacks and configuration:
@@ -54,12 +99,31 @@ public:
     void set_server_callback(BBL::OnServerErrFn fn);
 
     // -----------------------------
+    // LAN printer session (one at a time).
+    // -----------------------------
+    int  connect_printer(std::string dev_id,
+                         std::string dev_ip,
+                         std::string username,
+                         std::string password,
+                         bool        use_ssl);
+    int  disconnect_printer();
+    int  send_message_to_printer(const std::string& dev_id,
+                                 const std::string& json_str,
+                                 int                qos);
+
+    // -----------------------------
     // Accessors used by stub returns.
     // -----------------------------
     std::string country_code() const;
     std::string log_dir() const { return log_dir_; }
     std::string config_dir() const;
     std::string user_selected_machine() const;
+
+    // Invoked by LanSession from the MQTT network thread. Marshals the call
+    // through queue_on_main_ when Studio registered one, so status callbacks
+    // reach the Studio UI thread safely.
+    void notify_local_connected(int status, const std::string& dev_id, const std::string& msg);
+    void notify_local_message(const std::string& dev_id, const std::string& json);
 
 private:
     mutable std::mutex mu_;
@@ -70,6 +134,8 @@ private:
     std::string        country_code_{"US"};
     std::string        user_selected_machine_;
     std::map<std::string, std::string> extra_http_headers_;
+
+    std::unique_ptr<LanSession> lan_session_;
 
     // Callbacks - stored, not (yet) invoked.
     BBL::OnMsgArrivedFn       on_ssdp_msg_{};
