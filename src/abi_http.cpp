@@ -1,9 +1,14 @@
 #include <map>
+#include <sstream>
 #include <string>
 
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/cloud_auth.hpp"
+#include "obn/http_client.hpp"
+#include "obn/json_lite.hpp"
+#include "obn/log.hpp"
 
 using obn::as_agent;
 
@@ -38,12 +43,119 @@ OBN_ABI int bambu_network_check_user_task_report(void* /*agent*/, int* task_id, 
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_user_print_info(void* /*agent*/,
+namespace {
+
+// Serialize a json_lite value back to compact JSON text. We only need
+// this for the pass-through "whatever was in the server's device
+// entry" payload; json::Value::dump() does the heavy lifting for us.
+std::string dump_or_null(const obn::json::Value& v)
+{
+    return v.is_null() ? std::string{"null"} : v.dump();
+}
+
+// The Bambu cloud returns device-bind info at
+//   GET /v1/iot-service/api/user/bind
+// with body shape:
+//   { "devices":[{
+//       "dev_id":"22E8BJ610801473",
+//       "name":"3Д принтерик",
+//       "online":true,
+//       "print_status":"SUCCESS",
+//       "dev_model_name":"N7-V2",
+//       "dev_product_name":"P2S",
+//       "dev_access_code":"03f06755",
+//       ... }]}
+// Studio's DeviceManager::parse_user_print_info however reads slightly
+// different field names - {dev_name, dev_online, task_status}. We
+// translate here so Studio's parser finds everything. Pass-through
+// fields that Studio doesn't care about (print_job, nozzle_diameter,
+// dev_structure...) are preserved verbatim in case anything else on
+// the Studio side picks them up.
+std::string remap_bind_payload(const std::string& raw_body)
+{
+    std::string perr;
+    auto root = obn::json::parse(raw_body, &perr);
+    if (!root) {
+        OBN_WARN("get_user_print_info: bad JSON from server: %s", perr.c_str());
+        return R"({"devices":[]})";
+    }
+
+    std::ostringstream out;
+    out << "{\"message\":\"success\",\"devices\":[";
+    // Copy the devices array out of the temporary Value to avoid
+    // dangling reference (as_array() returns a reference to storage
+    // owned by the temporary returned from find()).
+    auto devs_v = root->find("devices");
+    const auto& devs = devs_v.as_array();
+    bool first = true;
+    for (const auto& d : devs) {
+        if (!first) out << ',';
+        first = false;
+        out << '{';
+        // Required by Studio's parser.
+        out << "\"dev_id\":"          << obn::json::escape(d.find("dev_id").as_string()) << ',';
+        out << "\"dev_name\":"        << obn::json::escape(d.find("name").as_string()) << ',';
+        out << "\"dev_online\":"      << (d.find("online").as_bool() ? "true" : "false") << ',';
+        out << "\"dev_model_name\":"  << obn::json::escape(d.find("dev_model_name").as_string()) << ',';
+        out << "\"task_status\":"     << obn::json::escape(d.find("print_status").as_string()) << ',';
+        out << "\"dev_access_code\":" << obn::json::escape(d.find("dev_access_code").as_string());
+        // Pass-through extras; Studio code paths occasionally look them up.
+        if (auto v = d.find("dev_product_name"); !v.is_null())
+            out << ",\"dev_product_name\":" << obn::json::escape(v.as_string());
+        if (auto v = d.find("print_job"); !v.is_null())
+            out << ",\"print_job\":" << dump_or_null(v);
+        if (auto v = d.find("nozzle_diameter"); !v.is_null())
+            out << ",\"nozzle_diameter\":" << dump_or_null(v);
+        if (auto v = d.find("dev_structure"); !v.is_null())
+            out << ",\"dev_structure\":" << obn::json::escape(v.as_string());
+        out << '}';
+    }
+    out << "]}";
+    return out.str();
+}
+
+} // namespace
+
+OBN_ABI int bambu_network_get_user_print_info(void* agent,
                                               unsigned int* http_code, std::string* http_body)
 {
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
-    return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        OBN_WARN("get_user_print_info: no access token");
+        return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+                          + "/v1/iot-service/api/user/bind";
+    std::map<std::string, std::string> hdrs{
+        {"Authorization", "Bearer " + s.access_token},
+    };
+
+    auto resp = obn::http::get_json(url, hdrs);
+    if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
+
+    if (!resp.error.empty()) {
+        OBN_WARN("get_user_print_info: transport: %s", resp.error.c_str());
+        if (http_body) *http_body = resp.body;
+        return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+    }
+    if (resp.status_code != 200) {
+        OBN_WARN("get_user_print_info: HTTP %ld body=%s",
+                 resp.status_code, resp.body.c_str());
+        if (http_body) *http_body = resp.body;
+        return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
+    }
+
+    std::string mapped = remap_bind_payload(resp.body);
+    OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes",
+             resp.body.size(), mapped.size());
+    if (http_body) *http_body = std::move(mapped);
+    return BAMBU_NETWORK_SUCCESS;
 }
 
 OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,

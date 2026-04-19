@@ -130,7 +130,15 @@ OBN_ABI int bambu_network_get_model_mall_rating(void* /*agent*/,
 OBN_ABI int bambu_network_get_mw_user_preference(void* /*agent*/,
                                                  std::function<void(std::string)> cb)
 {
-    if (cb) cb("{}");
+    // CRITICAL: Studio expects a JSON with a numeric `recommendStatus`
+    // field. It reads it as `int nRecommendStatus = jPrefer["recommendStatus"]`
+    // inside a CallAfter lambda (WebViewDialog.cpp, SendDesignStaffpick).
+    // If the field is missing, nlohmann::json converts null -> int and
+    // throws type_error, which propagates out of the queued lambda
+    // (past Studio's outer try/catch) and aborts the whole process via
+    // wxApp::OnUnhandledException. We answer with 0 so Studio takes the
+    // "default staff pick" branch and never looks at a null.
+    if (cb) cb("{\"recommendStatus\":0}");
     return BAMBU_NETWORK_SUCCESS;
 }
 

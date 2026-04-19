@@ -6,6 +6,8 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
+#include "obn/cloud_auth.hpp"
+#include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/ssdp.hpp"
 
@@ -127,8 +129,19 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
 
 void Agent::set_config_dir(std::string dir)
 {
-    std::lock_guard<std::mutex> lk(mu_);
-    config_dir_ = std::move(dir);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        config_dir_ = std::move(dir);
+    }
+    // Swap the auth store to a real on-disk file as soon as Studio
+    // tells us where to keep it. Studio calls set_config_dir() exactly
+    // once during plugin init, before any user-facing ABI.
+    std::string cfg = config_dir();
+    if (!cfg.empty()) {
+        auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
+        auth_store_->load();
+        hydrate_session();
+    }
 }
 
 void Agent::set_cert_file(std::string folder, std::string filename)
@@ -336,5 +349,98 @@ OBN_SETTER(set_queue_on_main_fn,        queue_on_main_,        BBL::QueueOnMainF
 OBN_SETTER(set_server_callback,         server_err_,           BBL::OnServerErrFn)
 
 #undef OBN_SETTER
+
+// --------------------------------------------------------------------------
+// Cloud user session.
+// --------------------------------------------------------------------------
+
+std::string Agent::cloud_region() const
+{
+    std::string cc = country_code();
+    return cc == "CN" ? "CN" : "GLOBAL";
+}
+
+bool Agent::user_logged_in() const
+{
+    return auth_store_ && auth_store_->snapshot().logged_in();
+}
+
+int Agent::apply_login_info(const std::string& login_info_json)
+{
+    if (!auth_store_) {
+        OBN_WARN("apply_login_info: config_dir not set yet; dropping");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    std::string perr;
+    auto root = obn::json::parse(login_info_json, &perr);
+    if (!root) {
+        OBN_WARN("apply_login_info: bad JSON: %s", perr.c_str());
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    obn::auth::Session s = auth_store_->snapshot();
+    s.region        = cloud_region();
+    s.access_token  = root->find("accessToken").as_string();
+    if (auto rt = root->find("refreshToken").as_string(); !rt.empty())
+        s.refresh_token = rt;
+    if (auto ac = root->find("account").as_string(); !ac.empty())
+        s.account = ac;
+    auto expires_in = root->find("expiresIn").as_int(0);
+    s.expires_at = std::chrono::system_clock::now() +
+                   std::chrono::seconds(expires_in > 0 ? expires_in : 3 * 30 * 24 * 3600);
+
+    if (s.access_token.empty()) {
+        OBN_WARN("apply_login_info: no accessToken in payload");
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    auth_store_->set(s);
+
+    // Fire-and-forget profile fetch so get_user_id/name/avatar return
+    // something real the next time Studio asks. Synchronous but fast.
+    auto prof = obn::cloud::get_profile(s.region, s.access_token);
+    if (prof.ok) {
+        auth_store_->update_profile(prof.user_id, prof.user_name,
+                                    prof.nick_name, prof.avatar);
+        OBN_INFO("change_user: hello %s (uid=%s)",
+                 prof.user_name.empty() ? prof.nick_name.c_str() : prof.user_name.c_str(),
+                 prof.user_id.c_str());
+    } else {
+        OBN_WARN("change_user: profile fetch failed: %s", prof.error_message.c_str());
+    }
+
+    if (auto cb = [this]() { std::lock_guard<std::mutex> lk(mu_); return on_user_login_; }())
+        cb(0, "ok");
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+void Agent::clear_session()
+{
+    if (auth_store_) auth_store_->clear();
+    if (auto cb = [this]() { std::lock_guard<std::mutex> lk(mu_); return on_user_login_; }())
+        cb(1, "logout");
+}
+
+void Agent::hydrate_session()
+{
+    if (!auth_store_) return;
+    auto s = auth_store_->snapshot();
+    if (!s.logged_in()) return;
+    if (!auth_store_->needs_refresh()) {
+        OBN_INFO("cloud: session for %s still fresh", s.account.c_str());
+        return;
+    }
+    if (s.refresh_token.empty()) {
+        OBN_WARN("cloud: stored session expired and no refresh_token; ignore it");
+        return;
+    }
+    auto r = obn::cloud::refresh_token(s.region, s.refresh_token);
+    if (!r.ok) {
+        OBN_WARN("cloud: refresh failed: %s", r.error_message.c_str());
+        return;
+    }
+    auth_store_->update_tokens(r.access_token,
+                               r.refresh_token.empty() ? s.refresh_token : r.refresh_token,
+                               std::chrono::seconds(r.expires_in > 0 ? r.expires_in : 3 * 30 * 24 * 3600));
+    OBN_INFO("cloud: access_token refreshed for %s", s.account.c_str());
+}
 
 } // namespace obn

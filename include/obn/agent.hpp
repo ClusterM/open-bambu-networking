@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "obn/auth.hpp"
 #include "obn/bambu_networking.hpp"
 
 namespace obn {
@@ -163,6 +164,31 @@ public:
     void notify_local_connected(int status, const std::string& dev_id, const std::string& msg);
     void notify_local_message(const std::string& dev_id, const std::string& json);
 
+    // -----------------------------
+    // Cloud user session.
+    // -----------------------------
+    // Accept a login_info JSON (the same body the Bambu cloud returns
+    // from /user/login). Extracts tokens + profile fields, stores them
+    // under <config_dir>/obn.auth.json. Returns 0 on success.
+    int apply_login_info(const std::string& login_info_json);
+
+    // Forget the current session and delete the persisted file.
+    void clear_session();
+
+    // Consult the disk-backed store and, if the refresh token is fresh
+    // enough, perform a silent refresh so the next HTTP call has a
+    // valid Bearer. Called on Agent construction.
+    void hydrate_session();
+
+    bool        user_logged_in() const;
+    obn::auth::Session user_session_snapshot() const
+    {
+        return auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
+    }
+
+    // Human-readable region identifier used by cloud endpoints.
+    std::string cloud_region() const;
+
 private:
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -175,6 +201,10 @@ private:
 
     std::unique_ptr<LanSession> lan_session_;
     std::unique_ptr<ssdp::Discovery> discovery_;
+
+    // Holds the cloud session (tokens + profile). Lazily populated from
+    // <config_dir>/obn.auth.json as soon as config_dir_ is set.
+    std::unique_ptr<obn::auth::Store> auth_store_;
 
     // Tracks which printers we've already snapshotted a server cert for in
     // the current process. Keyed by dev_id. Studio's refresh timer calls

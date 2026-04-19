@@ -34,6 +34,7 @@ add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
+pkg_check_modules(CURL     REQUIRED IMPORTED_TARGET libcurl)
 find_package(OpenSSL REQUIRED)
 
 add_library(bambu_networking SHARED
@@ -52,8 +53,12 @@ add_library(bambu_networking SHARED
     src/abi_track.cpp
     src/abi_ft.cpp
     src/agent.cpp
+    src/auth.cpp
     src/cert_store.cpp
+    src/cloud_auth.cpp
     src/ftps.cpp
+    src/http_client.cpp
+    src/json_lite.cpp
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
@@ -67,6 +72,7 @@ target_compile_definitions(bambu_networking PRIVATE
 )
 target_link_libraries(bambu_networking PRIVATE
     PkgConfig::MOSQUITTO
+    PkgConfig::CURL
     OpenSSL::SSL
     OpenSSL::Crypto
 )
@@ -98,6 +104,30 @@ set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
 install(TARGETS bambu_networking BambuSource live555
     LIBRARY DESTINATION plugins
 )
+
+# --------------------------------------------------------------------------
+# obn-login (CLI helper for offline sign-in with email/password)
+# --------------------------------------------------------------------------
+
+add_executable(obn_login
+    tools/obn_login.cpp
+    src/auth.cpp
+    src/cloud_auth.cpp
+    src/http_client.cpp
+    src/json_lite.cpp
+    src/log.cpp
+)
+target_include_directories(obn_login PRIVATE include)
+target_compile_definitions(obn_login PRIVATE
+    OBN_VERSION_STRING="${OBN_VERSION}"
+)
+target_link_libraries(obn_login PRIVATE
+    PkgConfig::CURL
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+set_target_properties(obn_login PROPERTIES OUTPUT_NAME "obn-login")
+install(TARGETS obn_login RUNTIME DESTINATION bin)
 
 # Studio's PresetUpdater expects this JSON to declare the cached version in
 # <data_dir>/ota/plugins/; we ship the same file so the updater trusts our
@@ -136,7 +166,11 @@ if(OBN_BUILD_TESTS)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
+        src/auth.cpp
         src/cert_store.cpp
+        src/cloud_auth.cpp
+        src/http_client.cpp
+        src/json_lite.cpp
         src/lan_session.cpp
         src/log.cpp
         src/mqtt_client.cpp
@@ -147,6 +181,7 @@ if(OBN_BUILD_TESTS)
     )
     target_link_libraries(lan_live_test PRIVATE
         PkgConfig::MOSQUITTO
+        PkgConfig::CURL
         OpenSSL::SSL
         OpenSSL::Crypto
     )
