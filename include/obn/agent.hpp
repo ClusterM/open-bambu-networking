@@ -122,6 +122,11 @@ public:
     // printer's self-signed server certificate into <config_dir>/certs/.
     void install_device_cert(const std::string& dev_id, bool lan_only);
 
+    // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
+    // printers advertise themselves once every ~5 s via a UDP broadcast on
+    // port 2021. Returns true if the listener is running after the call.
+    bool start_discovery(bool enable, bool sending);
+
     // -----------------------------
     // Accessors used by stub returns.
     // -----------------------------
@@ -153,6 +158,7 @@ private:
     std::map<std::string, std::string> extra_http_headers_;
 
     std::unique_ptr<LanSession> lan_session_;
+    std::unique_ptr<ssdp::Discovery> discovery_;
 
     // Tracks which printers we've already snapshotted a server cert for in
     // the current process. Keyed by dev_id. Studio's refresh timer calls

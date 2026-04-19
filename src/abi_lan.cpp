@@ -75,8 +75,10 @@ OBN_ABI void bambu_network_install_device_cert(void* agent,
     a->install_device_cert(dev_id, lan_only);
 }
 
-OBN_ABI bool bambu_network_start_discovery(void* /*agent*/, bool start, bool sending)
+OBN_ABI bool bambu_network_start_discovery(void* agent, bool start, bool sending)
 {
-    OBN_INFO("start_discovery start=%d sending=%d", start, sending);
-    return false;
+    OBN_DEBUG("bambu_network_start_discovery start=%d sending=%d", start, sending);
+    auto* a = as_agent(agent);
+    if (!a) return false;
+    return a->start_discovery(start, sending);
 }

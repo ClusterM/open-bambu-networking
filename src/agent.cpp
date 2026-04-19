@@ -7,11 +7,12 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/log.hpp"
+#include "obn/ssdp.hpp"
 
 namespace obn {
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
-Agent::~Agent() = default;
+Agent::~Agent() { if (discovery_) discovery_->stop(); }
 
 int Agent::connect_printer(std::string dev_id,
                            std::string dev_ip,
@@ -203,6 +204,57 @@ std::string Agent::user_selected_machine() const
 {
     std::lock_guard<std::mutex> lk(mu_);
     return user_selected_machine_;
+}
+
+bool Agent::start_discovery(bool enable, bool sending)
+{
+    OBN_INFO("start_discovery enable=%d sending=%d", enable, sending);
+
+    // The existing Discovery is held under mu_; we capture the callback
+    // outside the lock to avoid holding it across the socket syscall.
+    if (!enable) {
+        std::unique_ptr<ssdp::Discovery> d;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            d = std::move(discovery_);
+        }
+        if (d) d->stop();
+        return false;
+    }
+
+    BBL::OnMsgArrivedFn cb;
+    BBL::QueueOnMainFn  queue;
+    ssdp::Discovery*    d_ptr = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!discovery_) discovery_ = std::make_unique<ssdp::Discovery>();
+        d_ptr = discovery_.get();
+        cb    = on_ssdp_msg_;
+        queue = queue_on_main_;
+    }
+
+    // All SSDP messages are trampolined through queue_on_main_ so that
+    // Studio's DeviceManager::on_machine_alive() mutates the UI-owned
+    // machine list only on the main thread. Without this we eventually
+    // race on_machine_alive against wx's own rendering and crash under
+    // high packet rates.
+    auto on_msg = [this](std::string json) {
+        BBL::OnMsgArrivedFn local_cb;
+        BBL::QueueOnMainFn  local_queue;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            local_cb    = on_ssdp_msg_;
+            local_queue = queue_on_main_;
+        }
+        if (!local_cb) return;
+        auto invoke = [local_cb, json = std::move(json)]() mutable {
+            local_cb(std::move(json));
+        };
+        if (local_queue) local_queue(invoke);
+        else             invoke();
+    };
+
+    return d_ptr->start(2021, std::move(on_msg));
 }
 
 void Agent::install_device_cert(const std::string& dev_id, bool lan_only)

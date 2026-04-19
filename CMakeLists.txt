@@ -56,6 +56,7 @@ add_library(bambu_networking SHARED
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
+    src/ssdp.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include)
@@ -120,12 +121,18 @@ if(OBN_BUILD_TESTS)
     # Live test: skipped unless OBN_PRINTER_IP etc. are exported when ctest
     # runs. Links against the same library as the plugin so it can exercise
     # obn::Agent directly.
+    add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
+        src/log.cpp
+        src/ssdp.cpp)
+    target_include_directories(ssdp_listener_test PRIVATE include)
+
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/cert_store.cpp
         src/lan_session.cpp
         src/log.cpp
-        src/mqtt_client.cpp)
+        src/mqtt_client.cpp
+        src/ssdp.cpp)
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
