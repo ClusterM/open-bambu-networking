@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 
 namespace obn {
 namespace mqtt { class Client; }
+namespace ssdp { class Discovery; }
 
 // Per-printer LAN MQTT session. Studio only holds one such connection at a
 // time (multi-printer LAN view is a future extension), so Agent owns a single
@@ -21,7 +23,8 @@ public:
                std::string dev_ip,
                std::string username,
                std::string password,
-               bool        use_ssl);
+               bool        use_ssl,
+               std::string ca_file);
     ~LanSession();
 
     LanSession(const LanSession&)            = delete;
@@ -40,6 +43,7 @@ public:
     int disconnect();
 
     const std::string& dev_id() const { return dev_id_; }
+    const std::string& dev_ip() const { return dev_ip_; }
 
 private:
     std::string report_topic_() const;
@@ -50,6 +54,7 @@ private:
     std::string username_;
     std::string password_;
     bool        use_ssl_;
+    std::string ca_file_;
 
     std::unique_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
@@ -111,12 +116,24 @@ public:
                                  const std::string& json_str,
                                  int                qos);
 
+    // Studio calls this every ~1 s from its refresh timer, plus once right
+    // after on_printer_connected_fn. We only do real work the first time a
+    // given `dev_id` is seen (and only in lan_only mode for now): capture the
+    // printer's self-signed server certificate into <config_dir>/certs/.
+    void install_device_cert(const std::string& dev_id, bool lan_only);
+
     // -----------------------------
     // Accessors used by stub returns.
     // -----------------------------
     std::string country_code() const;
     std::string log_dir() const { return log_dir_; }
     std::string config_dir() const;
+    std::string cert_folder() const;
+    std::string cert_filename() const;
+    // Returns "<cert_folder>/printer.cer" if the file exists, otherwise "".
+    // Used as the CA trust store for LAN MQTT so we can validate the chain
+    // the same way Bambu's own plugin does.
+    std::string bambu_ca_bundle_path() const;
     std::string user_selected_machine() const;
 
     // Invoked by LanSession from the MQTT network thread. Marshals the call
@@ -136,6 +153,12 @@ private:
     std::map<std::string, std::string> extra_http_headers_;
 
     std::unique_ptr<LanSession> lan_session_;
+
+    // Tracks which printers we've already snapshotted a server cert for in
+    // the current process. Keyed by dev_id. Studio's refresh timer calls
+    // install_device_cert() ~1 Hz, and we don't want to pound the printer
+    // with a fresh TLS handshake every tick.
+    std::set<std::string> certified_devs_;
 
     // Callbacks - stored, not (yet) invoked.
     BBL::OnMsgArrivedFn       on_ssdp_msg_{};

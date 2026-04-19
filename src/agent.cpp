@@ -1,8 +1,11 @@
 #include "obn/agent.hpp"
 
+#include <sys/stat.h>
+
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
+#include "obn/cert_store.hpp"
 #include "obn/log.hpp"
 
 namespace obn {
@@ -30,11 +33,21 @@ int Agent::connect_printer(std::string dev_id,
         // mu_.
     }
 
+    // Clearing the certified-devices cache so that if Studio re-binds to the
+    // same printer (e.g. after a firmware reboot or an access-code change)
+    // we snapshot its cert again on the very next install_device_cert() tick.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        certified_devs_.clear();
+    }
+
+    std::string ca_file = bambu_ca_bundle_path();
     auto session = std::make_unique<LanSession>(std::move(dev_id),
                                                 std::move(dev_ip),
                                                 std::move(username),
                                                 std::move(password),
-                                                use_ssl);
+                                                use_ssl,
+                                                std::move(ca_file));
 
     std::string sess_dev_id = session->dev_id();
 
@@ -154,10 +167,99 @@ std::string Agent::config_dir() const
     return config_dir_;
 }
 
+std::string Agent::cert_folder() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return cert_folder_;
+}
+
+std::string Agent::cert_filename() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return cert_filename_;
+}
+
+std::string Agent::bambu_ca_bundle_path() const
+{
+    std::string folder;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        folder = cert_folder_;
+    }
+    if (folder.empty()) return {};
+    if (folder.back() == '/') folder.pop_back();
+    // Studio ships two cert files in resources/cert/:
+    //   slicer_base64.cer  - RapidSSL leaf for *.bambulab.com (cloud only)
+    //   printer.cer        - BBL Root/Intermediate CA bundle that signs the
+    //                        printer's device cert (CN=<serial>, issuer=
+    //                        BBL Device CA N7-V2). This one is what we want.
+    std::string path = folder + "/printer.cer";
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) return path;
+    return {};
+}
+
 std::string Agent::user_selected_machine() const
 {
     std::lock_guard<std::mutex> lk(mu_);
     return user_selected_machine_;
+}
+
+void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
+{
+    // Studio calls this ~1 Hz from DeviceManagerRefresher::on_timer in
+    // addition to once right after on_printer_connected_fn. We deduplicate so
+    // that the printer only sees one extra TLS handshake per session.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!certified_devs_.insert(dev_id).second) {
+            // Already captured earlier this session - nothing more to do.
+            return;
+        }
+    }
+
+    if (!lan_only) {
+        // Cloud / hybrid mode: Bambu's own plugin fetches the device-
+        // specific MQTT tunnel cert from MakerWorld here. We don't have
+        // cloud auth plumbed in yet (phases 4-5), so log and bail cleanly.
+        OBN_DEBUG("install_device_cert dev=%s lan_only=0, cloud cert fetch deferred to phase 4", dev_id.c_str());
+        return;
+    }
+
+    // Grab the IP of the currently-open LAN session (if it matches dev_id).
+    // install_device_cert can technically be called for a device we haven't
+    // opened an MQTT connection to yet; in that case there's nothing to
+    // snapshot.
+    std::string ip;
+    std::string cfg_dir;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id)
+            ip = lan_session_->dev_ip();
+        cfg_dir = config_dir_;
+    }
+    if (ip.empty()) {
+        OBN_DEBUG("install_device_cert dev=%s: no active LAN session, skipping", dev_id.c_str());
+        // Put it back so we retry on the next tick.
+        std::lock_guard<std::mutex> lk(mu_);
+        certified_devs_.erase(dev_id);
+        return;
+    }
+    if (cfg_dir.empty()) {
+        OBN_WARN("install_device_cert dev=%s: config_dir not set", dev_id.c_str());
+        return;
+    }
+
+    std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+    OBN_INFO("install_device_cert dev=%s ip=%s: snapshotting to %s",
+             dev_id.c_str(), ip.c_str(), out_path.c_str());
+    bool ok = cert_store::capture_peer_cert_pem(ip, 8883, /*timeout_ms=*/3000, out_path);
+    if (!ok) {
+        OBN_WARN("install_device_cert dev=%s: snapshot failed", dev_id.c_str());
+        // Don't poison the cache - allow a retry on the next tick.
+        std::lock_guard<std::mutex> lk(mu_);
+        certified_devs_.erase(dev_id);
+    }
 }
 
 #define OBN_SETTER(method, field, type)                 \

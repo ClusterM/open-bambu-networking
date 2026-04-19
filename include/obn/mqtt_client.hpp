@@ -16,9 +16,15 @@ struct ConnectConfig {
     std::string username;
     std::string password;
     bool        use_tls      = true;
-    // Bambu printers ship self-signed certs; skip chain/hostname verification
-    // the same way Bambu's own plugin and the Python paho-based reference
-    // clients do.
+    // Optional path to a PEM file used as the trust anchor for chain
+    // verification. For LAN mode this should point at Studio's
+    // resources/cert/printer.cer (the BBL Root/Intermediate CA bundle). If
+    // empty, peer verification is disabled entirely (fallback for non-
+    // standard installs where the bundle is missing).
+    std::string ca_file;
+    // Skip hostname verification. Printers' certs use the serial number
+    // (e.g. CN=22E8BJ610801473) as the CN, and Studio connects by IP, so
+    // hostname checks never match. Kept even when ca_file is set.
     bool        tls_insecure = true;
     int         keepalive_s  = 60;
     std::string client_id;

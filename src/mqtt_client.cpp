@@ -106,23 +106,37 @@ int Client::connect(const ConnectConfig& cfg)
     }
 
     if (cfg.use_tls) {
-        // libmosquitto refuses tls_set with all-NULL CA arguments, so we have
-        // to point at *some* trust store even though we then disable peer
-        // verification below (printers ship self-signed certs with no
-        // hostname in SAN). Prefer the distro bundle; fall back to OpenSSL's
-        // CA directory.
-        static const char* kCaCandidates[] = {
-            "/etc/ssl/certs/ca-certificates.crt",        // Debian, Ubuntu
-            "/etc/pki/tls/certs/ca-bundle.crt",          // Fedora, RHEL
-            "/etc/ssl/ca-bundle.pem",                    // openSUSE
-            "/etc/ssl/cert.pem",                         // Alpine, macOS
-        };
+        // Three TLS modes, decided by what the caller has supplied:
+        //   1. ca_file provided -> chain verification against that bundle;
+        //      hostname check still skipped because the printer's cert CN is
+        //      its serial number, not the IP we connect by.
+        //   2. no ca_file, tls_insecure=true -> accept anything; fall back to
+        //      the distro trust store just because libmosquitto requires us
+        //      to hand it *some* CA path.
+        //   3. no ca_file, tls_insecure=false -> distro trust store with full
+        //      verification. Unlikely to work for LAN but left as an option
+        //      for future cloud use.
         const char* cafile = nullptr;
-        for (const char* p : kCaCandidates) {
-            FILE* f = std::fopen(p, "rb");
-            if (f) { std::fclose(f); cafile = p; break; }
+        const char* capath = nullptr;
+        bool        verify_peer = false;
+        if (!cfg.ca_file.empty()) {
+            cafile      = cfg.ca_file.c_str();
+            verify_peer = true;
+            OBN_DEBUG("mqtt using BBL CA bundle for verification: %s", cafile);
+        } else {
+            static const char* kCaCandidates[] = {
+                "/etc/ssl/certs/ca-certificates.crt",        // Debian, Ubuntu
+                "/etc/pki/tls/certs/ca-bundle.crt",          // Fedora, RHEL
+                "/etc/ssl/ca-bundle.pem",                    // openSUSE
+                "/etc/ssl/cert.pem",                         // Alpine, macOS
+            };
+            for (const char* p : kCaCandidates) {
+                FILE* f = std::fopen(p, "rb");
+                if (f) { std::fclose(f); cafile = p; break; }
+            }
+            capath      = cafile ? nullptr : "/etc/ssl/certs";
+            verify_peer = !cfg.tls_insecure;
         }
-        const char* capath = cafile ? nullptr : "/etc/ssl/certs";
         int rc = ::mosquitto_tls_set(mosq_, cafile, capath, nullptr, nullptr, nullptr);
         if (rc != MOSQ_ERR_SUCCESS) {
             OBN_ERROR("mqtt tls_set rc=%d (%s) cafile=%s capath=%s",
@@ -131,8 +145,8 @@ int Client::connect(const ConnectConfig& cfg)
                       capath ? capath : "(null)");
             return rc;
         }
-        // 0 == SSL_VERIFY_NONE.
-        rc = ::mosquitto_tls_opts_set(mosq_, 0, nullptr, nullptr);
+        // SSL_VERIFY_PEER (1) vs SSL_VERIFY_NONE (0).
+        rc = ::mosquitto_tls_opts_set(mosq_, verify_peer ? 1 : 0, nullptr, nullptr);
         if (rc != MOSQ_ERR_SUCCESS) {
             OBN_ERROR("mqtt tls_opts_set rc=%d (%s)", rc, err_str(rc));
             return rc;

@@ -37,12 +37,14 @@ LanSession::LanSession(std::string dev_id,
                        std::string dev_ip,
                        std::string username,
                        std::string password,
-                       bool        use_ssl)
+                       bool        use_ssl,
+                       std::string ca_file)
     : dev_id_(std::move(dev_id))
     , dev_ip_(std::move(dev_ip))
     , username_(std::move(username))
     , password_(std::move(password))
     , use_ssl_(use_ssl)
+    , ca_file_(std::move(ca_file))
 {
 }
 
@@ -116,8 +118,14 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     cfg.username     = username_;
     cfg.password     = password_;
     cfg.use_tls      = use_ssl_;
+    cfg.ca_file      = ca_file_;
+    // Printers use their serial as cert CN, so hostname check never matches
+    // when we connect by IP. Keep insecure=true even with ca_file set.
     cfg.tls_insecure = true;
     cfg.keepalive_s  = 60;
+
+    OBN_INFO("LanSession tls ca_file=%s",
+             ca_file_.empty() ? "<none, accepting any>" : ca_file_.c_str());
 
     int rc = client_->connect(cfg);
     if (rc != 0) {

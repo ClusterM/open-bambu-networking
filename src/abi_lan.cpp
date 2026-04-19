@@ -62,11 +62,17 @@ OBN_ABI int bambu_network_update_cert(void* /*agent*/)
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI void bambu_network_install_device_cert(void* /*agent*/,
+OBN_ABI void bambu_network_install_device_cert(void* agent,
                                                std::string dev_id,
                                                bool        lan_only)
 {
-    OBN_INFO("install_device_cert dev=%s lan_only=%d", dev_id.c_str(), lan_only);
+    // Demoted to DEBUG because Studio calls this ~1 Hz from its refresh
+    // timer; the agent internally dedups so real work only happens once per
+    // session and is logged there at INFO level.
+    OBN_DEBUG("install_device_cert dev=%s lan_only=%d", dev_id.c_str(), lan_only);
+    auto* a = as_agent(agent);
+    if (!a) return;
+    a->install_device_cert(dev_id, lan_only);
 }
 
 OBN_ABI bool bambu_network_start_discovery(void* /*agent*/, bool start, bool sending)
