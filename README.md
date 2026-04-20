@@ -7,9 +7,38 @@ implementations from
 [bambulabs_api](https://github.com/acse-ci223/bambulabs_api) and
 [ha_bambu_lab](https://github.com/greghesp/ha-bambulab).
 
-> **Status:** Phase 1 (ABI scaffolding). Exports all ~128 symbols Bambu Studio
-> looks up. All functions are currently no-op stubs. Studio loads the library
-> successfully; nothing works yet.
+> **Status:** Phase 5 (cloud MQTT + cloud print). LAN and cloud login, SSDP
+> discovery, live telemetry, LAN printing and cloud project upload all work.
+> The printer itself must be in **Developer Mode** (aka LAN-only mode) for
+> printing to succeed — see [Developer Mode requirement](#developer-mode-requirement)
+> below.
+
+## Developer Mode requirement
+
+Recent (2024+) printer firmware cryptographically verifies every MQTT command
+it receives when the printer is paired with the Bambu cloud. The verification
+uses a per-installation RSA key that the stock plugin ships as obfuscated data
+and which we do not reproduce. Symptom on the printer screen when an unsigned
+command arrives:
+
+```
+MQTT Command verification failed
+err_code: 84033543
+```
+
+To use this plugin, put the printer in **Developer Mode**:
+
+1. On the printer: Settings -> General -> LAN Only Mode -> enable.
+2. In Bambu Studio: Device -> Connect via LAN with access code.
+
+In this mode the printer skips MQTT verification and accepts plain LAN
+commands. All LAN features of the plugin (discovery, telemetry, printing,
+filename browsing, file transfer, camera) work normally.
+
+Non-developer / hybrid / cloud-only modes are **not supported** and will
+not be supported: replicating the proprietary signature chain is out of
+scope for an open-source plugin. MakerWorld task history is likewise out
+of scope.
 
 ## What it is
 

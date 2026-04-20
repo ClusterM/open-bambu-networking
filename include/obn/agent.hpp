@@ -14,6 +14,7 @@
 namespace obn {
 namespace mqtt { class Client; }
 namespace ssdp { class Discovery; }
+class CloudSession;
 
 // Per-printer LAN MQTT session. Studio only holds one such connection at a
 // time (multi-printer LAN view is a future extension), so Agent owns a single
@@ -144,6 +145,29 @@ public:
                                  BBL::OnUpdateStatusFn   update_fn,
                                  BBL::WasCancelledFn     cancel_fn);
 
+    // Implements bambu_network_start_print (use_lan_channel=false) and
+    // bambu_network_start_local_print_with_record (use_lan_channel=true).
+    //
+    // Orchestrates Bambu's cloud-print sequence reverse-engineered from
+    // MITM of the original plugin:
+    //   1.  POST /iot-service/api/user/project          - create project
+    //   2.  PUT  <presigned S3 url>                     - upload config 3mf
+    //   3.  PUT  /iot-service/api/user/notification     - notify upload
+    //   4.  GET  /iot-service/api/user/notification?... - poll
+    //   5.  PATCH /iot-service/api/user/project/<pid>   - register (ftp:// url)
+    //   6.  GET  /iot-service/api/user/upload?models=.. - request second url
+    //   7.  PUT  <presigned S3 url>                     - upload full 3mf
+    //   8.  PATCH /iot-service/api/user/project/<pid>   - register (https:// url)
+    //   9.  (LAN only) FTPS STOR to /cache/<name>.gcode.3mf
+    //  10.  POST /user-service/my/task                  - create task
+    //  11.  MQTT publish project_file:
+    //         - LAN channel: via LanSession, url=ftp://<name>
+    //         - cloud channel: via CloudSession, url=<S3 presigned>
+    int run_cloud_print_job(const BBL::PrintParams& params,
+                            BBL::OnUpdateStatusFn   update_fn,
+                            BBL::WasCancelledFn     cancel_fn,
+                            bool                    use_lan_channel);
+
     // -----------------------------
     // Accessors used by stub returns.
     // -----------------------------
@@ -163,6 +187,23 @@ public:
     // reach the Studio UI thread safely.
     void notify_local_connected(int status, const std::string& dev_id, const std::string& msg);
     void notify_local_message(const std::string& dev_id, const std::string& json);
+
+    // -----------------------------
+    // Cloud MQTT (Studio's "server" connection).
+    // -----------------------------
+    // Opens the long-lived TLS MQTT connection to us.mqtt.bambulab.com
+    // using the currently-stored access token. Idempotent: safe to
+    // call repeatedly, subsequent calls are no-ops while already
+    // connected. Returns BAMBU_NETWORK_* code.
+    int  connect_cloud();
+    int  disconnect_cloud();
+    bool cloud_connected() const;
+    int  cloud_refresh();
+    int  cloud_add_subscribe(const std::vector<std::string>& dev_ids);
+    int  cloud_del_subscribe(const std::vector<std::string>& dev_ids);
+    int  cloud_send_message(const std::string& dev_id,
+                            const std::string& json_str,
+                            int qos);
 
     // -----------------------------
     // Cloud user session.
@@ -201,6 +242,13 @@ private:
 
     std::unique_ptr<LanSession> lan_session_;
     std::unique_ptr<ssdp::Discovery> discovery_;
+    std::unique_ptr<CloudSession>   cloud_session_;
+
+    // First cloud report per dev_id flips this set, which is what
+    // triggers the one-shot on_printer_connected("tunnel/<id>")
+    // notification. Cleared on disconnect/resubscribe so reconnects
+    // re-fire the notification.
+    std::set<std::string> cloud_connected_devs_;
 
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.

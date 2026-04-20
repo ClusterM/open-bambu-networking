@@ -244,6 +244,15 @@ void Client::s_on_message(::mosquitto* /*m*/, void* obj, const ::mosquitto_messa
     auto* self = static_cast<Client*>(obj);
     if (!self || !msg) return;
     OBN_DEBUG("mqtt msg topic=%s bytes=%d qos=%d", msg->topic, msg->payloadlen, msg->qos);
+    if (msg->payload && msg->payloadlen > 0) {
+        // Truncate at 2 KiB to keep the log usable; printer reports can
+        // be huge (full device state dumps) and most of that isn't
+        // relevant for debugging a single command exchange.
+        int dump = msg->payloadlen < 2048 ? msg->payloadlen : 2048;
+        OBN_DEBUG("mqtt msg payload=%.*s%s",
+                  dump, static_cast<const char*>(msg->payload),
+                  msg->payloadlen > dump ? "...(truncated)" : "");
+    }
     OnMessageCb cb;
     {
         std::lock_guard<std::mutex> lk(self->mu_);

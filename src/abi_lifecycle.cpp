@@ -82,8 +82,19 @@ OBN_ABI int bambu_network_set_country_code(void* agent, std::string country_code
     return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 }
 
-OBN_ABI int bambu_network_start(void* /*agent*/)
+OBN_ABI int bambu_network_start(void* agent)
 {
     OBN_INFO("start");
+    // Studio's login flow only calls connect_server() after the privacy
+    // policy check + EVT_USER_LOGIN_HANDLE round-trip finishes (see
+    // GUI_App::on_user_login_handle). If the policy endpoint returns
+    // empty resources for a cached sign-in, that cascade can silently
+    // stall and we end up never kicking off cloud MQTT. Fire it off
+    // here ourselves - start() is the very last call in the plugin
+    // handshake, so all callbacks are already registered.
+    if (auto* a = as_agent(agent); a && a->user_logged_in()) {
+        OBN_INFO("start: user already logged in, auto-connecting cloud");
+        a->connect_cloud();
+    }
     return BAMBU_NETWORK_SUCCESS;
 }

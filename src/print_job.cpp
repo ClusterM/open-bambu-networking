@@ -16,6 +16,7 @@
 // buying us anything.
 
 #include "obn/agent.hpp"
+#include "obn/print_job.hpp"
 
 #include "obn/bambu_networking.hpp"
 #include "obn/ftps.hpp"
@@ -29,7 +30,7 @@
 #include <string>
 #include <system_error>
 
-namespace obn {
+namespace obn::print_job {
 
 namespace {
 
@@ -94,26 +95,6 @@ std::string sanitize_remote_name(std::string name)
     return name;
 }
 
-// Chooses the filename the printer will see on its internal storage.
-// Studio hands us a local tempfile path that typically looks like
-// "/tmp/.474173.0.3mf" - a hidden name which the firmware then refuses
-// to find when we later reference it in `project_file`. Mirror the
-// original plugin's behaviour instead: use `<project>.gcode.3mf`,
-// falling back to task name / a generic label. The `filename` basename
-// is consulted only as a last resort.
-std::string pick_remote_name(const BBL::PrintParams& p)
-{
-    std::string project = p.project_name;
-    if (project.empty()) project = p.task_name;
-    project = sanitize_remote_name(project);
-
-    if (!project.empty()) return project + ".gcode.3mf";
-
-    std::string name = sanitize_remote_name(basename_of(p.filename));
-    if (!name.empty()) return name;
-    return "print.gcode.3mf";
-}
-
 // Returns a millisecond-resolution epoch timestamp string suitable for
 // use as a sequence_id; matches the Bambu plugin's style.
 std::string now_seq_id()
@@ -138,7 +119,6 @@ std::string format_ams_mapping(const std::string& mapping, bool use_ams)
                           s.back() == '\r' || s.back() == '\n')) s.pop_back();
     if (s.empty()) return use_ams ? "[0]" : "[]";
     if (s.front() == '[') return s; // already a JSON array
-    // Fall back: treat as CSV of slot ids.
     std::string arr = "[";
     std::size_t start = 0;
     while (start <= s.size()) {
@@ -158,16 +138,28 @@ std::string format_ams_mapping(const std::string& mapping, bool use_ams)
     return arr;
 }
 
-// Runs the FTPS upload, streaming progress through update_fn and honoring
-// cancel_fn. Returns 0 on success or a BAMBU_NETWORK_ERR_PRINT_LP_*
-// code on failure.
-int do_ftp_upload(const BBL::PrintParams&    p,
-                  const std::string&         remote_path,
-                  const std::string&         ca_file,
-                  BBL::OnUpdateStatusFn      update_fn,
-                  BBL::WasCancelledFn        cancel_fn,
-                  int                        err_code_on_failure,
-                  std::uint64_t&             total_bytes_out)
+} // namespace
+
+std::string pick_remote_name(const BBL::PrintParams& p)
+{
+    std::string project = p.project_name;
+    if (project.empty()) project = p.task_name;
+    project = sanitize_remote_name(project);
+
+    if (!project.empty()) return project + ".gcode.3mf";
+
+    std::string name = sanitize_remote_name(basename_of(p.filename));
+    if (!name.empty()) return name;
+    return "print.gcode.3mf";
+}
+
+int ftp_upload(const BBL::PrintParams&    p,
+               const std::string&         remote_path,
+               const std::string&         ca_file,
+               BBL::OnUpdateStatusFn      update_fn,
+               BBL::WasCancelledFn        cancel_fn,
+               int                        err_code_on_failure,
+               std::uint64_t&             total_bytes_out)
 {
     std::error_code ec;
     auto sz = std::filesystem::file_size(p.filename, ec);
@@ -223,16 +215,12 @@ int do_ftp_upload(const BBL::PrintParams&    p,
     return 0;
 }
 
-// Builds the print/project_file MQTT payload. Field set mirrors what
-// bambulabs_api sends plus the AMS-related fields Studio fills in.
 std::string build_project_file_json(const BBL::PrintParams& p,
-                                    const std::string&       remote_path)
+                                    const ProjectFileOpts&  opts)
 {
     std::string plate_param = "Metadata/plate_" +
                               std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
                               ".gcode";
-    std::string file_path   = remote_path.front() == '/' ? remote_path : "/" + remote_path;
-    std::string url         = "ftp://" + file_path;
     std::string subtask     = p.project_name.empty() ? p.task_name : p.project_name;
     std::string bed_type    = p.task_bed_type.empty() ? "auto" : p.task_bed_type;
     std::string ams_mapping = format_ams_mapping(p.ams_mapping, p.task_use_ams);
@@ -242,14 +230,14 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     os << "\"sequence_id\":" << json_escape(now_seq_id());
     os << ",\"command\":\"project_file\"";
     os << ",\"param\":" << json_escape(plate_param);
-    os << ",\"project_id\":\"0\"";
-    os << ",\"profile_id\":\"0\"";
-    os << ",\"task_id\":\"0\"";
-    os << ",\"subtask_id\":\"0\"";
+    os << ",\"project_id\":" << json_escape(opts.project_id);
+    os << ",\"profile_id\":" << json_escape(opts.profile_id);
+    os << ",\"task_id\":"    << json_escape(opts.task_id);
+    os << ",\"subtask_id\":" << json_escape(opts.subtask_id);
     os << ",\"subtask_name\":" << json_escape(subtask);
-    os << ",\"file\":" << json_escape(file_path);
-    os << ",\"url\":" << json_escape(url);
-    os << ",\"md5\":" << json_escape(p.ftp_file_md5);
+    os << ",\"file\":" << json_escape(opts.file_path);
+    os << ",\"url\":"  << json_escape(opts.url);
+    os << ",\"md5\":"  << json_escape(opts.md5);
     os << ",\"bed_type\":" << json_escape(bed_type);
     os << ",\"bed_leveling\":"      << to_bool(p.task_bed_leveling);
     os << ",\"flow_cali\":"         << to_bool(p.task_flow_cali);
@@ -262,7 +250,9 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     return os.str();
 }
 
-} // namespace
+} // namespace obn::print_job
+
+namespace obn {
 
 int Agent::run_local_print_job(const BBL::PrintParams&   params,
                                BBL::OnUpdateStatusFn     update_fn,
@@ -297,14 +287,14 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     if (remote_folder.empty()) remote_folder = "cache/";
     if (remote_folder.back() != '/') remote_folder += '/';
     if (remote_folder.front() == '/') remote_folder.erase(0, 1);
-    std::string remote_name = pick_remote_name(params);
+    std::string remote_name = print_job::pick_remote_name(params);
     std::string remote_path = "/" + remote_folder + remote_name;
 
     std::string ca_file = bambu_ca_bundle_path();
 
     std::uint64_t total = 0;
-    int rc = do_ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
-                           BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total);
+    int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
+                                   BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total);
     if (rc != 0) return rc;
 
     if (cancel_fn && cancel_fn()) {
@@ -314,7 +304,11 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
 
     if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
 
-    std::string json = build_project_file_json(params, remote_path);
+    print_job::ProjectFileOpts opts;
+    opts.file_path = remote_path;
+    opts.url       = "ftp://" + remote_path; // printer fetches from its own FTPS
+    opts.md5       = params.ftp_file_md5;
+    std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());
 
     int pub = send_message_to_printer(params.dev_id, json, /*qos=*/0);
@@ -366,14 +360,14 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
     if (params.project_name == "verify_job") {
         remote_name = "verify_job";
     } else {
-        remote_name = pick_remote_name(params);
+        remote_name = print_job::pick_remote_name(params);
     }
     std::string remote_path = "/" + remote_folder + remote_name;
 
     std::string ca_file = bambu_ca_bundle_path();
     std::uint64_t total = 0;
-    int rc = do_ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
-                           BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED, total);
+    int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
+                                   BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED, total);
     if (rc != 0) return rc;
     if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
     return 0;

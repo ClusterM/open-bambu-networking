@@ -7,6 +7,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
+#include "obn/cloud_session.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/ssdp.hpp"
@@ -14,7 +15,11 @@
 namespace obn {
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
-Agent::~Agent() { if (discovery_) discovery_->stop(); }
+Agent::~Agent()
+{
+    if (discovery_) discovery_->stop();
+    if (cloud_session_) cloud_session_->stop();
+}
 
 int Agent::connect_printer(std::string dev_id,
                            std::string dev_ip,
@@ -417,6 +422,196 @@ void Agent::clear_session()
     if (auth_store_) auth_store_->clear();
     if (auto cb = [this]() { std::lock_guard<std::mutex> lk(mu_); return on_user_login_; }())
         cb(1, "logout");
+}
+
+// --------------------------------------------------------------------------
+// Cloud MQTT plumbing.
+// --------------------------------------------------------------------------
+
+int Agent::connect_cloud()
+{
+    auth::Session s;
+    BBL::OnServerConnectedFn on_server;
+    BBL::OnMessageFn         on_msg;
+    BBL::GetSubscribeFailureFn on_sub_fail;
+    BBL::QueueOnMainFn       queue;
+    BBL::OnPrinterConnectedFn on_printer_connected;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!cloud_session_) cloud_session_ = std::make_unique<CloudSession>();
+        on_server            = on_server_connected_;
+        on_msg               = on_message_;
+        on_sub_fail          = on_subscribe_failure_;
+        queue                = queue_on_main_;
+        on_printer_connected = on_printer_connected_;
+    }
+
+    if (!auth_store_) {
+        OBN_WARN("connect_cloud: no auth store (config_dir not set yet)");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    s = auth_store_->snapshot();
+    if (!s.logged_in()) {
+        OBN_WARN("connect_cloud: not logged in, skipping");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    cloud_session_->configure(cloud_region(), s.user_id, s.access_token,
+                              /*ca_file=*/{});
+
+    // Trampoline callbacks onto Studio's UI thread where one is
+    // registered. The message callback is intentionally NOT queued:
+    // DeviceManager::on_push_message() is thread-aware and has its own
+    // fast-path handling.
+    auto on_connected_cb = [this, on_server, queue, on_printer_connected]
+        (int status, int reason, std::string /*msg*/)
+    {
+        OBN_INFO("cloud: server_connected status=%d reason=%d", status, reason);
+        if (on_server) {
+            auto invoke = [on_server, status, reason]() {
+                on_server(status, reason);
+            };
+            if (queue) queue(invoke); else invoke();
+        }
+        // On successful CONNACK, if we already know the user's device
+        // list (passed via add_subscribe earlier), fire
+        // on_printer_connected with a "tunnel/" prefix for each of
+        // them so Studio marks them cloud-online and requests pushall.
+        if (status == 0 && on_printer_connected) {
+            std::vector<std::string> devs;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (cloud_session_) {
+                    // CloudSession exposes is_connected() only; mirror
+                    // its subscribed set via our own copy -> we don't
+                    // duplicate the state here. Instead: we rely on
+                    // Studio calling add_subscribe right after
+                    // connect_server, which will then call this path
+                    // via the sub-success logic below.
+                }
+            }
+            (void)devs;
+        }
+    };
+
+    auto on_msg_cb = [this, on_msg, on_printer_connected]
+        (std::string dev_id, std::string json)
+    {
+        // Mirror Bambu's plugin: the FIRST cloud report we receive
+        // for a device kicks off an on_printer_connected("tunnel/<id>")
+        // notification so Studio moves the device from "subscribing"
+        // to "online" in its UI.
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            first = cloud_connected_devs_.insert(dev_id).second;
+        }
+        if (first && on_printer_connected) {
+            BBL::OnPrinterConnectedFn cb = on_printer_connected;
+            BBL::QueueOnMainFn        q;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                q = queue_on_main_;
+            }
+            auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
+            if (q) q(invoke); else invoke();
+        }
+        if (on_msg) on_msg(std::move(dev_id), std::move(json));
+    };
+
+    auto on_sub_fail_cb = [this, on_sub_fail](std::string dev_id) {
+        if (on_sub_fail) {
+            BBL::QueueOnMainFn q;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                q = queue_on_main_;
+            }
+            auto invoke = [on_sub_fail, dev_id]() { on_sub_fail(dev_id); };
+            if (q) q(invoke); else invoke();
+        }
+    };
+
+    return cloud_session_->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
+}
+
+int Agent::disconnect_cloud()
+{
+    std::unique_ptr<CloudSession> sess;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = std::move(cloud_session_);
+        cloud_connected_devs_.clear();
+    }
+    if (sess) sess->stop();
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+bool Agent::cloud_connected() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return cloud_session_ && cloud_session_->is_connected();
+}
+
+int Agent::cloud_refresh()
+{
+    // Studio's DeviceManagerRefresher calls refresh_connection() on a
+    // 1-second wx timer as a keep-alive / "reconnect if dropped" probe
+    // (see DevManager.cpp DeviceManagerRefresher::on_timer). Doing a
+    // hard disconnect+connect here produces a tight loop where every
+    // tick tears down a healthy session, which Studio reports back to
+    // the user as "failed to connect".
+    //
+    // Policy:
+    //   * if we already have a live MQTT session -> no-op
+    //   * otherwise -> (re)connect with the current credentials
+    if (cloud_connected()) {
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    disconnect_cloud();
+    return connect_cloud();
+}
+
+int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
+{
+    CloudSession* sess = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = cloud_session_.get();
+    }
+    if (!sess) {
+        OBN_WARN("cloud_add_subscribe: no active cloud session");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    return sess->add_subscribe(dev_ids);
+}
+
+int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
+{
+    CloudSession* sess = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = cloud_session_.get();
+        for (const auto& d : dev_ids) cloud_connected_devs_.erase(d);
+    }
+    if (!sess) return BAMBU_NETWORK_SUCCESS;
+    return sess->del_subscribe(dev_ids);
+}
+
+int Agent::cloud_send_message(const std::string& dev_id,
+                              const std::string& json_str,
+                              int qos)
+{
+    CloudSession* sess = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = cloud_session_.get();
+    }
+    if (!sess) {
+        OBN_WARN("cloud_send_message: no active cloud session for %s",
+                 dev_id.c_str());
+        return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
+    }
+    return sess->publish(dev_id, json_str, qos);
 }
 
 void Agent::hydrate_session()

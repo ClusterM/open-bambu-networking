@@ -56,6 +56,8 @@ add_library(bambu_networking SHARED
     src/auth.cpp
     src/cert_store.cpp
     src/cloud_auth.cpp
+    src/cloud_print.cpp
+    src/cloud_session.cpp
     src/ftps.cpp
     src/http_client.cpp
     src/json_lite.cpp
@@ -169,6 +171,7 @@ if(OBN_BUILD_TESTS)
         src/auth.cpp
         src/cert_store.cpp
         src/cloud_auth.cpp
+        src/cloud_session.cpp
         src/http_client.cpp
         src/json_lite.cpp
         src/lan_session.cpp

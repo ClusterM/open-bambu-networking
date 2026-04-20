@@ -1,6 +1,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
@@ -71,7 +72,8 @@ std::string dump_or_null(const obn::json::Value& v)
 // fields that Studio doesn't care about (print_job, nozzle_diameter,
 // dev_structure...) are preserved verbatim in case anything else on
 // the Studio side picks them up.
-std::string remap_bind_payload(const std::string& raw_body)
+std::string remap_bind_payload(const std::string& raw_body,
+                               std::vector<std::string>* out_dev_ids)
 {
     std::string perr;
     auto root = obn::json::parse(raw_body, &perr);
@@ -93,7 +95,9 @@ std::string remap_bind_payload(const std::string& raw_body)
         first = false;
         out << '{';
         // Required by Studio's parser.
-        out << "\"dev_id\":"          << obn::json::escape(d.find("dev_id").as_string()) << ',';
+        const auto dev_id = d.find("dev_id").as_string();
+        if (out_dev_ids && !dev_id.empty()) out_dev_ids->push_back(dev_id);
+        out << "\"dev_id\":"          << obn::json::escape(dev_id) << ',';
         out << "\"dev_name\":"        << obn::json::escape(d.find("name").as_string()) << ',';
         out << "\"dev_online\":"      << (d.find("online").as_bool() ? "true" : "false") << ',';
         out << "\"dev_model_name\":"  << obn::json::escape(d.find("dev_model_name").as_string()) << ',';
@@ -151,9 +155,24 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
         return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     }
 
-    std::string mapped = remap_bind_payload(resp.body);
-    OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes",
-             resp.body.size(), mapped.size());
+    std::vector<std::string> dev_ids;
+    std::string mapped = remap_bind_payload(resp.body, &dev_ids);
+    OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
+             resp.body.size(), mapped.size(), dev_ids.size());
+
+    // Studio's DeviceManager never calls add_subscribe() for single-
+    // machine cloud mode (the only call sites in GUI_App.cpp / DevManager
+    // are either commented out or gated on the multi-machine flag), yet
+    // the stock Bambu plugin still receives per-device pushes from the
+    // cloud. We replicate that behaviour here: every device the /user/
+    // bind endpoint returns becomes an implicit subscription to
+    // device/<id>/report. Cloud MQTT connect may not have landed yet -
+    // CloudSession buffers the desired set and re-applies it on the
+    // next CONNACK, so ordering doesn't matter.
+    if (!dev_ids.empty()) {
+        a->cloud_add_subscribe(dev_ids);
+    }
+
     if (http_body) *http_body = std::move(mapped);
     return BAMBU_NETWORK_SUCCESS;
 }

@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -34,6 +35,23 @@ size_t on_body(void* ptr, size_t size, size_t nmemb, void* userdata)
     auto* out = static_cast<std::string*>(userdata);
     out->append(static_cast<char*>(ptr), size * nmemb);
     return size * nmemb;
+}
+
+int on_curl_debug(CURL* /*handle*/, curl_infotype type, char* data, size_t size,
+                  void* /*userp*/)
+{
+    // Keep verbose output to our log so we can diagnose "helpful"
+    // things libcurl does behind our back (e.g. auto Expect:
+    // 100-continue, forced Transfer-Encoding: chunked).
+    if (type != CURLINFO_HEADER_OUT && type != CURLINFO_HEADER_IN)
+        return 0;
+    std::string s(data, size);
+    // Strip trailing CRLF run to keep the log one-line-per-header.
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (s.empty()) return 0;
+    const char* dir = type == CURLINFO_HEADER_OUT ? ">>" : "<<";
+    OBN_DEBUG("curl %s %s", dir, s.c_str());
+    return 0;
 }
 
 size_t on_header(char* buffer, size_t size, size_t nitems, void* userdata)
@@ -75,10 +93,11 @@ size_t on_header(char* buffer, size_t size, size_t nitems, void* userdata)
 const char* method_verb(Method m)
 {
     switch (m) {
-        case Method::GET:  return "GET";
-        case Method::POST: return "POST";
-        case Method::PUT:  return "PUT";
-        case Method::DEL:  return "DELETE";
+        case Method::GET:   return "GET";
+        case Method::POST:  return "POST";
+        case Method::PUT:   return "PUT";
+        case Method::DEL:   return "DELETE";
+        case Method::PATCH: return "PATCH";
     }
     return "GET";
 }
@@ -110,7 +129,10 @@ Response perform(const Request& req)
     bool        have_accept = false;
     bool        have_ct = false;
     for (const auto& [k, v] : req.headers) {
-        std::string kv = k + ": " + v;
+        // libcurl idiom: "Header:" (no value, no space) removes an
+        // internally-added header such as Content-Type or Expect.
+        // "Header: value" sends the header normally.
+        std::string kv = v.empty() ? (k + ":") : (k + ": " + v);
         hdrs = curl_slist_append(hdrs, kv.c_str());
         std::string lk = k;
         for (auto& c : lk) c = std::tolower(static_cast<unsigned char>(c));
@@ -122,10 +144,12 @@ Response perform(const Request& req)
         std::string kv = "User-Agent: " + default_user_agent();
         hdrs = curl_slist_append(hdrs, kv.c_str());
     }
-    if (!have_accept) {
+    if (!have_accept && !req.no_default_accept) {
         hdrs = curl_slist_append(hdrs, "Accept: application/json");
     }
-    if ((req.method == Method::POST || req.method == Method::PUT) && !have_ct) {
+    if ((req.method == Method::POST || req.method == Method::PUT ||
+         req.method == Method::PATCH) && !have_ct &&
+        !req.no_default_content_type) {
         hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     }
 
@@ -142,9 +166,23 @@ Response perform(const Request& req)
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,   on_header);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA,       &resp);
 
-    if (req.method == Method::POST || req.method == Method::PUT) {
+    if (req.method == Method::POST || req.method == Method::PUT ||
+        req.method == Method::PATCH) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(req.body.size()));
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    req.body.data());
+    }
+
+    // Wire-level tracing of every HTTP request is very useful when
+    // debugging signatures (S3, Bambu cloud) but fills the log fast
+    // during normal use. Gated behind OBN_HTTP_TRACE=1 so we can turn
+    // it on for a single session without a rebuild.
+    static const bool s_trace_http = []() {
+        const char* v = std::getenv("OBN_HTTP_TRACE");
+        return v && *v && *v != '0';
+    }();
+    if (s_trace_http) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE,       1L);
+        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, on_curl_debug);
     }
 
     if (req.insecure) {

@@ -33,7 +33,7 @@ struct Response {
     std::string error; // non-empty if the transport failed
 };
 
-enum class Method { GET, POST, PUT, DEL };
+enum class Method { GET, POST, PUT, DEL, PATCH };
 
 struct Request {
     Method                                method = Method::GET;
@@ -44,6 +44,12 @@ struct Request {
     bool                                  insecure = false;
     int                                   connect_timeout_s = 10;
     int                                   timeout_s         = 30;
+    // When true, we do NOT inject a default `Content-Type` / `Accept`
+    // even if the body is non-empty. Required for PUTs to S3 presigned
+    // URLs: the V2 signature covers `Content-Type`, so any mismatch
+    // yields SignatureDoesNotMatch.
+    bool                                  no_default_content_type = false;
+    bool                                  no_default_accept       = false;
 };
 
 // Process-wide libcurl init (idempotent). Safe to call repeatedly.
