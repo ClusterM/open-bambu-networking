@@ -15,9 +15,9 @@ std::string g_log_start_time;
 
 OBN_ABI void* bambu_network_create_agent(std::string log_dir)
 {
-    // Route the logger into the same folder Studio uses for its own logs so
-    // support bundles automatically pick it up. Do this BEFORE the first
-    // OBN_* call so the banner lands in the right file.
+    // Optional file sink: set OBN_LOG_TO_FILE=1 so logs also go to
+    // <log_dir>/obn.log (same folder as Studio's logs). Default is stderr only.
+    // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
 
     OBN_INFO("create_agent log_dir=%s  plugin_version=%s",

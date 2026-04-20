@@ -7,16 +7,18 @@
 // Minimal printf-style logger shared by all ABI implementations. Goals:
 //   * zero runtime dependencies beyond libc;
 //   * always-on (no macro stripping in release) so a deployed plugin can be
-//     diagnosed in-field by tailing a file;
+//     diagnosed in-field from the terminal or an opt-in log file;
 //   * thread-safe - mosquitto calls us on a background thread, Studio calls
 //     us on the main thread, and they often interleave.
 //
 // Configuration happens at first use through environment variables:
-//   OBN_LOG_FILE    path to log file. Default: <log_dir>/obn.log where
-//                   log_dir is whatever Studio passes to create_agent, or
-//                   /tmp/obn.log as a last resort.
-//   OBN_LOG_LEVEL   trace | debug | info | warn | error (default: debug).
-//   OBN_LOG_STDERR  0|1 (default: 1) - also echo to stderr.
+//   OBN_LOG_FILE      optional absolute path to a log file. If unset, no file
+//                     sink is opened unless OBN_LOG_TO_FILE=1 (see below).
+//   OBN_LOG_TO_FILE   set to 1 to also write to <log_dir>/obn.log (log_dir is
+//                     passed from Studio to create_agent). Ignored if
+//                     OBN_LOG_FILE is set (including empty: console-only).
+//   OBN_LOG_LEVEL     trace | debug | info | warn | error | off (default: info).
+//   OBN_LOG_STDERR    0|1 (default: 1) - copy every line to stderr.
 //
 // The logger intentionally leaks a static singleton: the plugin is unloaded
 // together with the process, so there is no cleanup hazard.
@@ -32,9 +34,9 @@ enum Level : int {
     LVL_OFF   = 5,
 };
 
-// Sets the log file path. Called from bambu_network_create_agent once Studio
-// gives us a log directory. Safe to call multiple times; no-op if
-// OBN_LOG_FILE was set explicitly via env.
+// Called from bambu_network_create_agent once Studio gives us a log directory.
+// Opens <log_dir>/obn.log only when OBN_LOG_TO_FILE=1. Safe to call multiple
+// times; skipped if OBN_LOG_FILE was set explicitly via env.
 void configure_from_log_dir(const std::string& log_dir);
 
 // Low-level emitter. Use the OBN_* macros below instead of calling directly.

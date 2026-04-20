@@ -515,19 +515,12 @@ in non-LAN mode. Closed-source proprietary libraries (`libBambuTUTK` /
 `libBambuAgora`) implement them. We don't wrap either.
 **Scope:** out of scope — use LAN/Developer Mode instead.
 
-### Windows / macOS builds
-
-ABI uses `std::string`/`std::map`/`std::function` across the `dlsym`
-boundary, which means matching MSVC STL on Windows and Xcode libc++ on
-macOS. Studio also enforces code-signing publisher matches there.
-**Scope:** architected for but not built; Linux x86_64 and aarch64 ship.
-
 ## Supported platforms
 
 - Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
 - Linux aarch64 (cross-compile-friendly, see `cmake/toolchains/`).
 
-Windows and macOS are architected for but not yet built: the ABI uses
+Windows and macOS are architected for but not yet built and tested: the ABI uses
 `std::string`/`std::map`/`std::function` across the boundary, which means we
 would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
 also enforces a matching code-signing publisher on those OSes unless the user
@@ -581,41 +574,50 @@ Then edit `~/.config/BambuStudio/BambuStudio.conf`, section `"app"`:
 
 ## Logging
 
-The plugin writes a printf-style log of every ABI call and every
-MQTT / FTPS / HTTP action it takes. This is the primary
-troubleshooting tool — when something misbehaves, check the log first.
+The plugin writes a printf-style log of ABI calls and MQTT / FTPS /
+HTTP activity. **Defaults:** severity **info**, output **only to stderr**
+(the terminal that launched Bambu Studio). No log file is opened unless
+you opt in — this keeps disk noise down for everyday use.
 
-**Where it goes.** By default into Studio's log directory next to
-Studio's own logs, under the name `obn.log`:
+**Where it goes.**
 
-```
-~/.config/BambuStudio/log/obn.log
-```
+- **Default:** stderr only (`OBN_LOG_STDERR=1`).
+- **File next to Studio’s data directory:** set `OBN_LOG_TO_FILE=1` to
+  append to `<data_dir>/obn.log`, where `data_dir` is the path Studio
+  passes to `bambu_network_create_agent` (typically
+  `~/.config/BambuStudio/obn.log` on Linux).
+- **Explicit path:** set `OBN_LOG_FILE` to an absolute path. Use
+  `/dev/null` to disable the file sink while keeping stderr. An empty
+  `OBN_LOG_FILE=` means “no file from env” (stderr only unless
+  `OBN_LOG_TO_FILE=1`).
 
-If Studio doesn't pass a log directory (rare), the plugin falls back
-to `/tmp/obn.log`.
-
-**Log levels.** `trace < debug < info < warn < error`. The default
-is `debug`, which is chatty enough to diagnose most issues without
-being unreadable. `trace` adds per-MQTT-frame and per-FTPS-command
-dumps.
+**Log levels.** `trace < debug < info < warn < error < off`. The default
+is **info**. Use `debug` or `trace` when diagnosing issues (`trace` adds
+per-MQTT-frame and per-FTPS-command noise).
 
 **Configuration via environment variables** (read once, on first log
-call — so export them *before* launching Studio):
+call — export them *before* launching Studio):
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `OBN_LOG_FILE` | `<studio-log-dir>/obn.log` | Absolute path to the log file. Set explicitly to redirect; set to `/dev/null` to silence the file sink. |
-| `OBN_LOG_LEVEL` | `debug` | Threshold. One of `trace`, `debug`, `info`, `warn`, `error`, `off`. |
-| `OBN_LOG_STDERR` | `1` | When `1`, also echo every line to Studio's stderr (visible in the terminal you launched Studio from). Set to `0` if you just want the file. |
+| `OBN_LOG_LEVEL` | `info` | Threshold: `trace`, `debug`, `info`, `warn`, `error`, `off`. |
+| `OBN_LOG_STDERR` | `1` | When `1`, copy every line to stderr. Set to `0` to suppress the console copy (only useful together with a file sink). |
+| `OBN_LOG_TO_FILE` | *(unset)* | Set to `1`/`true`/`yes` to append to `<data_dir>/obn.log` after Studio passes `data_dir`. Ignored if `OBN_LOG_FILE` is set. |
+| `OBN_LOG_FILE` | *(unset)* | Absolute path to a log file. Creates the file sink when non-empty. |
 
-Example — quietest useful setup, file only:
+Example — default behaviour (info to terminal only):
 
 ```sh
-OBN_LOG_LEVEL=info OBN_LOG_STDERR=0 bambu-studio
+bambu-studio
 ```
 
-Example — full wire-level trace to a specific file:
+Example — persistent file next to Studio data, no stderr spam:
+
+```sh
+OBN_LOG_TO_FILE=1 OBN_LOG_LEVEL=info OBN_LOG_STDERR=0 bambu-studio
+```
+
+Example — full wire-level trace to a dedicated file:
 
 ```sh
 OBN_LOG_LEVEL=trace OBN_LOG_FILE=/tmp/obn-session.log bambu-studio
@@ -624,12 +626,11 @@ OBN_LOG_LEVEL=trace OBN_LOG_FILE=/tmp/obn-session.log bambu-studio
 **Line format:**
 
 ```
-[LVL] [TID] file.cpp:line func_name: message
+YYYY-mm-dd HH:MM:SS.uuuuuu [LVL] [tid] file.cpp:line func_name: message
 ```
 
-where `TID` is the last 6 digits of the OS thread id — useful to
-correlate MQTT background-thread activity (usually one stable TID per
-printer) with Studio main-thread ABI calls.
+where `tid` is the OS thread id — useful to correlate MQTT
+background-thread activity with Studio main-thread ABI calls.
 
 **Secrets — be careful before sharing a log.** The plugin does *not*
 currently auto-redact secrets. At `debug` and `trace` levels the log

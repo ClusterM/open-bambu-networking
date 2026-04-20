@@ -23,7 +23,7 @@ struct State {
     FILE*      fp          = nullptr;
     bool       echo_stderr = true;
     bool       explicit_path = false; // OBN_LOG_FILE set by user
-    Level      level       = LVL_DEBUG;
+    Level      level       = LVL_INFO;
     bool       initialized = false;
 };
 
@@ -33,9 +33,19 @@ State& state()
     return s;
 }
 
+// Non-empty OBN_LOG_TO_FILE enables <log_dir>/obn.log unless explicitly false.
+static bool env_wants_default_file(const char* v)
+{
+    if (!v || !*v) return false;
+    if (v[0] == '0' && v[1] == '\0') return false;
+    if (!::strcasecmp(v, "false") || !::strcasecmp(v, "no") || !::strcasecmp(v, "off"))
+        return false;
+    return true;
+}
+
 Level parse_level(const char* s)
 {
-    if (!s || !*s) return LVL_DEBUG;
+    if (!s || !*s) return LVL_INFO;
     if (!::strcasecmp(s, "trace")) return LVL_TRACE;
     if (!::strcasecmp(s, "debug")) return LVL_DEBUG;
     if (!::strcasecmp(s, "info"))  return LVL_INFO;
@@ -43,7 +53,7 @@ Level parse_level(const char* s)
     if (!::strcasecmp(s, "warning")) return LVL_WARN;
     if (!::strcasecmp(s, "error")) return LVL_ERROR;
     if (!::strcasecmp(s, "off"))   return LVL_OFF;
-    return LVL_DEBUG;
+    return LVL_INFO;
 }
 
 const char* level_name(Level l)
@@ -82,11 +92,11 @@ void ensure_initialized_locked(State& s)
     if (const char* p = std::getenv("OBN_LOG_FILE")) {
         s.explicit_path = true;
         if (*p) open_file_locked(s, p);
-    } else {
-        // Fallback path if Studio never calls configure_from_log_dir() or
-        // calls it with an empty string (e.g. when we run stand-alone tests).
-        open_file_locked(s, "/tmp/obn.log");
+        // Empty OBN_LOG_FILE => explicit_path only: stderr-only unless user
+        // enables OBN_LOG_TO_FILE from configure_from_log_dir (blocked below).
     }
+    // No default file: logs go to stderr only unless OBN_LOG_FILE,
+    // OBN_LOG_TO_FILE (see configure_from_log_dir), or tests set a path.
 }
 
 long tid()
@@ -116,6 +126,7 @@ void configure_from_log_dir(const std::string& log_dir)
     std::lock_guard<std::mutex> lk(s.mu);
     ensure_initialized_locked(s);
     if (s.explicit_path || log_dir.empty()) return;
+    if (!env_wants_default_file(std::getenv("OBN_LOG_TO_FILE"))) return;
     std::string path = log_dir;
     if (path.back() != '/') path += '/';
     path += "obn.log";
