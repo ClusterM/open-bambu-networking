@@ -522,16 +522,6 @@ boundary, which means matching MSVC STL on Windows and Xcode libc++ on
 macOS. Studio also enforces code-signing publisher matches there.
 **Scope:** architected for but not built; Linux x86_64 and aarch64 ship.
 
-## What it is
-
-A native shared library (`libbambu_networking.so`) binary-compatible with the
-`dlsym`-based ABI Bambu Studio uses to call into the proprietary plugin. Drops
-into `~/.config/BambuStudio/plugins/` in place of the original.
-
-See [`NETWORK_PLUGIN.md`](../BambuStudio/%20NETWORK_PLUGIN.md) in the sibling
-BambuStudio checkout for a full ABI reference, download flow, signature logic
-and version-check rules.
-
 ## Supported platforms
 
 - Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
