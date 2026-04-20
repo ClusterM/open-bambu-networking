@@ -526,46 +526,101 @@ would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
 also enforces a matching code-signing publisher on those OSes unless the user
 sets `ignore_module_cert = 1`.
 
-## Version compatibility
+## Build and install
 
-Studio compares the plugin's `bambu_network_get_version()` against its own
-`SLIC3R_VERSION` using the first 8 characters (`MAJOR.MINOR.PATCH`).
+### Dependencies (Linux)
 
-Configure the plugin version at CMake time with `-DOBN_VERSION=...`. Default is
-tracked to match the latest Bambu Studio release. Example:
+You need **CMake ≥ 3.20**, a **C++17** compiler, **pkg-config**, and development
+headers for everything the project links against:
+
+| Component | Debian / Ubuntu packages | Fedora-style packages |
+| --- | --- | --- |
+| Toolchain | `build-essential`, `cmake`, `pkg-config` | `gcc-c++`, `cmake`, `pkgconf-pkg-config` |
+| MQTT / HTTP / TLS / zlib | `libmosquitto-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
+| GStreamer (BambuSource camera path) | `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev` | `gstreamer1-devel`, `gstreamer1-plugins-base-devel` |
+| Images (BambuSource) | `libpng-dev`, `libjpeg-dev` | `libpng-devel`, `libjpeg-turbo-devel` |
+
+One-shot install examples:
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential cmake pkg-config \
+  libmosquitto-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libpng-dev libjpeg-dev
+```
+
+```sh
+# Fedora
+sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
+  mosquitto-devel libcurl-devel openssl-devel zlib-devel \
+  gstreamer1-devel gstreamer1-plugins-base-devel \
+  libpng-devel libjpeg-turbo-devel
+```
+
+### Configure, build, install
+
+From the repository root, run **three commands** in order:
+
+1. **`cmake -S . -B build`** — creates the `build/` folder and records how the
+   project will be compiled **and where files will be copied on install**.
+   On Linux the default install location is **`~/.config/BambuStudio`** (the same
+   place Bambu Studio uses). You do **not** need any extra flags for a normal setup.
+2. **`cmake --build build -j"$(nproc)"`** — compiles the plugin.
+3. **`cmake --install build`** — copies the built `.so` files and metadata into
+   the folder chosen in step 1 (by default `plugins/` and `ota/plugins/` under
+   `~/.config/BambuStudio`).
+
+```sh
+cmake -S . -B build
+cmake --build build -j"$(nproc)"
+cmake --install build
+```
+
+**Only if** you want the plugin installed somewhere other than `~/.config/BambuStudio`,
+add **`-DCMAKE_INSTALL_PREFIX=…` to the first command** (the `cmake -S . -B build`
+line), with an absolute path. Example:
+
+```sh
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/opt/my-bambu
+cmake --build build -j"$(nproc)"
+cmake --install build
+```
+
+After step 3, a typical Linux layout looks like:
+
+- `~/.config/BambuStudio/plugins/libbambu_networking.so`
+- `~/.config/BambuStudio/plugins/libBambuSource.so` (stub)
+- `~/.config/BambuStudio/plugins/liblive555.so` (stub)
+- `~/.config/BambuStudio/ota/plugins/network_plugins.json`
+
+**Studio version string:** Bambu Studio compares the plugin version to its own
+using the **first 8 characters** of `bambu_network_get_version()`. If your Studio
+build complains about a version mismatch, configure again with an explicit
+`OBN_VERSION` on the **same first line** as in this example (only when needed):
 
 ```sh
 cmake -S . -B build -DOBN_VERSION=02.05.02.99
-cmake --build build -j
 ```
 
-The currently shipped AppImage `v02.05.02.51` expects prefix `02.05.02`. A
-source build of BambuStudio from the main branch (as of writing) expects
-`02.05.03`.
+(e.g. AppImage `v02.05.02.51` matches prefix `02.05.02`; a main-branch BambuStudio
+source tree often expects `02.05.03` — details in the table below.)
 
-## Build options
+### CMake cache options (reference)
+
+Pass these on the **first** `cmake -S . -B build …` line (see above). Defaults
+match a typical Linux install; change only when you know you need to.
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| `CMAKE_INSTALL_PREFIX` | `$HOME/.config/BambuStudio` on native Linux builds | Where `cmake --install` places `plugins/` and `ota/plugins/`. Ignored if you already set a prefix in an existing build tree — reconfigure or delete `build/` to pick up the default. |
 | `OBN_VERSION` | tracked to latest Bambu Studio release | The version string `bambu_network_get_version()` returns. Studio checks only the first 8 chars (`MAJOR.MINOR.PATCH`). |
 | `OBN_ENABLE_WORKAROUNDS` | `ON` | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With `OFF` the plugin is a strict drop-in: same wire protocols the stock plugin uses and nothing else. Studio will transparently lose every workaround-backed feature (file browser stays empty, Send greys out on P2S, etc.) but nothing half-done runs at runtime. |
 | `OBN_FT_FTPS_FASTPATH` | `ON` | Serve the `ft_*` C ABI over FTPS for LAN URLs (media-ability probe + STOR-based upload with live progress). Turn `OFF` to keep every `ft_*` call as a polite-failure stub; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `OBN_ENABLE_WORKAROUNDS`. |
 
-## Install
+### First-time Studio configuration
 
-```sh
-cmake --install build --prefix ~/.config/BambuStudio
-```
-
-This copies:
-
-- `libbambu_networking.so` to `~/.config/BambuStudio/plugins/`
-- `libBambuSource.so` stub to `~/.config/BambuStudio/plugins/`
-- `liblive555.so` stub to `~/.config/BambuStudio/plugins/`
-- `ota/plugins/network_plugins.json` metadata so Studio's updater leaves it
-  alone.
-
-Then edit `~/.config/BambuStudio/BambuStudio.conf`, section `"app"`:
+Edit `~/.config/BambuStudio/BambuStudio.conf`, section `"app"`:
 
 ```json
 "installed_networking": "1",

@@ -5,6 +5,17 @@ project(open-bambu-networking
     LANGUAGES CXX
 )
 
+# Default install location: same tree Bambu Studio uses on Linux (~/.config/BambuStudio).
+# Override with -DCMAKE_INSTALL_PREFIX=... when needed.
+if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
+    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+        if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
+            set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.config/BambuStudio"
+                CACHE PATH "Install prefix (plugins/ and ota/plugins/ under it)" FORCE)
+        endif()
+    endif()
+endif()
+
 # The plugin's reported version must have the same first-8-char prefix as
 # Bambu Studio's SLIC3R_VERSION. AppImage v02.05.02.51 expects prefix
 # "02.05.02"; source builds from the main branch currently expect "02.05.03".
@@ -225,12 +236,16 @@ if(OBN_BUILD_TESTS)
         src/cert_store.cpp
         src/cloud_auth.cpp
         src/cloud_session.cpp
+        src/cover_cache.cpp
+        src/cover_server.cpp
+        src/ftps.cpp
         src/http_client.cpp
         src/json_lite.cpp
         src/lan_session.cpp
         src/log.cpp
         src/mqtt_client.cpp
-        src/ssdp.cpp)
+        src/ssdp.cpp
+        src/zip_reader.cpp)
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
@@ -240,6 +255,7 @@ if(OBN_BUILD_TESTS)
         PkgConfig::CURL
         OpenSSL::SSL
         OpenSSL::Crypto
+        ZLIB::ZLIB
     )
     add_test(NAME lan_live COMMAND lan_live_test)
 endif()
