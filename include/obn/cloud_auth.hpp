@@ -2,11 +2,15 @@
 
 // High-level wrappers for Bambu's cloud auth endpoints.
 //
-// We currently implement the email/password path against the global
-// `api.bambulab.com` host (with CN mirror at `api.bambulab.cn`). The
-// ticket-exchange path (used by Studio's "system browser login") still
-// needs to be reverse-engineered from the original plugin; until then
-// `login_with_ticket` returns Unimplemented.
+// Studio drives the interactive sign-in through its own wxWebView /
+// system-browser flow and hands the resulting tokens back via
+// `bambu_network_change_user` (see Agent::apply_login_info). On our
+// side we only need:
+//   * a ticket->token exchange (for the "system browser" callback),
+//   * a refresh_token rotation (to keep the session alive), and
+//   * a profile fetch (uid / nickname / avatar).
+// The global host is `api.bambulab.com`, with a CN mirror at
+// `api.bambulab.cn`.
 
 #include <cstdint>
 #include <string>
@@ -52,25 +56,12 @@ struct ProfileResult {
 std::string api_host(const std::string& region);
 std::string web_host(const std::string& region);
 
-AuthResult login_with_password(const std::string& region,
-                               const std::string& email,
-                               const std::string& password);
-
-// Finish the verifyCode flow started by a login_with_password() where
-// `login_type == "verifyCode"`: the user typed in the 6-digit code the
-// cloud emailed them and we post it back. Returns a fully-populated
-// session on success.
-AuthResult login_with_code(const std::string& region,
-                           const std::string& email,
-                           const std::string& code);
-
-// Request an email verification code for `email`. Returns ok=true only
-// on HTTP 200; otherwise error_message is filled in.
-AuthResult send_email_code(const std::string& region,
-                           const std::string& email);
-
-// Ticket-exchange: not yet implemented. Returns ok=false with
-// error_message set.
+// Ticket-exchange: the "system browser" / wxWebView login lands on the
+// local HTTP server Studio stands up and hands us a short-lived
+// `ticket`. We POST it to /v1/user-service/user/ticket/<TICKET> (the
+// body is ignored) and the server replies with accessToken /
+// refreshToken. On success the populated AuthResult's raw_body is the
+// JSON Studio feeds back into `bambu_network_change_user`.
 AuthResult login_with_ticket(const std::string& region,
                              const std::string& ticket);
 

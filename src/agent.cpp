@@ -382,34 +382,90 @@ int Agent::apply_login_info(const std::string& login_info_json)
         OBN_WARN("apply_login_info: bad JSON: %s", perr.c_str());
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
     }
-    obn::auth::Session s = auth_store_->snapshot();
-    s.region        = cloud_region();
-    s.access_token  = root->find("accessToken").as_string();
-    if (auto rt = root->find("refreshToken").as_string(); !rt.empty())
-        s.refresh_token = rt;
-    if (auto ac = root->find("account").as_string(); !ac.empty())
-        s.account = ac;
-    auto expires_in = root->find("expiresIn").as_int(0);
-    s.expires_at = std::chrono::system_clock::now() +
-                   std::chrono::seconds(expires_in > 0 ? expires_in : 3 * 30 * 24 * 3600);
 
-    if (s.access_token.empty()) {
-        OBN_WARN("apply_login_info: no accessToken in payload");
+    // change_user() gets called with two very different shapes and we have
+    // to tolerate both:
+    //
+    //  A. Raw API response to /v1/user-service/user/ticket/<T> (from our
+    //     own login_with_ticket, via the login WebView's window.postMessage
+    //     path). camelCase fields right at the root:
+    //       {"accessToken":"...","refreshToken":"...","expiresIn":N,
+    //        "refreshExpiresIn":N,"tfaKey":"","accessMethod":"ticket",...}
+    //
+    //  B. Studio-built envelope out of HttpServer.cpp:538-546 (the
+    //     third-party-login flow that lands on localhost:<port>). Nested,
+    //     snake_case, and expires_in is stringified:
+    //       {"data":{"token":"...","refresh_token":"...",
+    //                "expires_in":"31536000","refresh_expires_in":"...",
+    //                "user":{"uid":"...","name":"...",
+    //                        "account":"...","avatar":"..."}}}
+    //
+    // We probe B first (data.token takes precedence) because if both are
+    // present the envelope is the canonical one: it also carries the
+    // already-fetched profile, which saves us a second /my/profile HTTP.
+
+    auto read_int_or_str = [](const obn::json::Value& v) -> std::int64_t {
+        if (v.is_number()) return v.as_int(0);
+        const auto& s = v.as_string();
+        if (s.empty()) return 0;
+        try { return std::stoll(s); } catch (...) { return 0; }
+    };
+
+    std::string access_token  = root->find("data.token").as_string();
+    std::string refresh_token = root->find("data.refresh_token").as_string();
+    std::int64_t expires_in   = read_int_or_str(root->find("data.expires_in"));
+    std::string account       = root->find("data.user.account").as_string();
+    std::string user_id       = root->find("data.user.uid").as_string();
+    std::string user_name     = root->find("data.user.name").as_string();
+    std::string nick_name     = root->find("data.user.nickname").as_string();
+    std::string avatar        = root->find("data.user.avatar").as_string();
+
+    bool have_profile_inline = !user_id.empty() || !user_name.empty() ||
+                               !avatar.empty() || !account.empty();
+
+    if (access_token.empty()) {
+        // Shape A: raw API response. Profile is *not* included here.
+        access_token  = root->find("accessToken").as_string();
+        refresh_token = root->find("refreshToken").as_string();
+        expires_in    = read_int_or_str(root->find("expiresIn"));
+        account       = root->find("account").as_string();
+    }
+
+    if (access_token.empty()) {
+        OBN_WARN("apply_login_info: no access token in payload (json head: %.200s)",
+                 login_info_json.c_str());
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
     }
+
+    obn::auth::Session s = auth_store_->snapshot();
+    s.region        = cloud_region();
+    s.access_token  = access_token;
+    if (!refresh_token.empty()) s.refresh_token = refresh_token;
+    if (!account.empty())       s.account       = account;
+    s.expires_at    = std::chrono::system_clock::now() +
+                      std::chrono::seconds(expires_in > 0 ? expires_in
+                                                          : 3 * 30 * 24 * 3600);
     auth_store_->set(s);
 
-    // Fire-and-forget profile fetch so get_user_id/name/avatar return
-    // something real the next time Studio asks. Synchronous but fast.
-    auto prof = obn::cloud::get_profile(s.region, s.access_token);
-    if (prof.ok) {
-        auth_store_->update_profile(prof.user_id, prof.user_name,
-                                    prof.nick_name, prof.avatar);
-        OBN_INFO("change_user: hello %s (uid=%s)",
-                 prof.user_name.empty() ? prof.nick_name.c_str() : prof.user_name.c_str(),
-                 prof.user_id.c_str());
+    // Skip the /my/profile round-trip when Studio already put the profile
+    // into the envelope; that's the common case and halves login latency.
+    // Fall back to the network fetch otherwise (shape A).
+    if (have_profile_inline) {
+        auth_store_->update_profile(user_id, user_name, nick_name, avatar);
+        OBN_INFO("change_user: hello %s (uid=%s, inline profile)",
+                 user_name.empty() ? nick_name.c_str() : user_name.c_str(),
+                 user_id.c_str());
     } else {
-        OBN_WARN("change_user: profile fetch failed: %s", prof.error_message.c_str());
+        auto prof = obn::cloud::get_profile(s.region, s.access_token);
+        if (prof.ok) {
+            auth_store_->update_profile(prof.user_id, prof.user_name,
+                                        prof.nick_name, prof.avatar);
+            OBN_INFO("change_user: hello %s (uid=%s)",
+                     prof.user_name.empty() ? prof.nick_name.c_str() : prof.user_name.c_str(),
+                     prof.user_id.c_str());
+        } else {
+            OBN_WARN("change_user: profile fetch failed: %s", prof.error_message.c_str());
+        }
     }
 
     if (auto cb = [this]() { std::lock_guard<std::mutex> lk(mu_); return on_user_login_; }())

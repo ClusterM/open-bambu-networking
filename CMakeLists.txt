@@ -115,30 +115,6 @@ install(TARGETS bambu_networking BambuSource live555
     LIBRARY DESTINATION plugins
 )
 
-# --------------------------------------------------------------------------
-# obn-login (CLI helper for offline sign-in with email/password)
-# --------------------------------------------------------------------------
-
-add_executable(obn_login
-    tools/obn_login.cpp
-    src/auth.cpp
-    src/cloud_auth.cpp
-    src/http_client.cpp
-    src/json_lite.cpp
-    src/log.cpp
-)
-target_include_directories(obn_login PRIVATE include)
-target_compile_definitions(obn_login PRIVATE
-    OBN_VERSION_STRING="${OBN_VERSION}"
-)
-target_link_libraries(obn_login PRIVATE
-    PkgConfig::CURL
-    OpenSSL::SSL
-    OpenSSL::Crypto
-)
-set_target_properties(obn_login PROPERTIES OUTPUT_NAME "obn-login")
-install(TARGETS obn_login RUNTIME DESTINATION bin)
-
 # Studio's PresetUpdater expects this JSON to declare the cached version in
 # <data_dir>/ota/plugins/; we ship the same file so the updater trusts our
 # installation.
