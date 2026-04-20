@@ -86,11 +86,19 @@ set_target_properties(bambu_networking PROPERTIES
 )
 
 # --------------------------------------------------------------------------
-# libBambuSource.so  (stub for camera; only needs to load)
+# libBambuSource.so  (camera MJPG tunnel for P1/A1; consumed by Studio's
+# gstbambusrc element).
 # --------------------------------------------------------------------------
+
+pkg_check_modules(GST      REQUIRED IMPORTED_TARGET gstreamer-1.0)
+pkg_check_modules(GST_APP  REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
 
 add_library(BambuSource SHARED stubs/BambuSource.cpp)
 set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
+target_link_libraries(BambuSource PRIVATE
+    OpenSSL::SSL OpenSSL::Crypto
+    PkgConfig::GST PkgConfig::GST_APP
+)
 
 # --------------------------------------------------------------------------
 # liblive555.so  (stub; used by the real BambuSource internally)
