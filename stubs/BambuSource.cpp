@@ -69,6 +69,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 
+#include <dlfcn.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -864,14 +865,21 @@ extern "C" void rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad,
 // race in Studio's long-lived GStreamer context that manifests as
 // "streaming stopped, reason not-linked" on the second play):
 //
-//   rtspsrc [location, user-id, user-pw, protocols=tcp, latency=200,
-//            tls-validation-flags=0, do-retransmission=false]
+//   rtspsrc [location, user-id, user-pw, protocols=tcp, latency=120,
+//            drop-on-latency=true, tls-validation-flags=0,
+//            do-retransmission=false]
 //      --(pad-added, H264)--> rtph264depay
-//      --> h264parse --> avdec_h264 --> videoconvert --> videoscale
+//      --> h264parse --> <h264-decoder>
+//      --> queue [leaky=downstream, max-size-buffers=2] (decouples
+//                 decoder from jpegenc: a short Studio-side stall can
+//                 drop at most one stale frame instead of back-
+//                 pressuring the decoder/rtspsrc and triggering a
+//                 "fast-forward" burst when the stall ends)
+//      --> videoconvert --> videoscale
 //      --> capsfilter [video/x-raw,width=1280,height=720]
 //      --> jpegenc [quality=80, idct-method=ifast]
-//      --> appsink name=sink [emit-signals=false, drop=false,
-//                             max-buffers=4, sync=false]
+//      --> appsink name=sink [emit-signals=false, drop=true,
+//                             max-buffers=2, sync=false]
 //
 // See comments inside for why each property has the value it does.
 [[maybe_unused]] int open_rtsp(Tunnel* t)
@@ -904,45 +912,58 @@ extern "C" void rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad,
         dec = gst_element_factory_make(name, "dec");
         if (dec) { dec_name = name; break; }
     }
+    GstElement* dec_queue = gst_element_factory_make("queue",        "decq");
     GstElement* conv      = gst_element_factory_make("videoconvert", "conv");
     GstElement* scale     = gst_element_factory_make("videoscale",   "scale");
     GstElement* capsf     = gst_element_factory_make("capsfilter",   "capsf");
     GstElement* enc       = gst_element_factory_make("jpegenc",      "enc");
     GstElement* sink      = gst_element_factory_make("appsink",      "sink");
-    if (!pipeline || !src || !depay || !parse || !dec || !conv ||
-        !scale || !capsf || !enc || !sink) {
+    if (!pipeline || !src || !depay || !parse || !dec || !dec_queue ||
+        !conv || !scale || !capsf || !enc || !sink) {
         log_fmt(t->logger, t->log_ctx,
                 "open_rtsp: missing GStreamer element(s): "
-                "pipeline=%p src=%p depay=%p parse=%p dec=%p conv=%p "
-                "scale=%p capsf=%p enc=%p sink=%p",
-                pipeline, src, depay, parse, dec, conv, scale, capsf,
-                enc, sink);
+                "pipeline=%p src=%p depay=%p parse=%p dec=%p decq=%p "
+                "conv=%p scale=%p capsf=%p enc=%p sink=%p",
+                pipeline, src, depay, parse, dec, dec_queue,
+                conv, scale, capsf, enc, sink);
         if (pipeline) gst_object_unref(pipeline);
         else {
-            if (src)   gst_object_unref(src);
-            if (depay) gst_object_unref(depay);
-            if (parse) gst_object_unref(parse);
-            if (dec)   gst_object_unref(dec);
-            if (conv)  gst_object_unref(conv);
-            if (scale) gst_object_unref(scale);
-            if (capsf) gst_object_unref(capsf);
-            if (enc)   gst_object_unref(enc);
-            if (sink)  gst_object_unref(sink);
+            if (src)       gst_object_unref(src);
+            if (depay)     gst_object_unref(depay);
+            if (parse)     gst_object_unref(parse);
+            if (dec)       gst_object_unref(dec);
+            if (dec_queue) gst_object_unref(dec_queue);
+            if (conv)      gst_object_unref(conv);
+            if (scale)     gst_object_unref(scale);
+            if (capsf)     gst_object_unref(capsf);
+            if (enc)       gst_object_unref(enc);
+            if (sink)      gst_object_unref(sink);
         }
         set_last_error("missing gst element");
         return -1;
     }
 
-    // rtspsrc: latency=200 gives the jitterbuffer enough window to
-    // reassemble multi-RTP-packet NALs over TCP without adding visible
-    // wall-clock lag. tls-validation-flags=0 matches the stock plugin
-    // which accepts the printer's self-signed cert.
+    // rtspsrc: latency=120 ms is a compromise between end-to-end
+    // delay and jitter tolerance. At 50 ms we sporadically dropped
+    // entire RTP packets on LAN (visible as a half-green frame /
+    // missing frame), at 200 ms the stock plugin value we inherited
+    // single-frame stalls in Studio cascaded into multi-frame catch-
+    // up bursts. 120 ms holds the jitterbuffer window at roughly
+    // three 30 fps frame-times, which is still comfortably below
+    // what a person sees as "delayed".
+    // drop-on-latency=true turns the jitterbuffer into a leaky one:
+    // packets that arrive past the window are dropped instead of
+    // back-pressuring the transport, which on TCP would cascade into
+    // visible "freeze for 200 ms, then catch up" hiccups.
+    // tls-validation-flags=0 matches the stock plugin which accepts
+    // the printer's self-signed cert.
     g_object_set(src,
                  "location",             uri.c_str(),
                  "user-id",              t->url.user.c_str(),
                  "user-pw",              t->url.passwd.c_str(),
                  "protocols",            4 /* GST_RTSP_LOWER_TRANS_TCP */,
-                 "latency",              200,
+                 "latency",              120,
+                 "drop-on-latency",      TRUE,
                  "tls-validation-flags", 0,
                  "do-retransmission",    FALSE,
                  nullptr);
@@ -965,33 +986,62 @@ extern "C" void rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad,
     g_object_set(capsf, "caps", scaled_caps, nullptr);
     gst_caps_unref(scaled_caps);
 
-    // jpegenc: quality=90 + islow IDCT keeps visible banding and
-    // macroblock artefacts out of high-contrast transitions (e.g.
-    // print-bed LED turning on) without costing enough CPU to matter
-    // -- on a modern desktop this is ~7-10% of one core for 720p30.
-    // ifast drops ~3% CPU but introduces a faint "ringing" on sharp
-    // edges; we had complaints about that, so islow it is.
-    g_object_set(enc, "quality", 90, "idct-method", 0 /* islow */, nullptr);
+    // jpegenc: quality=80 + ifast IDCT is the sweet spot for a
+    // live-camera feed: ~4-5% of one core for 720p30 vs ~8% at
+    // quality=90/islow, and the faint ringing on sharp edges that
+    // ifast produces is below the printer camera's own sensor noise.
+    g_object_set(enc, "quality", 80, "idct-method", 1 /* ifast */, nullptr);
 
-    // appsink: no callbacks (we poll from Bambu_ReadSample), backpressure
-    // (drop=false max-buffers=4) instead of dropping frames, and
-    // sync=false so we dispatch as soon as a frame is ready -- clocking
-    // happens on Studio's side of the tunnel.
+    // dec_queue: small leaky queue between the H.264 decoder and the
+    // conv/scale/jpegenc chain. If Studio's consumer stalls even
+    // briefly (UI thread blocked, window minimised, etc.) the jpegenc
+    // chain slows down; without this queue that back-pressures the
+    // decoder, which back-pressures rtspsrc, which on TCP buffers
+    // until the stall ends and then dumps all the accumulated frames
+    // as fast as the CPU can chew them - the visible "fast-forward
+    // hiccup" symptom. Leaking the oldest decoded frame keeps the
+    // producer side of the pipeline ticking at real time.
+    //
+    // Why 2 buffers instead of 1: the 1-buffer version dropped
+    // *every* frame that was produced while jpegenc was still
+    // encoding the previous one, which in practice capped us well
+    // below 30 fps on machines where jpegenc takes 15-20 ms per
+    // 720p frame. A 2-buffer slot means we only drop when Studio
+    // is actively behind on pulling, not on normal encoder latency.
+    g_object_set(dec_queue,
+                 "leaky",            2 /* GST_QUEUE_LEAKY_DOWNSTREAM */,
+                 "max-size-buffers", 2,
+                 "max-size-bytes",   0,
+                 "max-size-time",    G_GUINT64_CONSTANT(0),
+                 nullptr);
+
+    // appsink: no callbacks (we poll from Bambu_ReadSample), drop the
+    // oldest queued frame if a new one arrives before we've pulled,
+    // and sync=false so we dispatch as soon as a frame is ready --
+    // clocking happens on Studio's side of the tunnel.
+    //
+    // drop=true/max-buffers=2 is the consumer-side counterpart to
+    // the dec_queue above: we keep at most one in-flight frame plus
+    // one "on-deck" so Studio's Bambu_ReadSample poll (which isn't
+    // strictly locked to the producer's 30 fps clock) can always
+    // grab something fresh without starving. After a transient
+    // stall the liveview snaps back to "now" instead of replaying
+    // a long backlog.
     g_object_set(sink,
                  "emit-signals", FALSE,
-                 "drop",         FALSE,
-                 "max-buffers",  4,
+                 "drop",         TRUE,
+                 "max-buffers",  2,
                  "sync",         FALSE,
                  nullptr);
 
-    gst_bin_add_many(GST_BIN(pipeline), src, depay, parse, dec, conv,
-                     scale, capsf, enc, sink, nullptr);
+    gst_bin_add_many(GST_BIN(pipeline), src, depay, parse, dec,
+                     dec_queue, conv, scale, capsf, enc, sink, nullptr);
 
-    // Static portion: depay -> parse -> dec -> conv -> scale -> capsf
-    //                 -> enc -> appsink. rtspsrc -> depay is wired in
-    //                 the pad-added handler below.
-    if (!gst_element_link_many(depay, parse, dec, conv, scale, capsf,
-                               enc, sink, nullptr)) {
+    // Static portion: depay -> parse -> dec -> dec_queue -> conv ->
+    //                 scale -> capsf -> enc -> appsink. rtspsrc ->
+    //                 depay is wired in the pad-added handler below.
+    if (!gst_element_link_many(depay, parse, dec, dec_queue, conv,
+                               scale, capsf, enc, sink, nullptr)) {
         log_fmt(t->logger, t->log_ctx,
                 "open_rtsp: gst_element_link_many failed");
         gst_object_unref(pipeline);
@@ -1035,6 +1085,14 @@ extern "C" void rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad,
         set_last_error("gst PLAYING failed");
         return -1;
     }
+
+    // gst-libav only loads libavutil/libavcodec when the first
+    // avdec_h264 instance goes to PAUSED/PLAYING, so our gst_init_once
+    // call happened too early to see the library in-process. Retry
+    // now, which is the path that actually silences the per-frame
+    // "deprecated pixel format used" spam swscale prints when the
+    // YUVJ420P decoder output feeds into videoconvert.
+    silence_libav_warnings();
 
     GstBus* bus = gst_element_get_bus(t->pipeline);
     const GstClockTime kWaitNs = 10ULL * GST_SECOND;

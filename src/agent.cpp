@@ -2,7 +2,9 @@
 
 #include <sys/stat.h>
 
+#include <chrono>
 #include <cstdint>
+#include <thread>
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
@@ -608,16 +610,12 @@ bool Agent::start_discovery(bool enable, bool sending)
 void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
 {
     // Studio calls this ~1 Hz from DeviceManagerRefresher::on_timer in
-    // addition to once right after on_printer_connected_fn. We deduplicate so
-    // that the printer only sees one extra TLS handshake per session.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!certified_devs_.insert(dev_id).second) {
-            // Already captured earlier this session - nothing more to do.
-            return;
-        }
-    }
-
+    // addition to once right after on_printer_connected_fn on the UI thread.
+    // The actual cert snapshot does a blocking SSL_connect to port 8883 that
+    // can hang for ~timeout_ms when the printer refuses the extra handshake
+    // (seen in the field: TCP SYN/ACK fine, ClientHello goes nowhere). To
+    // keep the UI responsive we offload that to a detached worker and
+    // back off on failure.
     if (!lan_only) {
         // Cloud / hybrid mode: Bambu's own plugin fetches the device-
         // specific MQTT tunnel cert from MakerWorld here. We don't have
@@ -626,23 +624,30 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         return;
     }
 
-    // Grab the IP of the currently-open LAN session (if it matches dev_id).
-    // install_device_cert can technically be called for a device we haven't
-    // opened an MQTT connection to yet; in that case there's nothing to
-    // snapshot.
+    // Fast-path checks (success-cache, in-flight, cooldown, matching LAN
+    // session). All of them are cheap and must never block.
     std::string ip;
     std::string cfg_dir;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (certified_devs_.count(dev_id)) {
+            return; // already snapshotted this session.
+        }
+        if (cert_snapshot_inflight_.count(dev_id)) {
+            return; // a worker is on it.
+        }
+        auto it = cert_snapshot_cooldown_.find(dev_id);
+        if (it != cert_snapshot_cooldown_.end() &&
+            std::chrono::steady_clock::now() < it->second) {
+            return; // recent failure, don't retry yet.
+        }
         if (lan_session_ && lan_session_->dev_id() == dev_id)
             ip = lan_session_->dev_ip();
         cfg_dir = config_dir_;
     }
+
     if (ip.empty()) {
         OBN_DEBUG("install_device_cert dev=%s: no active LAN session, skipping", dev_id.c_str());
-        // Put it back so we retry on the next tick.
-        std::lock_guard<std::mutex> lk(mu_);
-        certified_devs_.erase(dev_id);
         return;
     }
     if (cfg_dir.empty()) {
@@ -650,16 +655,32 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         return;
     }
 
-    std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
-    OBN_INFO("install_device_cert dev=%s ip=%s: snapshotting to %s",
-             dev_id.c_str(), ip.c_str(), out_path.c_str());
-    bool ok = cert_store::capture_peer_cert_pem(ip, 8883, /*timeout_ms=*/3000, out_path);
-    if (!ok) {
-        OBN_WARN("install_device_cert dev=%s: snapshot failed", dev_id.c_str());
-        // Don't poison the cache - allow a retry on the next tick.
+    // Claim the inflight slot and launch the worker. cert_snapshot_inflight_
+    // is cleared by the worker on exit, certified_devs_ only on success,
+    // cooldown only on failure.
+    {
         std::lock_guard<std::mutex> lk(mu_);
-        certified_devs_.erase(dev_id);
+        cert_snapshot_inflight_.insert(dev_id);
     }
+
+    std::thread([this, dev_id, ip, cfg_dir]() {
+        std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+        OBN_INFO("install_device_cert dev=%s ip=%s: snapshotting to %s",
+                 dev_id.c_str(), ip.c_str(), out_path.c_str());
+        bool ok = cert_store::capture_peer_cert_pem(
+            ip, 8883, /*timeout_ms=*/3000, out_path);
+        std::lock_guard<std::mutex> lk(mu_);
+        cert_snapshot_inflight_.erase(dev_id);
+        if (ok) {
+            certified_devs_.insert(dev_id);
+            cert_snapshot_cooldown_.erase(dev_id);
+        } else {
+            OBN_WARN("install_device_cert dev=%s: snapshot failed, cooldown 60s",
+                     dev_id.c_str());
+            cert_snapshot_cooldown_[dev_id] =
+                std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        }
+    }).detach();
 }
 
 #define OBN_SETTER(method, field, type)                 \

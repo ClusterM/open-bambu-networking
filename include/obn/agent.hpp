@@ -1,11 +1,13 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "obn/auth.hpp"
@@ -299,6 +301,16 @@ private:
     // install_device_cert() ~1 Hz, and we don't want to pound the printer
     // with a fresh TLS handshake every tick.
     std::set<std::string> certified_devs_;
+    // dev_ids for which a cert-snapshot worker is currently running. Prevents
+    // stacking multiple blocking SSL_connect attempts on a printer that
+    // refuses the extra handshake.
+    std::set<std::string> cert_snapshot_inflight_;
+    // Negative cache for cert snapshotting: dev_id -> time when we may retry.
+    // If a snapshot attempt fails (e.g. printer rejects the second TLS
+    // session while our LAN MQTT is already connected) we back off for a
+    // while instead of hammering the printer on every 1 Hz refresh tick.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        cert_snapshot_cooldown_;
 
     // Callbacks - stored, not (yet) invoked.
     BBL::OnMsgArrivedFn       on_ssdp_msg_{};
