@@ -341,6 +341,12 @@ bool try_rewrite_home_flag(std::string& payload)
 
 } // namespace
 
+// Forward declarations for helpers defined further down; keeps the file
+// readable (firmware-cache logic lives with render_firmware_json). These
+// live in obn:: (not the anonymous namespace above) so the definition
+// and the notify_local_message caller bind to the same symbol.
+static void update_fw_state(Agent::DeviceFw* dev, const std::string& payload);
+
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
     BBL::OnMessageFn cb;
@@ -442,7 +448,254 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d (strict)",
               dev_id.c_str(), patched.size(), cb ? 1 : 0);
 #endif
+
+    // Harvest firmware info from any frame that carries it. This
+    // runs whether or not workarounds are compiled in -- it's purely
+    // additive and only populates an in-memory cache used by
+    // bambu_network_get_printer_firmware.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        update_fw_state(&fw_state_for(dev_id), patched);
+    }
+
     if (cb) cb(dev_id, patched);
+}
+
+// Pulls firmware bookkeeping out of every MQTT frame we forward. Studio
+// assembles the same info internally (module_vers + upgrade->m_new_ver_list),
+// but it never shares that back with the plugin, so we mirror it here so
+// render_firmware_json has something to serve.
+//
+// Two shapes feed this:
+//
+//  * Reply to info.command=get_version:
+//      {"info":{"command":"get_version","module":[
+//          {"name":"ota","sw_ver":"01.08.01.00","product_name":"P2S",
+//           "sn":"...","sw_new_ver":"01.09.01.00"},
+//          {"name":"ams/0","sw_ver":"00.00.06.49", ... }, ...
+//      ]}}
+//    Present the printer's current and (optionally) advertised new
+//    versions for every module it knows about.
+//
+//  * push_status.upgrade_state.new_ver_list (P1/X1 firmware only pushes
+//    this when new firmware is actually available):
+//      {"print":{"upgrade_state":{"new_ver_list":[
+//          {"name":"ota","cur_ver":"01.08.01.00","new_ver":"01.09.01.00"}
+//      ]}}}
+//    Used to fill in new_ver when get_version didn't include it.
+//
+// We keep whichever field was set most recently per module; both push
+// frequently enough that the record converges. Running under mu_.
+static void parse_module_into(Agent::DeviceFw*        dev,
+                              const obn::json::Value& item)
+{
+    if (!item.is_object()) return;
+    // Every json_lite find() returns by value, so we must copy the
+    // string out of each temporary before it dies. Binding to
+    // `const std::string&` produces -Wdangling-reference under GCC 13.
+    std::string name = item.find("name").as_string();
+    if (name.empty()) return;
+    auto& m = dev->modules[name];
+    m.name = std::move(name);
+
+    std::string cur = item.find("sw_ver").as_string();
+    if (!cur.empty()) m.cur_ver = std::move(cur);
+    std::string nv = item.find("sw_new_ver").as_string();
+    if (!nv.empty()) m.new_ver = std::move(nv);
+    std::string alt_nv = item.find("new_ver").as_string();
+    if (!alt_nv.empty() && m.new_ver.empty()) m.new_ver = std::move(alt_nv);
+    std::string alt_cur = item.find("cur_ver").as_string();
+    if (!alt_cur.empty() && m.cur_ver.empty()) m.cur_ver = std::move(alt_cur);
+    std::string prod = item.find("product_name").as_string();
+    if (!prod.empty()) m.product_name = std::move(prod);
+    std::string sn = item.find("sn").as_string();
+    if (!sn.empty()) m.sn = std::move(sn);
+}
+
+static void update_fw_state(Agent::DeviceFw* dev, const std::string& payload)
+{
+    if (!dev) return;
+    // Cheap prefilter: only parse if the string even hints at firmware
+    // data. Keeps per-message cost close to zero for the dense push_status
+    // heartbeat frames that otherwise dominate this path.
+    if (payload.find("sw_ver") == std::string::npos &&
+        payload.find("new_ver_list") == std::string::npos) {
+        return;
+    }
+    auto v = obn::json::parse(payload);
+    if (!v) return;
+
+    // info.command=get_version reply (modules array).
+    if (v->find("info.command").as_string() == "get_version") {
+        auto modules = v->find("info.module");
+        for (const auto& m : modules.as_array()) {
+            parse_module_into(dev, m);
+        }
+    }
+
+    // push_status.print.upgrade_state.new_ver_list.
+    {
+        auto list = v->find("print.upgrade_state.new_ver_list");
+        for (const auto& m : list.as_array()) {
+            parse_module_into(dev, m);
+        }
+    }
+}
+
+// Version-compare just good enough for Bambu's "XX.YY.ZZ.WW" scheme.
+// Returns -1 if a<b, 0 if equal or uncomparable, +1 if a>b.
+static int version_compare(const std::string& a, const std::string& b)
+{
+    if (a == b || a.empty() || b.empty()) return 0;
+    auto parts = [](const std::string& s) {
+        std::vector<int> out;
+        size_t i = 0;
+        while (i <= s.size()) {
+            if (i == s.size() || s[i] == '.') {
+                // treat empty/bad segment as 0; we want to keep going.
+                // nothing to append here.
+                ++i;
+            } else {
+                size_t j = i;
+                int n = 0;
+                while (j < s.size() && s[j] >= '0' && s[j] <= '9') {
+                    n = n * 10 + (s[j] - '0');
+                    ++j;
+                }
+                out.push_back(n);
+                i = j;
+            }
+        }
+        return out;
+    };
+    auto pa = parts(a);
+    auto pb = parts(b);
+    size_t n = std::max(pa.size(), pb.size());
+    for (size_t i = 0; i < n; ++i) {
+        int va = i < pa.size() ? pa[i] : 0;
+        int vb = i < pb.size() ? pb[i] : 0;
+        if (va < vb) return -1;
+        if (va > vb) return +1;
+    }
+    return 0;
+}
+
+// Helper: append a JSON string value (opening quote, escaped contents,
+// closing quote). obn::json::escape already produces the quoted form,
+// so we just concat.
+static void emit_json_string(std::string* dst, const std::string& s)
+{
+    dst->append(obn::json::escape(s));
+}
+
+static void emit_fw_entry(std::string*       dst,
+                          bool*              first,
+                          const std::string& version,
+                          const std::string& description)
+{
+    if (!*first) dst->push_back(',');
+    *first = false;
+    dst->append(R"({"version":)");
+    emit_json_string(dst, version);
+    dst->append(R"(,"url":"","description":)");
+    emit_json_string(dst, description);
+    dst->push_back('}');
+}
+
+std::string Agent::render_firmware_json(const std::string& dev_id) const
+{
+    // Pull a snapshot under the lock; build the JSON text outside it.
+    DeviceFw snap;
+    bool have_device = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = device_fw_.find(dev_id);
+        if (it != device_fw_.end()) {
+            snap = it->second;
+            have_device = true;
+        }
+    }
+
+    // Release-note link derived from the OTA module's product_name.
+    // Bambu's support site has per-series pages; we map Pn to the P1
+    // page because they all share a changelog.
+    std::string product;
+    if (have_device) {
+        auto ota = snap.modules.find("ota");
+        if (ota != snap.modules.end()) product = ota->second.product_name;
+    }
+    auto product_slug = [&]() -> std::string {
+        if (product.find("X1") != std::string::npos) return "x1";
+        if (product.find("P2") != std::string::npos) return "p1";
+        if (product.find("P1") != std::string::npos) return "p1";
+        if (product.find("A1") != std::string::npos) return "a1";
+        if (product.find("H2") != std::string::npos) return "h2d";
+        if (product.find("N7") != std::string::npos) return "n7";
+        return "all";
+    }();
+    std::string notes_url =
+        "https://bambulab.com/en/support/firmware-download/" + product_slug;
+
+    std::string body;
+    body.reserve(512);
+    body.append(R"({"devices":[{"dev_id":)");
+    emit_json_string(&body, dev_id);
+    body.append(R"(,"firmware":[)");
+
+    bool first_ota = true;
+    if (have_device) {
+        auto ota_it = snap.modules.find("ota");
+        if (ota_it != snap.modules.end()) {
+            const auto& m = ota_it->second;
+            // Current version entry - release-note dialog falls back
+            // to it when the printer hasn't advertised a new version.
+            if (!m.cur_ver.empty()) {
+                std::string desc =
+                    "Currently installed firmware. Full changelog at " +
+                    notes_url + ".";
+                emit_fw_entry(&body, &first_ota, m.cur_ver, desc);
+            }
+            // New-version entry - drives the "current -> new" arrow
+            // and the release-note text the user sees after clicking.
+            if (!m.new_ver.empty() &&
+                version_compare(m.new_ver, m.cur_ver) > 0) {
+                std::string desc =
+                    "New firmware version " + m.new_ver +
+                    " is available.\n\nRelease notes: " + notes_url +
+                    "\n\nClick 'Update' to install; the printer already "
+                    "knows which package to download. Do not turn off "
+                    "the printer during the update (~10 minutes).";
+                emit_fw_entry(&body, &first_ota, m.new_ver, desc);
+            }
+        }
+    }
+    body.append(R"(],"ams":[)");
+
+    // Gather AMS entries; Studio's parser walks `ams_list.front().
+    // firmware` so wrap whatever we have in a single element.
+    std::string ams_fw;
+    bool first_ams = true;
+    if (have_device) {
+        for (const auto& kv : snap.modules) {
+            const std::string& key = kv.first;
+            // "ams/0", "ams/1", ... from get_version; "ams" from
+            // upgrade_state.new_ver_list.
+            if (key != "ams" && key.rfind("ams/", 0) != 0) continue;
+            const auto& m = kv.second;
+            const std::string& advertised =
+                !m.new_ver.empty() ? m.new_ver : m.cur_ver;
+            if (advertised.empty()) continue;
+            std::string desc = "AMS firmware. Release notes: " + notes_url;
+            emit_fw_entry(&ams_fw, &first_ams, advertised, desc);
+        }
+    }
+    if (!ams_fw.empty()) {
+        body.append(R"({"firmware":[)");
+        body.append(ams_fw);
+        body.append(R"(]})");
+    }
+    body.append(R"(]}]})");
+    return body;
 }
 
 bool Agent::lookup_synthetic_subtask(const std::string& subtask_id,

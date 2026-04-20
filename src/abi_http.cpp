@@ -185,12 +185,44 @@ OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_printer_firmware(void* /*agent*/,
-                                               std::string /*dev_id*/,
+OBN_ABI int bambu_network_get_printer_firmware(void* agent,
+                                               std::string dev_id,
                                                unsigned* http_code, std::string* http_body)
 {
-    if (http_code) *http_code = 0;
-    if (http_body) http_body->clear();
+    // The stock plugin fetches this from Bambu Lab's cloud firmware
+    // catalogue. We don't have cloud auth plumbed in, so we rebuild
+    // the subset Studio actually reads from the MQTT frames the
+    // printer already pushes through us: current versions come from
+    // info.command=get_version, advertised-new versions come from
+    // push_status.upgrade_state.new_ver_list. See Agent::render_
+    // firmware_json for details.
+    //
+    // The Update tab stays blank until this call returns a JSON that
+    // parses successfully AND whose devices[0].dev_id matches; an
+    // empty body (the previous stub) made json::parse("") throw and
+    // left m_firmware_valid=false forever.
+    std::string body;
+    if (auto* a = as_agent(agent)) {
+        body = a->render_firmware_json(dev_id);
+    } else {
+        // No agent context yet - emit the minimal valid envelope so
+        // Studio's json::parse doesn't throw. This path is only hit
+        // on startup before a printer has connected.
+        body.reserve(64);
+        body.append(R"({"devices":[{"dev_id":")");
+        for (char c : dev_id) {
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') || c == '_' || c == '-')
+                body.push_back(c);
+        }
+        body.append(R"(","firmware":[],"ams":[]}]})");
+    }
+
+    if (http_code) *http_code = 200;
+    if (http_body) *http_body = std::move(body);
+    OBN_DEBUG("get_printer_firmware dev=%s -> %zu bytes",
+              dev_id.c_str(),
+              http_body ? http_body->size() : size_t{0});
     return BAMBU_NETWORK_SUCCESS;
 }
 

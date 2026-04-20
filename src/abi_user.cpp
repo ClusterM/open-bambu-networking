@@ -27,10 +27,12 @@ OBN_ABI bool bambu_network_is_user_login(void* agent)
 {
     if (auto* a = as_agent(agent)) {
         bool v = a->user_logged_in();
-        OBN_INFO("is_user_login -> %s", v ? "true" : "false");
+        // Studio polls this on every paint of the sidebar avatar widget;
+        // at INFO it drowns out every other line, so demote to DEBUG.
+        OBN_DEBUG("is_user_login -> %s", v ? "true" : "false");
         return v;
     }
-    OBN_INFO("is_user_login -> false (no agent)");
+    OBN_DEBUG("is_user_login -> false (no agent)");
     return false;
 }
 

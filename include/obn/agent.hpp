@@ -223,6 +223,41 @@ public:
                                   SubtaskCoverInfo*  out) const;
 
     // -----------------------------
+    // Firmware catalogue (synthesised from MQTT).
+    // -----------------------------
+    // Rendered on demand from device_fw_ by bambu_network_get_printer_
+    // firmware. The stock plugin would fetch this from Bambu Lab's
+    // cloud firmware catalogue (auth-gated); we instead rebuild the
+    // subset Studio actually reads (versions + release-note text) out
+    // of the push_status.upgrade_state and info.get_version MQTT
+    // frames we already forward. That gives us:
+    //   * Populated "Update" tab with current/new versions.
+    //   * Non-empty Release Notes dialog.
+    //   * A functional Upgrade button (Studio's upgrade_confirm MQTT
+    //     command doesn't carry a URL; the printer already knows
+    //     which firmware it advertised in new_ver_list).
+    // What we can NOT do without cloud auth: flash an arbitrary
+    // OTA URL (CtrlUpgradeFirmware path). Studio only takes that
+    // path when the user explicitly picks a non-advertised version.
+    std::string render_firmware_json(const std::string& dev_id) const;
+
+    // Public so parse helpers inside agent.cpp can reach them; nobody
+    // outside the library has reason to touch these directly.
+    struct ModuleFw {
+        std::string name;          // "ota", "ams", "ahb", "cutting_module", ...
+        std::string cur_ver;       // installed version string (e.g. 01.08.01.00)
+        std::string new_ver;       // advertised-by-printer newer version, if any
+        std::string product_name;  // "P2S", "X1-Carbon", "AMS 2 Pro", ...
+        std::string sn;
+    };
+    struct DeviceFw {
+        std::map<std::string, ModuleFw> modules; // keyed by ModuleFw::name
+    };
+    // Accessor for the update-fw worker; returns a pointer into the
+    // map under mu_. Caller MUST hold mu_ for the entire access.
+    DeviceFw& fw_state_for(const std::string& dev_id) { return device_fw_[dev_id]; }
+
+    // -----------------------------
     // Cloud MQTT (Studio's "server" connection).
     // -----------------------------
     // Opens the long-lived TLS MQTT connection to us.mqtt.bambulab.com
@@ -285,6 +320,15 @@ private:
     // emit in notify_local_message. Trimmed when the user swaps the
     // active print, bounded to a handful of entries.
     std::map<std::string, std::pair<std::string, int>> synthetic_subtasks_;
+
+    // Per-device firmware snapshot, populated from MQTT forwarded
+    // through notify_local_message. Keyed by dev_id; value is the
+    // most recent picture we have of that printer's modules. See
+    // render_firmware_json() for how it's turned into the body Studio
+    // expects from bambu_network_get_printer_firmware. Structs are
+    // declared above (ModuleFw / DeviceFw) so agent.cpp helpers can
+    // reach them.
+    std::map<std::string, DeviceFw> device_fw_;
 
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")
