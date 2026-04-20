@@ -299,6 +299,27 @@ public:
     // Human-readable region identifier used by cloud endpoints.
     std::string cloud_region() const;
 
+    // ------------------------------------------------------------------
+    // Cloud bind (bambu_network_bind / ping_bind / …)
+    // ------------------------------------------------------------------
+    // Every SSDP JSON line Studio receives is also fed here so bind_detect
+    // can resolve dev_id/bind_state from IP without an MQTT password.
+    void cache_ssdp_json_for_bind(const std::string& device_info_json);
+    // Polls up to `wait_ms` for a cached SSDP snapshot whose dev_ip
+    // matches. Returns 0 and fills `out` on success, -1 on parse/conn
+    // failure, -3 if nothing arrived in time (Studio then switches to
+    // manual serial entry — same as stock returning -3).
+    int lookup_bind_detect(const std::string& dev_ip,
+                           BBL::detectResult& out,
+                           int                wait_ms);
+    // Last LAN access code seen in connect_printer for this dev_id (needed
+    // because bambu_network_bind does not pass the code in the ABI).
+    std::string lan_access_code_for(const std::string& dev_id) const;
+    // Friendly name from the last SSDP packet for this printer IP, or "".
+    std::string device_display_name_for_ip(const std::string& dev_ip) const;
+    // Bearer + optional Studio certification headers for api.bambulab.com.
+    std::map<std::string, std::string> cloud_api_http_headers() const;
+
 private:
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -355,6 +376,13 @@ private:
     // while instead of hammering the printer on every 1 Hz refresh tick.
     std::unordered_map<std::string, std::chrono::steady_clock::time_point>
         cert_snapshot_cooldown_;
+
+    // Last SSDP "device alive" JSON keyed by normalised LAN IP (see
+    // ssdp::to_device_info_json). Used by lookup_bind_detect().
+    std::unordered_map<std::string, std::string> ssdp_json_by_ip_;
+    // connect_printer() stores the MQTT/FTPS password (access code) here so
+    // bambu_network_bind can POST it to the cloud as bind_code.
+    std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
 
     // Callbacks - stored, not (yet) invoked.
     BBL::OnMsgArrivedFn       on_ssdp_msg_{};

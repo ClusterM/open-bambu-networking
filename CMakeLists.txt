@@ -91,6 +91,7 @@ add_library(bambu_networking SHARED
     src/auth.cpp
     src/cert_store.cpp
     src/cloud_auth.cpp
+    src/bind_cloud.cpp
     src/cloud_print.cpp
     src/cloud_session.cpp
     src/cover_cache.cpp

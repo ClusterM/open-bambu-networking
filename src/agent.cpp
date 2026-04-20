@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <thread>
 #include <utility>
 
@@ -18,6 +19,22 @@
 #include "obn/ssdp.hpp"
 
 namespace obn {
+
+namespace {
+
+std::string trim_ip_string(std::string s)
+{
+    while (!s.empty() &&
+           (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    std::size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+        ++i;
+    if (i > 0) s.erase(0, i);
+    return s;
+}
+
+} // namespace
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent()
@@ -74,7 +91,8 @@ int Agent::connect_printer(std::string dev_id,
 
     if (rc == BAMBU_NETWORK_SUCCESS) {
         std::lock_guard<std::mutex> lk(mu_);
-        lan_session_ = std::move(session);
+        lan_access_code_by_dev_[sess_dev_id] = session->password();
+        lan_session_                         = std::move(session);
     }
     return rc;
 }
@@ -842,6 +860,7 @@ bool Agent::start_discovery(bool enable, bool sending)
     // race on_machine_alive against wx's own rendering and crash under
     // high packet rates.
     auto on_msg = [this](std::string json) {
+        cache_ssdp_json_for_bind(json);
         BBL::OnMsgArrivedFn local_cb;
         BBL::QueueOnMainFn  local_queue;
         {
@@ -967,6 +986,102 @@ std::string Agent::cloud_region() const
 {
     std::string cc = country_code();
     return cc == "CN" ? "CN" : "GLOBAL";
+}
+
+void Agent::cache_ssdp_json_for_bind(const std::string& json)
+{
+    std::string perr;
+    auto        root = obn::json::parse(json, &perr);
+    if (!root) return;
+    std::string ip = trim_ip_string(root->find("dev_ip").as_string());
+    if (ip.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    ssdp_json_by_ip_[ip] = json;
+}
+
+int Agent::lookup_bind_detect(const std::string& dev_ip,
+                                BBL::detectResult& out,
+                                int                wait_ms)
+{
+    const std::string want = trim_ip_string(dev_ip);
+    if (want.empty()) return -1;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    std::string json;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = ssdp_json_by_ip_.find(want);
+            if (it != ssdp_json_by_ip_.end()) json = it->second;
+        }
+        if (!json.empty()) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            OBN_INFO("lookup_bind_detect: no SSDP for %s within %d ms",
+                     want.c_str(),
+                     wait_ms);
+            return -3;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) {
+        OBN_WARN("lookup_bind_detect: bad JSON: %s", perr.c_str());
+        return -1;
+    }
+
+    out.command      = "bind_detect";
+    out.dev_id       = root->find("dev_id").as_string();
+    out.dev_name     = root->find("dev_name").as_string();
+    out.model_id     = root->find("dev_type").as_string();
+    out.version      = root->find("ssdp_version").as_string();
+    out.bind_state   = root->find("bind_state").as_string();
+    out.connect_type = root->find("connect_type").as_string();
+    out.result_msg   = "ok";
+
+    if (out.dev_id.empty()) {
+        OBN_WARN("lookup_bind_detect: empty dev_id in SSDP json");
+        return -1;
+    }
+    return 0;
+}
+
+std::string Agent::lan_access_code_for(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto                        it = lan_access_code_by_dev_.find(dev_id);
+    if (it != lan_access_code_by_dev_.end()) return it->second;
+    if (lan_session_ && lan_session_->dev_id() == dev_id) return lan_session_->password();
+    return {};
+}
+
+std::string Agent::device_display_name_for_ip(const std::string& dev_ip) const
+{
+    const std::string ip = trim_ip_string(dev_ip);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = ssdp_json_by_ip_.find(ip);
+    if (it == ssdp_json_by_ip_.end()) return {};
+    std::string perr;
+    auto        root = obn::json::parse(it->second, &perr);
+    if (!root) return {};
+    return root->find("dev_name").as_string();
+}
+
+std::map<std::string, std::string> Agent::cloud_api_http_headers() const
+{
+    std::map<std::string, std::string> h;
+    obn::auth::Session                 s;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        s = auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
+        for (const auto& kv : extra_http_headers_) h[kv.first] = kv.second;
+    }
+    if (!s.access_token.empty()) h["Authorization"] = "Bearer " + s.access_token;
+    h["Accept"]        = "application/json";
+    h["Content-Type"]  = "application/json";
+    return h;
 }
 
 bool Agent::user_logged_in() const
