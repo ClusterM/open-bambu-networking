@@ -36,6 +36,11 @@ public:
     Value(bool b) : kind_(Kind::Bool), boolean_(b) {}
     Value(double d) : kind_(Kind::Number), number_(d) {}
     Value(std::string s) : kind_(Kind::String), string_(std::move(s)) {}
+    // Without this explicit overload, string literals (const char*) bind
+    // to Value(bool) via the standard pointer-to-bool conversion, which
+    // wins over the user-defined std::string conversion. Every
+    // obn::json::Value("...") call would silently become `true`.
+    Value(const char* s) : kind_(Kind::String), string_(s ? s : "") {}
     Value(Array a) : kind_(Kind::Array), array_(std::make_shared<Array>(std::move(a))) {}
     Value(Object o) : kind_(Kind::Object), object_(std::make_shared<Object>(std::move(o))) {}
 

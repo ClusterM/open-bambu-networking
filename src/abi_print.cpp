@@ -67,14 +67,13 @@ OBN_ABI int bambu_network_start_local_print(void* agent,
     return a->run_local_print_job(params, update_fn, cancel_fn);
 }
 
-OBN_ABI int bambu_network_start_sdcard_print(void* /*agent*/,
+OBN_ABI int bambu_network_start_sdcard_print(void* agent,
                                              BBL::PrintParams      params,
                                              BBL::OnUpdateStatusFn update_fn,
-                                             BBL::WasCancelledFn   /*cancel_fn*/)
+                                             BBL::WasCancelledFn   cancel_fn)
 {
     log_print_params("start_sdcard_print", params);
-    if (update_fn) update_fn(BBL::PrintingStageERROR,
-                             BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                             "obn: start_sdcard_print not implemented");
-    return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return a->run_sdcard_print_job(params, update_fn, cancel_fn);
 }

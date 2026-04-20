@@ -330,6 +330,85 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     return 0;
 }
 
+int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
+                                BBL::OnUpdateStatusFn   update_fn,
+                                BBL::WasCancelledFn     cancel_fn)
+{
+#if !OBN_ENABLE_WORKAROUNDS
+    // Stock plugin routes "Print from Device" through the cloud
+    // `start_sdcard_print` REST call, which we can't sign. Without
+    // the workaround we surface the same error Studio would have seen
+    // from the stub.
+    (void)params; (void)cancel_fn;
+    if (update_fn) update_fn(BBL::PrintingStageERROR,
+                             BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                             "obn: start_sdcard_print disabled (OBN_ENABLE_WORKAROUNDS=OFF)");
+    return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+#else
+    // The file is already on the printer (we listed it via the
+    // PrinterFileSystem CTRL channel); all we do is tell the printer
+    // to start a print from that path. Studio routes this through
+    // "cloud" by design, but Developer Mode printers have no cloud
+    // route - the command has to go over LAN MQTT.
+    OBN_INFO("sdcard_print dev=%s ip=%s dst_file=%s plate=%d use_ams=%d",
+             params.dev_id.c_str(), params.dev_ip.c_str(),
+             params.dst_file.c_str(), params.plate_index,
+             params.task_use_ams ? 1 : 0);
+
+    if (params.dev_id.empty()) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                 "no dev_id");
+        return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+    }
+    if (params.dst_file.empty()) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_FILE_NOT_EXIST,
+                                 "no dst_file");
+        return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
+    }
+    if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
+
+    if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
+
+    // Studio's MediaFilePanel already stripped one leading slash when
+    // building dst_file; re-normalise so the printer sees an absolute
+    // path (it'll also accept a relative one, but this matches the
+    // format FILE_DOWNLOAD traffic uses).
+    std::string remote_path = params.dst_file;
+    if (remote_path.empty() || remote_path.front() != '/')
+        remote_path = "/" + remote_path;
+
+    print_job::ProjectFileOpts opts;
+    opts.file_path  = remote_path;
+    opts.url        = "ftp://" + remote_path;
+    opts.md5        = "";  // not known for a pre-existing file on storage
+    opts.project_id = "0";
+    opts.profile_id = "0";
+    opts.task_id    = "0";
+    opts.subtask_id = "0";
+
+    std::string json = print_job::build_project_file_json(params, opts);
+    OBN_DEBUG("sdcard_print mqtt: %s", json.c_str());
+
+    if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
+
+    int pub = send_message_to_printer(params.dev_id, json, /*qos=*/0);
+    if (pub != 0) {
+        OBN_ERROR("sdcard_print: publish project_file failed rc=%d (no LAN session?)", pub);
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
+                                 "MQTT publish failed (no LAN session)");
+        return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
+    }
+
+    if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+    OBN_INFO("sdcard_print dev=%s: queued for printing (file=%s, plate=%d)",
+             params.dev_id.c_str(), remote_path.c_str(), params.plate_index);
+    return 0;
+#endif // OBN_ENABLE_WORKAROUNDS
+}
+
 int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
                                     BBL::OnUpdateStatusFn   update_fn,
                                     BBL::WasCancelledFn     cancel_fn)

@@ -16,10 +16,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -498,6 +500,239 @@ std::string Client::dele(const std::string& remote_path)
     int code = p_->send_cmd("DELE " + remote_path);
     if (code != 250 && code != 200) return "DELE code=" + std::to_string(code);
     return {};
+}
+
+std::string Client::size(const std::string& remote_path,
+                         std::uint64_t* size_out)
+{
+    if (size_out) *size_out = 0;
+    std::string body;
+    int code = p_->send_cmd("SIZE " + remote_path, &body);
+    if (code != 213) return "SIZE code=" + std::to_string(code);
+    // Reply is "213 <bytes>"; strip the code and any leading whitespace.
+    const char* s = body.c_str();
+    while (*s && !std::isdigit(static_cast<unsigned char>(*s))) ++s;
+    // skip the 213 prefix
+    while (*s && std::isdigit(static_cast<unsigned char>(*s))) ++s;
+    while (*s == ' ' || *s == '\t') ++s;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(s, &end, 10);
+    if (end == s) return "SIZE parse: " + body;
+    if (size_out) *size_out = v;
+    return {};
+}
+
+std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
+{
+    std::string err;
+    int data_fd = open_data_tcp(*p_, p_->host, err);
+    if (data_fd < 0) return err;
+
+    int code = p_->send_cmd("RETR " + remote_path);
+    if (code != 150 && code != 125) {
+        ::close(data_fd);
+        return "RETR rejected: code=" + std::to_string(code);
+    }
+    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+    if (!data_ssl) { ::close(data_fd); return err; }
+
+    char buf[64 * 1024];
+    bool aborted = false;
+    while (true) {
+        int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+        if (n < 0) {
+            err = "data read: " + openssl_last_error();
+            aborted = true;
+            break;
+        }
+        if (n == 0) break;
+        if (sink && !sink(buf, static_cast<std::size_t>(n))) {
+            err = "download cancelled";
+            aborted = true;
+            break;
+        }
+    }
+    SSL_shutdown(data_ssl);
+    SSL_free(data_ssl);
+    ::close(data_fd);
+
+    std::string body;
+    int done = p_->read_reply(&body);
+    if (aborted) return err;
+    if (done != 226 && done != 250) return "RETR finish code=" + std::to_string(done) + ": " + body;
+    return {};
+}
+
+namespace {
+
+// Parses the `modify=YYYYMMDDHHMMSS[.frac];size=N;type=file;` fact list
+// that MLSD prepends in front of each name. Keys are case-insensitive.
+void parse_mlsd_facts(const std::string& facts, obn::ftps::Entry* e)
+{
+    std::size_t i = 0;
+    while (i < facts.size()) {
+        std::size_t sep = facts.find(';', i);
+        if (sep == std::string::npos) sep = facts.size();
+        std::string fact = facts.substr(i, sep - i);
+        i = sep + 1;
+        auto eq = fact.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = fact.substr(0, eq);
+        std::string v = fact.substr(eq + 1);
+        for (auto& c : k) c = std::tolower(static_cast<unsigned char>(c));
+        if (k == "type") {
+            for (auto& c : v) c = std::tolower(static_cast<unsigned char>(c));
+            e->is_dir = (v == "dir" || v == "cdir" || v == "pdir");
+        } else if (k == "size") {
+            e->size = std::strtoull(v.c_str(), nullptr, 10);
+        } else if (k == "modify") {
+            // YYYYMMDDHHMMSS, 14 digits minimum. UTC per RFC 3659.
+            if (v.size() >= 14) {
+                std::tm tm{};
+                auto num = [&](int off, int len) {
+                    return std::atoi(v.substr(off, len).c_str());
+                };
+                tm.tm_year = num(0, 4) - 1900;
+                tm.tm_mon  = num(4, 2) - 1;
+                tm.tm_mday = num(6, 2);
+                tm.tm_hour = num(8, 2);
+                tm.tm_min  = num(10, 2);
+                tm.tm_sec  = num(12, 2);
+                // timegm() treats tm as UTC - which is what MLSD demands.
+                e->mtime = static_cast<std::uint64_t>(timegm(&tm));
+            }
+        }
+    }
+}
+
+// Last-resort parser for `ls -l` style LIST output. Only extracts name,
+// size and is_dir; no mtime (that'd require re-implementing ls's
+// month-name locale handling, which isn't worth it when MLSD works).
+void parse_ls_line(const std::string& line, obn::ftps::Entry* e)
+{
+    if (line.empty()) return;
+    e->is_dir = (line[0] == 'd');
+    // Typical format: "drwxr-xr-x 2 root root 4096 Mar 24 12:34 name"
+    // Columns: perms / links / owner / group / size / mon / day / time / name
+    std::size_t i = 0;
+    int col = 0;
+    std::size_t size_start = std::string::npos;
+    std::size_t name_start = std::string::npos;
+    while (i < line.size() && col < 8) {
+        while (i < line.size() && line[i] == ' ') ++i;
+        std::size_t start = i;
+        while (i < line.size() && line[i] != ' ') ++i;
+        if (col == 4) { size_start = start; }
+        ++col;
+    }
+    while (i < line.size() && line[i] == ' ') ++i;
+    name_start = i;
+    if (size_start != std::string::npos) {
+        e->size = std::strtoull(line.c_str() + size_start, nullptr, 10);
+    }
+    if (name_start != std::string::npos) {
+        e->name = line.substr(name_start);
+        // Skip symlink target portion "name -> target" if present.
+        auto arrow = e->name.find(" -> ");
+        if (arrow != std::string::npos) e->name = e->name.substr(0, arrow);
+    }
+}
+
+} // namespace
+
+std::string Client::list_entries(const std::string& path,
+                                 std::vector<Entry>* entries)
+{
+    if (entries) entries->clear();
+
+    // Try MLSD first - standardised, machine-readable. Bambu firmware
+    // (vsftpd) supports it.
+    std::string err;
+    int data_fd = open_data_tcp(*p_, p_->host, err);
+    if (data_fd < 0) return err;
+
+    int code = p_->send_cmd(path.empty() ? "MLSD" : "MLSD " + path);
+    if (code == 150 || code == 125) {
+        SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+        if (!data_ssl) { ::close(data_fd); return err; }
+        std::string body;
+        char buf[1024];
+        while (true) {
+            int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+            if (n <= 0) break;
+            body.append(buf, buf + n);
+        }
+        SSL_shutdown(data_ssl);
+        SSL_free(data_ssl);
+        ::close(data_fd);
+        int done = p_->read_reply(nullptr);
+        if (done != 226 && done != 250) return "MLSD finish code=" + std::to_string(done);
+
+        std::size_t i = 0;
+        while (i < body.size()) {
+            auto nl = body.find('\n', i);
+            std::string line = body.substr(i, (nl == std::string::npos ? body.size() : nl) - i);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            i = (nl == std::string::npos) ? body.size() : (nl + 1);
+            auto sp = line.find(' ');
+            if (sp == std::string::npos) continue;
+            Entry e;
+            parse_mlsd_facts(line.substr(0, sp), &e);
+            e.name = line.substr(sp + 1);
+            if (e.name == "." || e.name == "..") continue;
+            if (entries) entries->push_back(std::move(e));
+        }
+        return {};
+    }
+
+    // MLSD failed or unsupported - fall back to LIST on the same data
+    // socket? No, the socket was consumed by the rejected MLSD reply;
+    // open a fresh one.
+    ::close(data_fd);
+
+    data_fd = open_data_tcp(*p_, p_->host, err);
+    if (data_fd < 0) return err;
+    code = p_->send_cmd(path.empty() ? "LIST" : "LIST " + path);
+    if (code != 150 && code != 125) {
+        ::close(data_fd);
+        return "LIST rejected: code=" + std::to_string(code);
+    }
+    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+    if (!data_ssl) { ::close(data_fd); return err; }
+    std::string body;
+    char buf[1024];
+    while (true) {
+        int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+        if (n <= 0) break;
+        body.append(buf, buf + n);
+    }
+    SSL_shutdown(data_ssl);
+    SSL_free(data_ssl);
+    ::close(data_fd);
+    int done = p_->read_reply(nullptr);
+    if (done != 226 && done != 250) return "LIST finish code=" + std::to_string(done);
+
+    std::size_t i = 0;
+    while (i < body.size()) {
+        auto nl = body.find('\n', i);
+        std::string line = body.substr(i, (nl == std::string::npos ? body.size() : nl) - i);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        i = (nl == std::string::npos) ? body.size() : (nl + 1);
+        if (line.empty()) continue;
+        Entry e;
+        parse_ls_line(line, &e);
+        if (e.name.empty() || e.name == "." || e.name == "..") continue;
+        if (entries) entries->push_back(std::move(e));
+    }
+    return {};
+}
+
+std::string Client::cwd(const std::string& path)
+{
+    int code = p_->send_cmd("CWD " + path);
+    // 250 is the usual success reply. Some firmwares answer 200 here.
+    if (code == 250 || code == 200) return {};
+    return "CWD " + path + " code=" + std::to_string(code);
 }
 
 void Client::quit()

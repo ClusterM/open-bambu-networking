@@ -10,6 +10,36 @@ project(open-bambu-networking
 # "02.05.02"; source builds from the main branch currently expect "02.05.03".
 set(OBN_VERSION "02.05.02.99" CACHE STRING "Plugin version reported via bambu_network_get_version()")
 
+# When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
+# the Print job's eMMC pre-flight speaks a real transport instead of
+# reporting an immediate I/O error. The transport is FTPS (same one we
+# use for LAN print uploads), not the proprietary port-6000 tunnel, so
+# only `bambu:///local/*` URLs are served; TUTK/Agora URLs still get
+# FT_EIO. With this OFF, every ft_* entry point is a polite-failure
+# stub and Studio falls back to its internal FTP path (our
+# start_send_gcode_to_sdcard / start_local_print entry points). Both
+# modes produce the same file in the same place on the printer; the
+# FTPS fastpath gives the more native dialog sequence (ability probe
+# / storage picker / percent progress).
+option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
+
+# Toggles every non-stock behaviour in the plugin. With this ON the plugin
+# makes choices the original bambu_networking.so never would in order to
+# get Developer-Mode LAN printers (most notably the P2S, which has a USB
+# stick in place of an SD card) fully functional in Studio. With this
+# OFF the plugin stays a strict drop-in: the same MQTT/HTTP/FTPS/MJPEG
+# paths the stock plugin uses, and nothing else. Features that only exist
+# via a workaround disappear cleanly (no partial UI, no runtime errors):
+#   - push_status `home_flag` SDCARD-bits rewrite (P2S reports NO_SDCARD)
+#   - push_status `ipcam.file` block injection (unblocks MediaFilePanel on P2S)
+#   - `start_sdcard_print` routed over LAN MQTT instead of the cloud API
+#   - RTSPS camera transcode to MJPEG inside libBambuSource
+#     (stock pipes H.264 straight to Studio's gstbambusrc)
+#   - PrinterFileSystem CTRL bridge served from a worker thread over FTPS
+#     (stock speaks a proprietary port-6000 CTRL protocol)
+# See "What works" and "Workaround reference" in README.md.
+option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -71,6 +101,8 @@ add_library(bambu_networking SHARED
 target_include_directories(bambu_networking PRIVATE include)
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
+    OBN_FT_FTPS_FASTPATH=$<BOOL:${OBN_FT_FTPS_FASTPATH}>
+    OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 target_link_libraries(bambu_networking PRIVATE
     PkgConfig::MOSQUITTO
@@ -92,12 +124,38 @@ set_target_properties(bambu_networking PROPERTIES
 
 pkg_check_modules(GST      REQUIRED IMPORTED_TARGET gstreamer-1.0)
 pkg_check_modules(GST_APP  REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+# zlib is pulled in for the Metadata/plate_*.png unpacker used by
+# PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
+find_package(ZLIB REQUIRED)
+# libpng is used to letterbox 3mf Metadata/plate_*.png and libjpeg to
+# decode the /timelapse/thumbnail/*.jpg sidecars - both get padded to
+# the aspect of the Studio tile they're shown in (see
+# letterbox_image_to_aspect in stubs/BambuSource.cpp).
+pkg_check_modules(PNG      REQUIRED IMPORTED_TARGET libpng)
+pkg_check_modules(JPEG     REQUIRED IMPORTED_TARGET libjpeg)
 
-add_library(BambuSource SHARED stubs/BambuSource.cpp)
+# BambuSource ships the PrinterFileSystem CTRL bridge (FTPS-backed file
+# browser for X1/P1S/P2S/A-series in LAN mode), so it needs ftps + json +
+# log from the core tree. Compile them in directly instead of linking
+# against libbambu_networking to keep the shared-object self-contained
+# (Studio dlopens BambuSource *before* it loads the network plugin).
+add_library(BambuSource SHARED
+    stubs/BambuSource.cpp
+    src/ftps.cpp
+    src/json_lite.cpp
+    src/log.cpp
+)
+target_include_directories(BambuSource PRIVATE include)
+target_compile_definitions(BambuSource PRIVATE
+    OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
+)
 set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
 target_link_libraries(BambuSource PRIVATE
     OpenSSL::SSL OpenSSL::Crypto
     PkgConfig::GST PkgConfig::GST_APP
+    ZLIB::ZLIB
+    PkgConfig::PNG
+    PkgConfig::JPEG
 )
 
 # --------------------------------------------------------------------------

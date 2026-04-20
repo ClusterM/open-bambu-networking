@@ -7,14 +7,21 @@ implementations from
 [bambulabs_api](https://github.com/acse-ci223/bambulabs_api) and
 [ha_bambu_lab](https://github.com/greghesp/ha-bambulab).
 
-> **Status:** Phase 8 (LAN printing + camera). SSDP discovery, live
-> telemetry, LAN printing, cloud ticket sign-in (for user presets /
-> profile) and camera (MJPEG for P1/A1, RTSPS→MJPEG transcode for
-> X1/P1S/P2S) all work. Cloud print upload to S3 works but the final
+> **Status:** Phase 9 (file browser + Print-from-Device). SSDP
+> discovery, live telemetry, LAN printing, cloud ticket sign-in (for
+> user presets / profile), camera (MJPEG for P1/A1, RTSPS→MJPEG
+> transcode for X1/P1S/P2S), Device→Files browser with downloads and
+> deletes, and "Print from Device" over LAN MQTT all work on a P2S
+> in Developer Mode. Cloud print upload to S3 works but the final
 > `create_task` step cannot be signed, so MakerWorld task history is
-> not recorded. The printer itself must be in **Developer Mode** (aka
-> LAN-only mode) for LAN commands to succeed — see
-> [Developer Mode requirement](#developer-mode-requirement) below.
+> not recorded. Everything that isn't a stock-compatible wire path
+> (ipcam/home_flag rewrites, PrinterFileSystem FTPS bridge, RTSPS
+> transcode, Print-from-Device-over-LAN) is gated behind the
+> `OBN_ENABLE_WORKAROUNDS` CMake flag — see [Workaround
+> reference](#workaround-reference). The printer itself must be in
+> **Developer Mode** (aka LAN-only mode) for LAN commands to
+> succeed — see [Developer Mode requirement](#developer-mode-requirement)
+> below.
 
 ## Developer Mode requirement
 
@@ -119,23 +126,111 @@ lose the Studio features in the second list above.
 
 ## What works
 
-| Feature | P1 / A1 | X1 / P1S / P2S |
-| --- | --- | --- |
-| SSDP discovery (LAN) | ✅ | ✅ |
-| MQTT telemetry (LAN, Dev Mode) | ✅ | ✅ |
-| MQTT telemetry (cloud) | ✅ | ✅ |
-| LAN print (FTPS + MQTT) | ✅ | ✅ (Dev Mode only) |
-| Cloud project upload (S3) | ✅ | ✅ |
-| `create_task` (MakerWorld entry) | ⚠️ soft-fail | ⚠️ soft-fail |
-| Camera liveview (MJPEG) | ✅ | n/a |
-| Camera liveview (RTSPS → MJPEG transcode) | n/a | ✅ |
-| Cloud login / user info | ✅ | ✅ |
-| AMS telemetry / mapping | ✅ | ✅ |
+Legend for the per-model columns:
+
+| Mark | Meaning |
+| :--: | --- |
+| ✅ | Implemented **and exercised** against a real printer of that family. |
+| ✅ (not tested) | Implemented; should work in theory but **not tested** on that model. The author only has a P2S, so everything else relies on code inspection and reference implementations. |
+| ⚠️ | Partially works / soft-fails (see Notes). |
+| ❌ | Not implemented (see "What is not implemented" for scope rationale). |
+| ➖ | Not applicable to this model (e.g. MJPEG liveview on a printer that only serves RTSPS). |
+
+The **Impl** column distinguishes three kinds of feature:
+
+- **Native** — the plugin speaks the same wire protocol the stock
+  `bambu_networking.so` does. Drop-in behaviour.
+- **Workaround** — the plugin reaches the same user-visible outcome
+  over a different transport. Listed individually in
+  [Workaround reference](#workaround-reference) below; all of them
+  can be compiled out together with `-DOBN_ENABLE_WORKAROUNDS=OFF`.
+- **Passthrough** — the plugin just forwards MQTT / REST payloads;
+  Studio does the work.
+
+| Feature | P1 / A1 | X1 / P1S | P2S | Impl | Notes |
+| --- | :-: | :-: | :-: | --- | --- |
+| SSDP discovery (LAN) | ✅ (not tested) | ✅ (not tested) | ✅ | Native | Multicast listener on `239.255.255.250:1990` + Studio `on_server_connected_`. |
+| LAN MQTT telemetry (Dev Mode) | ✅ (not tested) | ✅ (not tested) | ✅ | Native | TLS to `mqtts://<ip>:8883`, user `bblp`, pass = access code. |
+| Cloud MQTT telemetry | ✅ (not tested) | ✅ (not tested) | ✅ (not tested) | Native | TLS to `us.mqtt.bambulab.com:8883`. Runs in parallel with LAN if signed in. Not exercised during LAN-focused testing. |
+| LAN print (FTPS + MQTT) | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Native | `STOR /cache/<name>` then `{"print":{"command":"project_file",...}}` on LAN MQTT. |
+| "Send to Printer" dialog (`ft_*`) | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Workaround | `ft_*` C ABI served over FTPS (`OBN_FT_FTPS_FASTPATH`, ON by default); stock uses a proprietary port-6000 tunnel. With `OFF` Studio falls back to its internal FTP path — same file, same place, less UI polish. |
+| Cloud 3MF upload to S3 | ✅ (not tested) | ✅ (not tested) | ✅ (not tested) | Native | 6-step upload sequence from MITM of the stock plugin. |
+| `create_task` (MakerWorld entry) | ⚠️ | ⚠️ | ⚠️ | ❌ | Soft-fails — logs 4xx, keeps going with `task_id="0"`. Printing works; MakerWorld history and timelapse-on-printer cloud flags don't. See [MakerWorld integration](#makerworld-integration). |
+| MQTT command signing | ❌ | ❌ | ❌ | ❌ | Stock plugin carries per-install RSA keys we don't reproduce. Workaround for the user: enable Developer Mode on the printer. |
+| Camera liveview (MJPEG, port 6000) | ✅ (not tested) | ➖ | ➖ | Native | Same TCP-over-TLS stream the stock plugin consumes. The author has no P1/A1 hardware to test on. |
+| Camera liveview (RTSPS → MJPEG) | ➖ | ✅ (not tested) | ✅ | Workaround | Stock plugin pipes raw H.264 off RTSPS to Studio's `gstbambusrc` element directly; we run `rtspsrc ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videoscale ! jpegenc ! appsink` inside `libBambuSource.so` so Studio still sees MJPEG. Heavier CPU, slightly more latency, identical UX. |
+| File browser list (LIST_INFO) | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Workaround | FTPS `MLSD`/`LIST` from a worker thread inside `libBambuSource.so`; stock protocol over port 6000 not reimplemented. |
+| File download from storage | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Workaround | Streaming FTPS `RETR` with 256 KB `CONTINUE` reply chunks. Same workaround envelope. |
+| File delete from storage | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Workaround | FTPS `DELE` per path. |
+| 3MF thumbnails in list (`Metadata/plate_*.png`) | ✅ (not tested) | ✅ (not tested) | ⚠️ | Workaround | Opens the archive via FTPS `RETR`, extracts the plate PNG in-process with zlib raw-inflate. Flaky on large archives today — see the open note under [PrinterFileSystem](#printerfilesystem-sdusb-browser-ui-in-studio). |
+| Timelapse / video thumbnails | ✅ (not tested) | ✅ (not tested) | ✅ | Workaround | Sidecar `<stem>.jpg` fetch. P2S doesn't write sidecars — panel falls back to Studio's default icon. |
+| "Print from Device" (`start_sdcard_print`) | ✅ (not tested) | ✅ (not tested, Dev Mode) | ✅ (Dev Mode) | Workaround | Stock plugin: cloud REST endpoint we can't sign. Ours: publish `project_file` on LAN MQTT for a file already on the printer. |
+| `push_status` `home_flag` SDCARD-bits rewrite | ➖ | ➖ | ✅ | Workaround | Only triggers when the printer actually reports `NO_SDCARD`; HAS/ABNORMAL/READONLY pass through untouched. Needed so Studio's Send-to-Printer UI doesn't grey out on printers whose external storage is USB-only. |
+| `push_status` `ipcam.file` block injection | ➖ | ➖ | ✅ | Workaround | Only triggers when the block is absent; firmware that already advertises it is passed through. Makes Studio open the file-browser tunnel in the first place. |
+| Cloud login / ticket flow | ✅ (not tested) | ✅ (not tested) | ✅ | Native | Browser → `localhost` callback → `POST /user-service/user/ticket/<T>`. Session persisted to `obn.auth.json`. |
+| User presets sync / profile / avatar | ✅ (not tested) | ✅ (not tested) | ✅ | Native | Driven by Studio reading `get_user_id()`; plugin just serves the login session. |
+| AMS telemetry / mapping | ✅ (not tested) | ✅ (not tested) | ✅ | Passthrough | Studio consumes `push_status` directly. |
+| Nozzle mapping / multi-extruder | ✅ (not tested) | ✅ (not tested) | ✅ (not tested) | Passthrough | Same as AMS; P2S is single-extruder so not exercised. |
+| TUTK / Agora cloud-p2p transports | ❌ | ❌ | ❌ | ❌ | Proprietary libraries; out of scope — use LAN/Developer Mode instead. |
+| Windows / macOS builds | ❌ | ❌ | ❌ | ❌ | Architected for but Linux x86_64 / aarch64 only today. |
+
+### Model specifics
+
+Storage on the printer depends on the model: X1 / P1P / A1 (and A1
+mini) use a microSD slot, while **P2S has a USB port instead** (no SD
+slot). The plugin auto-detects which mount is available and uploads
+to the right path:
+
+- X1 / P1P / A1: FTPS exposes `/sdcard/` and (sometimes) `/usb/`; the
+  `ft_*` fast-path probes both with `CWD` and reports whatever answers.
+- P2S: FTPS has **no** `/sdcard` or `/usb` subdirectory — the FTPS root
+  *is* the USB stick, so files sit right at `/`. The plugin detects
+  this (both probes fail, root is reachable) and still advertises
+  `"sdcard"` to Studio so the Send-to-Printer radio shows "External
+  Storage"; uploads go to `/<dest_name>` (no prefix).
+
+There's one more P2S-specific twist: the printer reports `home_flag`
+with `NO_SDCARD` bits because, strictly speaking, it has no SD slot.
+Studio's DeviceManager parses those bits into `DevStorage::SdcardState`,
+which turns the Send button grey and shows a red "Please check the
+network …" tile in the Device/Storage panel. Since we *can* write to
+the USB over FTPS, the plugin rewrites bits 8-9 of `home_flag` from
+`NO_SDCARD` (00) to `HAS_SDCARD_NORMAL` (01) on every `push_status`
+frame. Real error states (`ABNORMAL`=10, `READONLY`=11) and printers
+that already report `HAS_SDCARD` are passed through unchanged.
 
 `⚠️ soft-fail` means the step logs a warning and continues with `task_id="0"`.
 Printing works; the job does not show up in the cloud's job history and the
 timelapse/record-on-printer cloud flags have no effect. Local print records
 on the printer itself still work.
+
+## Workaround reference
+
+Everything marked **Workaround** in the table above is a deliberate
+non-stock path chosen to get a Developer-Mode printer usable without
+the proprietary secrets the stock plugin carries. All of them are
+gated behind one CMake flag, `-DOBN_ENABLE_WORKAROUNDS` (default
+`ON`). Build with `=OFF` if you want a strict drop-in that only
+exposes the native paths from the "What works" table above — Studio
+will transparently lose the affected features (Send greys out on P2S,
+file browser stays empty on Dev-Mode printers, "Print from Device"
+errors out with "start_sdcard_print disabled", RTSPS liveview refuses
+to open, etc.), but nothing half-done runs at runtime.
+
+| Workaround | What the stock plugin does | What we do | Why this is acceptable | Trade-offs |
+| --- | --- | --- | --- | --- |
+| `home_flag` SDCARD-bits rewrite | Printer reports its real `SdcardState` from the hardware. On P2S / A-series firmware without an SD slot the bits read `NO_SDCARD`. | On every LAN `push_status` we check bits [8:9]. If they are `00` (NO_SDCARD) and `ipcam` is present we flip them to `01` (HAS_SDCARD_NORMAL) in-place on the JSON text. `ABNORMAL` / `READONLY` and printers that already have the bit are passed through untouched. | We *can* read/write the USB stick over FTPS on P2S, so from Studio's workflow POV the storage exists and is healthy — the bit is lying. | If a real "SD card missing" ever reports as `NO_SDCARD` on P1/A1 the UI would mistakenly enable Send; in practice those printers have a real slot and use the ABNORMAL code path instead. |
+| `ipcam.file` block injection | Firmware with a file browser advertises `ipcam.file = {"local":"local",…}`; Studio keys the MediaFilePanel off that. | When the printer omits the block we inject `{"local":"local","remote":"none","model_download":"enabled"}` into the ipcam object. Present blocks pass through unchanged. | Without this Studio short-circuits MediaFilePanel with "Browsing file in storage is not supported in current firmware" and never calls `Bambu_StartStreamEx(CTRL_TYPE)` on us. | The plugin advertises file-browser capability even for firmware revisions where it doesn't exist natively; the opposite side (our CTRL bridge) is all FTPS so it still works. |
+| PrinterFileSystem CTRL bridge | Port-6000 proprietary CTRL protocol served by the stock `libBambuSource.so`: Bambu-framed binary JSON and per-command media blobs. | In our `libBambuSource.so` a worker thread per tunnel answers `LIST_INFO` / `SUB_FILE` / `FILE_DOWNLOAD` / `FILE_DEL` / `REQUEST_MEDIA_ABILITY` / `TASK_CANCEL` by translating each into FTPS (`MLSD`, `RETR`, `DELE`) on the same TLS endpoint we use for LAN print uploads. | FTPS is universal across Bambu LAN firmware and survives Developer Mode. The CTRL protocol isn't documented anywhere we've found. | `FILE_UPLOAD` is not implemented (Studio uses `ft_*` for uploads anyway). `SUB_FILE` re-downloads the whole `.3mf` for every thumbnail / metadata request: OK on LAN, wasteful vs. a native CTRL channel that could stream entries. |
+| 3MF thumbnail extraction | Stock CTRL protocol likely streams just the requested entry out of the `.3mf` on the printer. | We fetch the whole archive into memory, parse the central directory, and `inflate` the target PNG (`Metadata/plate_1.png` / `plate_no_light_1.png`) or a requested entry with zlib raw-deflate. | No external ZIP dependency; archives fit in RAM for any reasonable print job. | Large models (~10+ MB) hit the wire once per thumbnail tile. Parser is minimal — compressed entries only via DEFLATE; we don't handle stored-with-encryption or ZIP64. |
+| Camera liveview (RTSPS) | X1/P1S stock `libBambuSource.so` exposes the H.264 RTSPS stream directly; Studio's `gstbambusrc` element decodes it. | Our `libBambuSource.so` builds a GStreamer pipeline that terminates RTSPS internally (`rtspsrc ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videoscale ! jpegenc ! appsink`) and hands Studio MJPEG frames via `Bambu_ReadSample`, the same wire format the port-6000 MJPEG path uses for P1/A1. | We can lean on the MJPEG reader Studio already ships instead of matching the stock H.264 frame metadata and GStreamer plumbing byte-for-byte. | Extra decode + re-encode on the host CPU; 720p @ 30 fps consumes ~15 % of a mid-tier desktop. Higher end-to-end latency (~100–300 ms more) than passing H.264 through untouched. |
+| `start_sdcard_print` over LAN MQTT | Stock plugin hits a cloud REST endpoint (`start_sdcard_print`) that signs and relays the command via the cloud tunnel. | We publish `{"print":{"command":"project_file", "url":"ftp://<path>", …}}` directly on the active LAN MQTT session. | The cloud endpoint requires MakerWorld signing we don't reproduce, and Developer Mode printers have no cloud route to receive it on anyway. LAN MQTT is what the firmware actually consumes. | No cloud task record. `task_id` / `subtask_id` / `project_id` are all `0`, which a very old firmware could refuse if it ever validates them (none observed). |
+| `ft_*` FTPS fastpath (`OBN_FT_FTPS_FASTPATH`, also default ON) | Port-6000 proprietary tunnel for the `FileTransfer` ABI (Send-to-Printer dialog + eMMC pre-flight + media-ability probes). | FTPS-backed `STOR` for uploads + `CWD /sdcard` / `CWD /usb` probe for media-ability answers. TUTK/Agora URLs still return `FT_EIO`. | Same tunnel the LAN print path already uses; gives the richer dialog sequence (ability probe → storage picker → percent progress) without a new transport. | `emmc` is never advertised (Bambu firmware reserves it for system files). Fall-back path via Studio's internal FTP upload still puts the file in the same place if you turn this OFF. See [FileTransfer module](#filetransfer-module-ft_-c-abi). |
+
+All of these except the last are gated by `OBN_ENABLE_WORKAROUNDS`.
+The `ft_*` fastpath has its own flag because stock-compatible builds
+may want to keep Send-to-Printer's UI progress working while turning
+everything else off.
 
 ## What is **not** implemented
 
@@ -163,29 +258,127 @@ code. We log the 40x and continue, so the print itself completes.
 
 ### FileTransfer module (`ft_*` C ABI)
 
-Used by Studio for:
+Used by Studio for the "Send to Printer" dialog (upload without
+printing), the eMMC pre-flight check in the regular Print job, and a
+handful of media-ability queries. The proprietary plugin serves these
+over a port-6000 TLS tunnel with a JSON command framer we haven't
+reimplemented.
 
-- eMMC pre-flight check in Print job (determines whether the file goes
-  to eMMC vs. SD card);
-- the separate "Send to Printer" dialog (upload without printing);
-- some media-ability queries.
+We have two modes, toggled at configure time with
+`-DOBN_FT_FTPS_FASTPATH=ON|OFF` (default **ON**):
 
-Our implementation returns `FT_EIO` immediately. On P1/A1 this means the
-print always lands on the SD card (not eMMC) and the Send-to-Printer
-dialog is unavailable; the regular Print button works and copies via FTP.
-On X1/P1S/P2S the proprietary transport (TUTK/cloud-p2p) is used by Studio
-and is out of scope here — printing falls through to FTPS, which works.
-**Scope:** could be added for P1/A1 if there is demand. Transport is
-documented in `OpenBambuAPI/video.md` (port 6000, TLS, 80-byte auth).
+**`OBN_FT_FTPS_FASTPATH=ON` (default).**
+For `bambu:///local/*` URLs the plugin serves the ABI over the same
+FTPS connection the print job uses:
 
-### PrinterFileSystem (SD-card browser UI in Studio)
+- `cmd_type=7` (media ability) is answered by probing `CWD /sdcard`
+  and `CWD /usb` on the printer. X1/P1P/A1 and first-gen A1 mini have
+  the SD-card mount; P2S has a USB port instead. Printers with both
+  will get both back. If *neither* path answers but the FTPS login
+  itself succeeded (the P2S case), the fastpath treats the FTPS root
+  as the storage mount and reports `["sdcard"]` so Studio's picker
+  lights up. `emmc` is never reported — on Bambu firmware that storage
+  is for system files, not user uploads.
+- `cmd_type=5` (upload) runs `STOR /<dest_storage>/<dest_name>` with
+  byte-level progress forwarded to Studio as `{"progress":N}` via
+  `msg_cb` (skipping 99, which Studio reserves as a timeout tripwire).
+  When the tunnel is in root-is-storage mode the `STOR` target is just
+  `/<dest_name>`.
+- TUTK/Agora URLs still return `FT_EIO` — we don't speak the cloud
+  p2p transport.
 
-For P1/A1 this multiplexes a CTRL channel (`Bambu_StartStreamEx(CTRL_TYPE)`,
-JSON request/response) over the same port-6000 tunnel used by the camera.
-For X1/P1S/P2S in LAN-only mode **Studio itself refuses to open the
-browser** ("Browsing file in storage is not supported in LAN Only Mode"),
-so this is not a limitation we can fix from the plugin side.
-**Scope:** deferred with the FileTransfer module.
+Net effect: the "Send to Printer" dialog walks through the same UI
+states as with the stock plugin (Reading storage → picker → sending
+with real % progress), the eMMC pre-flight in the regular Print job
+gets a clean `["sdcard"]` / `["usb"]` answer and Studio stops logging
+a fallback every time.
+
+**`OBN_FT_FTPS_FASTPATH=OFF`.**
+Every `ft_*` entry point is a polite-failure stub that fires its
+callback synchronously with `FT_EIO` and a "fall back to FTP" message.
+Studio's internal fallback kicks in and the 3mf is uploaded through
+`bambu_network_start_send_gcode_to_sdcard`, which also uses FTPS.
+Same file lands in the same place — the UI just skips the media-
+ability step and the per-percent progress comes from the fallback
+instead.
+
+**Scope:** the fastpath is a deliberate shortcut, not a clean
+reimplementation of the proprietary port-6000 protocol. If you need
+MakerWorld-style project metadata, eMMC-as-primary-storage, or the
+"Send to multiple machines" batch UI to work end-to-end, you'll still
+be limited to what the fallback path supports.
+
+### PrinterFileSystem (SD/USB browser UI in Studio)
+
+Studio's MediaFilePanel opens a port-6000 tunnel through `libBambuSource.so`
+and then switches it to a CTRL channel via `Bambu_StartStreamEx(CTRL_TYPE)`.
+From there it sends JSON request/response messages (`LIST_INFO`, `SUB_FILE`,
+`FILE_DOWNLOAD`, `FILE_DEL`, `REQUEST_MEDIA_ABILITY`, `TASK_CANCEL`) that
+Studio renders as the Device → Files panel (timelapses, camera recordings,
+printed models with thumbnails).
+
+`libBambuSource.so` does **not** speak the proprietary CTRL wire protocol;
+instead it runs a worker thread per tunnel that services those JSON requests
+over **FTPS** (the same service we use for "Print via LAN" uploads). That
+gives Studio the full file browser on every printer we can reach over TLS
+on port 990, regardless of whether the firmware implements the CTRL protocol
+itself.
+
+Supported operations:
+
+- `REQUEST_MEDIA_ABILITY` — probe `/sdcard` and `/usb`; if neither exists we
+  treat the FTPS root as the storage mount (P2S-style USB-only) and report
+  it as `"sdcard"` to Studio.
+- `LIST_INFO` — `MLSD` (falling back to `LIST`) on:
+  `<prefix>/timelapse/` for the timelapse tab,
+  `<prefix>/ipcam/` for the manual video tab,
+  `<prefix>/` for the model tab.
+  Files are filtered by extension (`.mp4`, `.3mf`, `.gcode.3mf`).
+- `SUB_FILE` thumbnails — for timelapses we fetch the sidecar `.jpg`; for
+  `.3mf` files we download the archive, parse the central directory, and
+  `inflate` `Metadata/plate_1.png` (or `plate_no_light_1.png`) using zlib's
+  raw deflate — no external ZIP dependency.
+- `FILE_DOWNLOAD` — streaming `RETR` with 256 KB chunks, each chunk
+  delivered as a separate `CONTINUE` reply so Studio's progress bar
+  updates smoothly. The final reply is `SUCCESS`.
+- `FILE_DEL` — `DELE` per path (modern form `{"paths":[…]}` only; the
+  legacy `{"delete":[…]}` form isn't used by current Studio releases).
+- `TASK_CANCEL` — marks a sequence number; the worker aborts the relevant
+  multi-chunk response cleanly at the next check point.
+
+`FILE_UPLOAD` is intentionally not implemented here: Studio's
+"Send to Printer" dialog uses the separate `ft_*` ABI (see above), which
+already has an FTPS fastpath.
+
+For printers whose firmware **does** send `ipcam.file` in its MQTT
+`push_status` (X1 / P1S class), the plugin passes it through untouched —
+those printers speak the real CTRL protocol to their stock BambuSource,
+and we don't want to clobber a capability we don't match exactly.
+
+For printers that **don't** advertise `ipcam.file` (P2S, A-series, some
+firmware revisions) the plugin injects
+`"file":{"local":"local","remote":"none","model_download":"enabled"}`
+into every LAN `ipcam` block. That's what makes Studio open the
+port-6000 tunnel in the first place; without it, MediaFilePanel would
+short-circuit with "Browsing file in storage is not supported in current
+firmware." and never give us a CTRL channel to service.
+
+**Storage root layout:**
+
+| Printer | FTPS layout                                  | Our prefix    |
+| ------- | -------------------------------------------- | ------------- |
+| X1 / P1 | `/sdcard/{,timelapse,ipcam,…}`               | `/sdcard`     |
+| A1      | `/sdcard/…` (microSD)                        | `/sdcard`     |
+| P2S     | `/timelapse`, `/ipcam`, `/*.gcode.3mf` on /  | `""` (root)   |
+
+The P2S variant uses the "FTPS root == USB stick" convention from our
+`ft_*` implementation. We re-advertise it as `"sdcard"` because Studio's
+storage dropdown treats anything that isn't `"emmc"` as removable media.
+
+**Limitations:** Studio still refuses to *open* the browser in LAN Only
+Mode for X1/P1S/P2S ("Browsing file in storage is not supported in LAN
+Only Mode") — that check lives inside Studio itself, ahead of the
+plugin. Developer Mode (which is what we target anyway) bypasses it.
 
 ### TUTK / Agora cloud p2p transports
 
@@ -238,6 +431,14 @@ cmake --build build -j
 The currently shipped AppImage `v02.05.02.51` expects prefix `02.05.02`. A
 source build of BambuStudio from the main branch (as of writing) expects
 `02.05.03`.
+
+## Build options
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `OBN_VERSION` | tracked to latest Bambu Studio release | The version string `bambu_network_get_version()` returns. Studio checks only the first 8 chars (`MAJOR.MINOR.PATCH`). |
+| `OBN_ENABLE_WORKAROUNDS` | `ON` | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With `OFF` the plugin is a strict drop-in: same wire protocols the stock plugin uses and nothing else. Studio will transparently lose every workaround-backed feature (file browser stays empty, Send greys out on P2S, etc.) but nothing half-done runs at runtime. |
+| `OBN_FT_FTPS_FASTPATH` | `ON` | Serve the `ft_*` C ABI over FTPS for LAN URLs (media-ability probe + STOR-based upload with live progress). Turn `OFF` to keep every `ft_*` call as a polite-failure stub; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `OBN_ENABLE_WORKAROUNDS`. |
 
 ## Install
 

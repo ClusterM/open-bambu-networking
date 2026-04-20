@@ -47,6 +47,20 @@ struct ConnectConfig {
 using ProgressFn = std::function<bool(std::uint64_t uploaded,
                                       std::uint64_t total)>;
 
+// One entry returned from `list_entries` / `mlsd`. Field values that
+// the server didn't provide are left empty / zero.
+struct Entry {
+    std::string name;        // file name only, no directory prefix
+    std::uint64_t size = 0;  // bytes; 0 for directories
+    std::uint64_t mtime = 0; // seconds since epoch (UTC) if known
+    bool          is_dir = false;
+};
+
+// Streaming sink for `retr`. Called repeatedly with non-empty chunks of
+// file data until the transfer completes. Return false to abort the
+// transfer (RETR gets torn down cleanly afterwards).
+using DataSinkFn = std::function<bool(const void* data, std::size_t len)>;
+
 class Client {
 public:
     struct Impl;
@@ -74,8 +88,32 @@ public:
     // empty on success).
     std::string list(const std::string& path, std::string& err_out);
 
+    // Structured directory listing. Tries MLSD first (returns size/mtime
+    // as standardised facts), falls back to LIST with a best-effort
+    // parser for `ls -l` style output. On success *entries is populated
+    // and the returned string is empty; on error *entries is cleared
+    // and the returned string describes the failure.
+    std::string list_entries(const std::string& path,
+                             std::vector<Entry>* entries);
+
+    // Downloads `remote_path`. The callback is invoked repeatedly with
+    // streaming chunks; returning false from it aborts the transfer
+    // cleanly. Returns empty on success, otherwise an error string.
+    std::string retr(const std::string& remote_path, DataSinkFn sink);
+
+    // SIZE: returns 0 and an empty error on success, with *size_out set;
+    // any non-empty return value indicates a protocol/transport error.
+    std::string size(const std::string& remote_path,
+                     std::uint64_t* size_out);
+
     // Deletes a remote file. Returns empty string on success.
     std::string dele(const std::string& remote_path);
+
+    // Change working directory. Returns empty on success (reply 250),
+    // otherwise a human-readable error (used as a cheap "does this
+    // storage mount exist?" probe - 550 comes back when the path is
+    // missing, which we convert to a non-empty error).
+    std::string cwd(const std::string& path);
 
     // Graceful shutdown (QUIT + TLS close + TCP close). Safe to call on a
     // disconnected client.

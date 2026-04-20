@@ -1,6 +1,7 @@
 #include "obn/json_lite.hpp"
 
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <sstream>
 
@@ -270,7 +271,30 @@ std::string Value::dump() const
     switch (kind_) {
         case Kind::Null:   os << "null"; break;
         case Kind::Bool:   os << (boolean_ ? "true" : "false"); break;
-        case Kind::Number: os << number_; break;
+        case Kind::Number: {
+            // Prefer integer-looking output when the value fits losslessly
+            // into int64 and has no fractional part. Studio's json parser
+            // chokes on "1.62e+09" for fields it expects to be u64 (file
+            // sizes, epoch timestamps, sequence numbers), so we emit them
+            // as plain decimals.
+            if (std::isfinite(number_) &&
+                number_ >= -9.2233720368547748e18 &&
+                number_ <=  9.2233720368547748e18 &&
+                std::trunc(number_) == number_)
+            {
+                std::ostringstream tmp;
+                tmp << static_cast<long long>(number_);
+                os << tmp.str();
+            } else {
+                // Preserve enough precision for doubles; 17 is the IEEE-754
+                // round-trip guarantee for binary64.
+                std::ostringstream tmp;
+                tmp.precision(17);
+                tmp << number_;
+                os << tmp.str();
+            }
+            break;
+        }
         case Kind::String: os << escape(string_); break;
         case Kind::Array: {
             os << '[';

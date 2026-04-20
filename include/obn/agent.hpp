@@ -145,6 +145,19 @@ public:
                                  BBL::OnUpdateStatusFn   update_fn,
                                  BBL::WasCancelledFn     cancel_fn);
 
+    // Implements bambu_network_start_sdcard_print: the "Print" button
+    // from Device -> Files. The file is already on the printer's
+    // storage (we list/browse it via the PrinterFileSystem bridge), so
+    // there's no FTPS upload - we just publish a `project_file` MQTT
+    // command with url=ftp://<path> on the LAN channel. Studio
+    // hard-codes this path to `start_sdcard_print` and calls it
+    // "cloud service" in the UI, but on Developer Mode printers there
+    // is no cloud route; going over LAN MQTT is the only thing the
+    // printer will actually accept.
+    int run_sdcard_print_job(const BBL::PrintParams& params,
+                             BBL::OnUpdateStatusFn   update_fn,
+                             BBL::WasCancelledFn     cancel_fn);
+
     // Implements bambu_network_start_print (use_lan_channel=false) and
     // bambu_network_start_local_print_with_record (use_lan_channel=true).
     //

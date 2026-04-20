@@ -116,6 +116,127 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
     else       invoke();
 }
 
+namespace {
+
+#if OBN_ENABLE_WORKAROUNDS
+// Printers with no SD-card slot (P2S uses a USB-A stick instead, newer A-series
+// likewise) report `home_flag` with bits [8:9] == 0 (NO_SDCARD). Studio's
+// DeviceManager parses those two bits straight into DevStorage::SdcardState,
+// which in turn gates the "Send to Printer" and "Print via LAN" UIs: the
+// storage radio button goes grey and the Device/Storage pane shows the
+// red error tile the user provided a screenshot of. Our FTPS fast-path
+// *does* support uploading to the FTPS root on these printers, so the
+// bit is lying as far as Studio's UX is concerned.
+//
+// Rewrite bits [8:9] from 00 (NO_SDCARD) -> 01 (HAS_SDCARD_NORMAL) *in place*
+// on the JSON text. Only bits [8:9] are touched; real SD error states
+// (ABNORMAL=2, READONLY=3) and printers that already report HAS_SDCARD=1
+// are passed through unchanged so genuine "SD card missing" errors on
+// P-series/X-series printers keep working.
+//
+// The match is deliberately tolerant: `"home_flag":<digits>` allowing
+// optional whitespace after the colon, anywhere inside the payload. We
+// don't do a full JSON round-trip to avoid the cost on every push_status
+// frame (they arrive ~1 Hz, are up to ~20 KB each, and Studio already
+// re-parses them on its side).
+// P2S / newer A-series firmware does not expose `ipcam.file` in push_status,
+// but we *do* implement a FileBrowser-over-FTPS bridge inside libBambuSource
+// (CTRL_TYPE channel). If Studio sees `file.local == "none"` it short-circuits
+// the MediaFilePanel with "Browsing file in storage is not supported in
+// current firmware" and never asks us to open the tunnel.
+//
+// So we inject `"file":{"local":"local","remote":"none","model_download":
+// "enabled"}` into the ipcam block of LAN push_status frames that didn't
+// include one. Studio's MediaFilePanel then:
+//   * routes through NetworkAgent::media_get_url (LAN branch),
+//   * builds `bambu:///local/<ip>.?port=6000&user=bblp&passwd=<code>&...`,
+//   * calls our Bambu_StartStreamEx(CTRL_TYPE) and talks the PrinterFileSystem
+//     wire protocol to us - which we service out of FTPS.
+//
+// If a payload already carries `ipcam.file` (X1/P1S-class printers that
+// do advertise it) we pass through untouched: those printers speak the
+// real proprietary CTRL protocol to their stock BambuSource, and our
+// injection would only clobber their real capabilities.
+//
+// Returns true if the payload was patched.
+bool try_inject_ipcam_file_local(std::string& payload)
+{
+    // Only patch frames that look like an ipcam report but lack the file
+    // block (both conditions are cheap substring searches).
+    static const std::string kIpcam = "\"ipcam\":";
+    std::size_t pos = payload.find(kIpcam);
+    if (pos == std::string::npos) return false;
+    // Walk to the opening brace of the ipcam object.
+    std::size_t brace = payload.find('{', pos + kIpcam.size());
+    if (brace == std::string::npos) return false;
+    // Find the matching closing brace by depth counting. Strings are
+    // tracked minimally (enough for well-formed JSON; printers always
+    // emit that).
+    std::size_t i = brace + 1;
+    int depth = 1;
+    bool in_str = false;
+    bool esc = false;
+    std::size_t end = std::string::npos;
+    std::size_t file_hit = std::string::npos;
+    for (; i < payload.size(); ++i) {
+        char c = payload[i];
+        if (in_str) {
+            if (esc)        esc = false;
+            else if (c=='\\') esc = true;
+            else if (c=='"')  in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            // Opportunistically spot an existing "file": at the current
+            // depth - if present, leave the payload alone.
+            if (depth == 1 && payload.compare(i, 7, "\"file\":") == 0)
+                file_hit = i;
+            continue;
+        }
+        if (c == '{')      ++depth;
+        else if (c == '}') { if (--depth == 0) { end = i; break; } }
+    }
+    if (end == std::string::npos) return false;
+    if (file_hit != std::string::npos) return false;
+    static const std::string kInject =
+        ",\"file\":{\"local\":\"local\",\"remote\":\"none\","
+        "\"model_download\":\"enabled\"}";
+    payload.insert(end, kInject);
+    return true;
+}
+
+bool try_rewrite_home_flag(std::string& payload)
+{
+    static const std::string kKey = "\"home_flag\":";
+    std::size_t pos = payload.find(kKey);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + kKey.size();
+    while (i < payload.size() && payload[i] == ' ') ++i;
+    std::size_t start = i;
+    bool        negative = false;
+    if (i < payload.size() && payload[i] == '-') { negative = true; ++i; }
+    std::size_t digits_start = i;
+    while (i < payload.size() && payload[i] >= '0' && payload[i] <= '9') ++i;
+    if (i == digits_start) return false;
+
+    long long flag = 0;
+    try { flag = std::stoll(payload.substr(digits_start, i - digits_start)); }
+    catch (...) { return false; }
+    if (negative) flag = -flag;
+
+    int sd_bits = static_cast<int>((flag >> 8) & 0x3);
+    if (sd_bits != 0) return false;  // HAS_SDCARD_NORMAL/ABNORMAL/READONLY: pass through
+
+    long long patched = flag | (1LL << 8);
+    std::string repl  = std::to_string(patched);
+    payload.replace(start, i - start, repl);
+    return true;
+}
+#endif // OBN_ENABLE_WORKAROUNDS
+
+} // namespace
+
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
     BBL::OnMessageFn cb;
@@ -127,9 +248,25 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         std::lock_guard<std::mutex> lk(mu_);
         cb = on_local_message_;
     }
-    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d",
-              dev_id.c_str(), json.size(), cb ? 1 : 0);
-    if (cb) cb(dev_id, json);
+
+    std::string patched = json;
+#if OBN_ENABLE_WORKAROUNDS
+    // Both rewrites are P2S/A-series-targeted workarounds: stock
+    // firmware on those printers exposes neither HAS_SDCARD nor the
+    // `ipcam.file` hint, and without them Studio greys out the
+    // Send-to-Printer UI and refuses to open the file browser. When
+    // workarounds are compiled out we just forward the payload.
+    bool rewrote_flag   = try_rewrite_home_flag(patched);
+    bool injected_file  = try_inject_ipcam_file_local(patched);
+
+    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d sd_fix=%d file_inject=%d",
+              dev_id.c_str(), patched.size(), cb ? 1 : 0,
+              rewrote_flag ? 1 : 0, injected_file ? 1 : 0);
+#else
+    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d (strict)",
+              dev_id.c_str(), patched.size(), cb ? 1 : 0);
+#endif
+    if (cb) cb(dev_id, patched);
 }
 
 void Agent::set_config_dir(std::string dir)
