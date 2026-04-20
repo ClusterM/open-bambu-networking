@@ -66,6 +66,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
 pkg_check_modules(CURL     REQUIRED IMPORTED_TARGET libcurl)
 find_package(OpenSSL REQUIRED)
+# zlib is shared between bambu_networking (cover_cache: unpacks
+# Metadata/plate_N.png out of /cache/<name>.3mf to show it as the
+# printing-task thumbnail) and BambuSource (same unpack, but for the
+# file browser).
+find_package(ZLIB REQUIRED)
 
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
@@ -88,6 +93,8 @@ add_library(bambu_networking SHARED
     src/cloud_auth.cpp
     src/cloud_print.cpp
     src/cloud_session.cpp
+    src/cover_cache.cpp
+    src/cover_server.cpp
     src/ftps.cpp
     src/http_client.cpp
     src/json_lite.cpp
@@ -96,6 +103,7 @@ add_library(bambu_networking SHARED
     src/mqtt_client.cpp
     src/print_job.cpp
     src/ssdp.cpp
+    src/zip_reader.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include)
@@ -109,6 +117,7 @@ target_link_libraries(bambu_networking PRIVATE
     PkgConfig::CURL
     OpenSSL::SSL
     OpenSSL::Crypto
+    ZLIB::ZLIB
 )
 
 # No "lib" prefix rename: output is literally "libbambu_networking.so"
@@ -144,6 +153,7 @@ add_library(BambuSource SHARED
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
+    src/zip_reader.cpp
 )
 target_include_directories(BambuSource PRIVATE include)
 target_compile_definitions(BambuSource PRIVATE

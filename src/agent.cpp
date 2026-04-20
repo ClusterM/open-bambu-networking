@@ -2,12 +2,15 @@
 
 #include <sys/stat.h>
 
+#include <cstdint>
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
+#include "obn/cover_cache.hpp"
+#include "obn/cover_server.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/ssdp.hpp"
@@ -206,6 +209,105 @@ bool try_inject_ipcam_file_local(std::string& payload)
     return true;
 }
 
+// Extracts a JSON string-valued field from an arbitrary payload. Only
+// matches top-level flat string fields (no escaping, no nested objects)
+// because we only ever use it to read simple values like subtask_name
+// that Bambu's firmware always emits as plain ASCII.
+//
+// On hit: returns true and writes the string value (without surrounding
+// quotes) into *out. On miss: false, *out is left unchanged.
+bool json_peek_string_field(const std::string& payload,
+                            const std::string& key,
+                            std::string*       out)
+{
+    std::string needle = "\"" + key + "\":";
+    std::size_t pos = payload.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < payload.size() && payload[pos] == ' ') ++pos;
+    if (pos >= payload.size() || payload[pos] != '"') return false;
+    std::size_t start = pos + 1;
+    std::size_t end = start;
+    while (end < payload.size() && payload[end] != '"') {
+        if (payload[end] == '\\' && end + 1 < payload.size()) ++end;
+        ++end;
+    }
+    if (end >= payload.size()) return false;
+    *out = payload.substr(start, end - start);
+    return true;
+}
+
+// Rewrites `"key":"0"` (or `"key": "0"`) to `"key":"<value>"` *in place*.
+// Returns true if a replacement happened. Used to swap LAN print
+// `project_id`/`profile_id`/`task_id` zeros with synthetic non-zero
+// values that push Studio's MachineObject::is_sdcard_printing() off the
+// SD-card-placeholder branch and onto the cover-via-URL branch.
+bool patch_string_zero_to(std::string&       payload,
+                          const std::string& key,
+                          const std::string& value)
+{
+    std::string needle = "\"" + key + "\":";
+    std::size_t pos = payload.find(needle);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + needle.size();
+    while (i < payload.size() && payload[i] == ' ') ++i;
+    if (i + 3 > payload.size()) return false;
+    // Look for "0"
+    if (payload[i] != '"' || payload[i+1] != '0' || payload[i+2] != '"')
+        return false;
+    payload.replace(i, 3, "\"" + value + "\"");
+    return true;
+}
+
+// FNV-1a 32-bit - deterministic across platforms and C++ runtimes, so
+// Studio always computes the same synthetic subtask id for a given
+// subtask name even across plugin rebuilds.
+std::uint32_t fnv1a_32(const std::string& s)
+{
+    std::uint32_t h = 2166136261u;
+    for (unsigned char c : s) { h ^= c; h *= 16777619u; }
+    return h;
+}
+
+std::string synthetic_subtask_id(const std::string& subtask_name)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "lan-%08x", fnv1a_32(subtask_name));
+    return buf;
+}
+
+// LAN / Developer-Mode prints set project_id / profile_id / task_id /
+// subtask_id all to "0" in push_status.print, which makes Studio's
+// MachineObject::is_sdcard_printing() return true and routes the
+// Device-panel thumbnail to the static SD-card placeholder bitmap. We
+// don't want that: we have the original .3mf sitting in the printer's
+// FTPS /cache/ and can hand Studio a real cover image.
+//
+// Swap the zero ids for synthetic non-zero ones derived from the
+// subtask_name. Studio will then hit the "cloud subtask" branch,
+// eventually calling our bambu_network_get_subtask_info which hands
+// back a JSON pointing at the local cover_server.
+//
+// Returns true if the payload was patched.
+bool try_rewrite_print_ids(std::string& payload, std::string* synthetic_id)
+{
+    // Cheap prefilter: only bother if we're looking at a push_status
+    // frame that carries a subtask_name (i.e. a real print, not a
+    // system_printing / system_status frame).
+    std::string name;
+    if (!json_peek_string_field(payload, "subtask_name", &name)) return false;
+    if (name.empty() || name == "-1") return false;
+
+    std::string id = synthetic_subtask_id(name);
+    bool touched = false;
+    touched |= patch_string_zero_to(payload, "project_id", "lan");
+    touched |= patch_string_zero_to(payload, "profile_id", "lan");
+    touched |= patch_string_zero_to(payload, "task_id",    id);
+    touched |= patch_string_zero_to(payload, "subtask_id", id);
+    if (touched && synthetic_id) *synthetic_id = id;
+    return touched;
+}
+
 bool try_rewrite_home_flag(std::string& payload)
 {
     static const std::string kKey = "\"home_flag\":";
@@ -251,22 +353,113 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
 
     std::string patched = json;
 #if OBN_ENABLE_WORKAROUNDS
-    // Both rewrites are P2S/A-series-targeted workarounds: stock
+    // These rewrites are P2S/A-series-targeted workarounds: stock
     // firmware on those printers exposes neither HAS_SDCARD nor the
     // `ipcam.file` hint, and without them Studio greys out the
     // Send-to-Printer UI and refuses to open the file browser. When
     // workarounds are compiled out we just forward the payload.
-    bool rewrote_flag   = try_rewrite_home_flag(patched);
-    bool injected_file  = try_inject_ipcam_file_local(patched);
+    bool rewrote_flag    = try_rewrite_home_flag(patched);
+    bool injected_file   = try_inject_ipcam_file_local(patched);
 
-    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d sd_fix=%d file_inject=%d",
+    // Print-cover workaround: turn a LAN-only "all zeros" print into a
+    // synthetic cloud subtask so Studio's update_cloud_subtask path
+    // fires and requests our cover URL.
+    std::string synth_id;
+    bool rewrote_ids = try_rewrite_print_ids(patched, &synth_id);
+
+    // Cover-cache trigger. Two cases feed this path:
+    //  * LAN-only prints: ids were "0", rewrite_print_ids swapped them
+    //    for a synthetic "lan-<fnv>" id that we have to publish.
+    //  * Cloud-initiated prints (subtask from Bambu cloud, even when
+    //    Studio is now unbound): ids already carry real values like
+    //    "893120535", Studio sends those to get_subtask_info. We need
+    //    to map them onto the same cover PNG.
+    // In both cases we pull `/cache/<subtask_name>.gcode.3mf` over
+    // FTPS, which is what start_local_print_with_record / start_sdcard_
+    // print deposit (cloud prints land there via the printer's own
+    // cloud-download path too).
+    std::string subtask_name;
+    json_peek_string_field(patched, "subtask_name", &subtask_name);
+    std::string real_subtask_id;
+    json_peek_string_field(patched, "subtask_id", &real_subtask_id);
+
+    std::string cover_id;
+    if (!subtask_name.empty() && subtask_name != "-1") {
+        if (rewrote_ids && !synth_id.empty()) {
+            cover_id = synth_id;
+        } else if (!real_subtask_id.empty() && real_subtask_id != "0") {
+            cover_id = real_subtask_id;
+        }
+    }
+
+    if (!cover_id.empty()) {
+        // Bambu firmware doesn't ship plate_idx in push_status; the
+        // original .3mf is the source of truth (Metadata/slice_info.
+        // config) but we haven't downloaded it yet. Default to 1 -
+        // this matches our start_sdcard_print param path and is right
+        // for 99% of single-plate .3mfs.
+        int plate_idx = 1;
+
+        std::string host, user, pass, ca;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (lan_session_) {
+                host = lan_session_->dev_ip();
+                user = lan_session_->username();
+                pass = lan_session_->password();
+                ca   = lan_session_->ca_file();
+            }
+            synthetic_subtasks_[cover_id] = {subtask_name, plate_idx};
+            // Cap the map; the user only ever cares about the current
+            // print but we keep a short history for races between
+            // subtask switches and Studio's thumbnail re-request.
+            while (synthetic_subtasks_.size() > 16) {
+                synthetic_subtasks_.erase(synthetic_subtasks_.begin());
+            }
+            if (!cover_server_) {
+                cover_server_ = std::make_unique<cover_server::Server>();
+                if (int rc = cover_server_->start(); rc != 0) {
+                    OBN_WARN("cover_server: start failed rc=%d", rc);
+                    cover_server_.reset();
+                }
+            }
+        }
+        if (!host.empty()) {
+            cover_cache::ensure(host, user, pass, ca,
+                                subtask_name, plate_idx);
+        }
+    }
+
+    OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d sd_fix=%d "
+              "file_inject=%d print_ids=%d cover_id=%s",
               dev_id.c_str(), patched.size(), cb ? 1 : 0,
-              rewrote_flag ? 1 : 0, injected_file ? 1 : 0);
+              rewrote_flag ? 1 : 0, injected_file ? 1 : 0,
+              rewrote_ids ? 1 : 0,
+              cover_id.empty() ? "-" : cover_id.c_str());
 #else
     OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d (strict)",
               dev_id.c_str(), patched.size(), cb ? 1 : 0);
 #endif
     if (cb) cb(dev_id, patched);
+}
+
+bool Agent::lookup_synthetic_subtask(const std::string& subtask_id,
+                                     SubtaskCoverInfo*  out) const
+{
+    if (!out) return false;
+#if OBN_ENABLE_WORKAROUNDS
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = synthetic_subtasks_.find(subtask_id);
+    if (it == synthetic_subtasks_.end()) return false;
+    out->subtask_name = it->second.first;
+    out->plate_idx    = it->second.second;
+    if (cover_server_) out->url = cover_server_->url_for(out->subtask_name,
+                                                          out->plate_idx);
+    return true;
+#else
+    (void)subtask_id;
+    return false;
+#endif
 }
 
 void Agent::set_config_dir(std::string dir)

@@ -7,6 +7,14 @@
 
 using obn::as_agent;
 
+// Cloud-signed TUTK/Agora liveview is intentionally not implemented -
+// this plugin is a LAN-first replacement. On LAN-only printers
+// MediaPlayCtrl takes its native LAN branch and never even calls us
+// here (see src/slic3r/GUI/MediaPlayCtrl.cpp:~308); on cloud-paired
+// printers it calls get_camera_url() expecting a `bambu:///tutk?...`
+// URL which we can't mint without shipping the proprietary TUTK SDK.
+// Returning an empty URL drives Studio into its normal "connection
+// failed" path.
 OBN_ABI int bambu_network_get_camera_url(void* /*agent*/,
                                          std::string /*dev_id*/,
                                          std::function<void(std::string)> callback)

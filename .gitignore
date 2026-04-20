@@ -9,3 +9,4 @@ compile_commands.json
 *.a
 .vscode/
 .idea/
+patches/

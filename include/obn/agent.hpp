@@ -14,6 +14,7 @@
 namespace obn {
 namespace mqtt { class Client; }
 namespace ssdp { class Discovery; }
+namespace cover_server { class Server; }
 class CloudSession;
 
 // Per-printer LAN MQTT session. Studio only holds one such connection at a
@@ -46,6 +47,11 @@ public:
 
     const std::string& dev_id() const { return dev_id_; }
     const std::string& dev_ip() const { return dev_ip_; }
+    // Expose the LAN access-code so the cover-cache worker can mount
+    // the printer's FTPS storage without asking Studio again.
+    const std::string& username() const { return username_; }
+    const std::string& password() const { return password_; }
+    const std::string& ca_file()  const { return ca_file_; }
 
 private:
     std::string report_topic_() const;
@@ -201,6 +207,19 @@ public:
     void notify_local_connected(int status, const std::string& dev_id, const std::string& msg);
     void notify_local_message(const std::string& dev_id, const std::string& json);
 
+    // Lookup: given a synthetic subtask id we minted in notify_local_message,
+    // returns the (subtask_name, plate_idx) combo and a ready-to-fetch
+    // URL for its cover PNG. Used by bambu_network_get_subtask_info to
+    // turn the opaque id back into a fake "cloud subtask" JSON reply
+    // Studio can parse.
+    struct SubtaskCoverInfo {
+        std::string subtask_name;
+        int         plate_idx = 1;
+        std::string url; // http://127.0.0.1:PORT/cover/...
+    };
+    bool lookup_synthetic_subtask(const std::string& subtask_id,
+                                  SubtaskCoverInfo*  out) const;
+
     // -----------------------------
     // Cloud MQTT (Studio's "server" connection).
     // -----------------------------
@@ -256,6 +275,14 @@ private:
     std::unique_ptr<LanSession> lan_session_;
     std::unique_ptr<ssdp::Discovery> discovery_;
     std::unique_ptr<CloudSession>   cloud_session_;
+    // Lazy localhost HTTP server that hands cover PNGs to Studio's
+    // wxWebRequest. Only spun up when we first mint a synthetic
+    // subtask id; destructor joins its accept loop.
+    std::unique_ptr<cover_server::Server> cover_server_;
+    // subtask_id ("lan-<fnv>") -> (subtask_name, plate_idx) mapping we
+    // emit in notify_local_message. Trimmed when the user swaps the
+    // active print, bounded to a handful of entries.
+    std::map<std::string, std::pair<std::string, int>> synthetic_subtasks_;
 
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")

@@ -201,8 +201,8 @@ OBN_ABI int bambu_network_get_task_plate_index(void* /*agent*/,
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_subtask_info(void* /*agent*/,
-                                           std::string /*subtask_id*/,
+OBN_ABI int bambu_network_get_subtask_info(void* agent,
+                                           std::string subtask_id,
                                            std::string* task_json,
                                            unsigned int* http_code,
                                            std::string*  http_body)
@@ -210,6 +210,58 @@ OBN_ABI int bambu_network_get_subtask_info(void* /*agent*/,
     if (task_json) task_json->clear();
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
+
+#if OBN_ENABLE_WORKAROUNDS
+    // Synthetic-subtask short-circuit. notify_local_message rewrites
+    // zero ids in LAN push_status frames to "lan-<fnv>"; Studio then
+    // calls us here to resolve that id. We hand back a minimal
+    // "cloud subtask" JSON whose only interesting field is the
+    // context.plates[0].thumbnail.url pointing at our local
+    // cover_server, which in turn serves the PNG extracted from the
+    // printer's /cache/<name>.3mf.
+    auto* a = as_agent(agent);
+    if (a) {
+        obn::Agent::SubtaskCoverInfo info;
+        if (a->lookup_synthetic_subtask(subtask_id, &info) &&
+            !info.url.empty()) {
+            using obn::json::Value;
+            using obn::json::Object;
+            using obn::json::Array;
+
+            Object thumb{{"url", Value(info.url)}};
+            Object plate{
+                {"index",     Value(static_cast<double>(info.plate_idx))},
+                {"thumbnail", Value(std::move(thumb))},
+            };
+            Array plates;
+            plates.push_back(Value(std::move(plate)));
+            Object context{{"plates", Value(std::move(plates))}};
+
+            // DeviceManager.cpp parses `content` as a *string* holding
+            // an embedded JSON object, then reads info.plate_idx out
+            // of it to pick which plate entry to attach.
+            Object inner_info{
+                {"plate_idx", Value(static_cast<double>(info.plate_idx))},
+            };
+            Object inner{{"info", Value(std::move(inner_info))}};
+            Value inner_v{std::move(inner)};
+
+            Object root{
+                {"context", Value(std::move(context))},
+                {"content", Value(inner_v.dump())},
+            };
+            std::string body = Value(std::move(root)).dump();
+            if (task_json) *task_json = body;
+            if (http_code) *http_code = 200;
+            if (http_body) *http_body = body;
+            OBN_DEBUG("get_subtask_info: synthetic id=%s url=%s body=%s",
+                      subtask_id.c_str(), info.url.c_str(), body.c_str());
+            return BAMBU_NETWORK_SUCCESS;
+        }
+    }
+#endif
+    (void)agent;
+    (void)subtask_id;
     return BAMBU_NETWORK_SUCCESS;
 }
 

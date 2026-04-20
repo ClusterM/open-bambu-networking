@@ -101,6 +101,7 @@
 
 #include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/zip_reader.hpp"
 
 #if defined(_WIN32)
 #    define OBN_EXPORT extern "C" __declspec(dllexport)
@@ -701,6 +702,38 @@ void gst_log_handler(GstDebugCategory* cat, GstDebugLevel level,
                  gst_debug_message_get(message));
 }
 
+// avdec_h264 decodes Bambu's stream into AV_PIX_FMT_YUVJ420P (JPEG
+// full-range YUV), whose handling is deprecated in modern ffmpeg.
+// gst_videoconvert's internal swscale prints one "deprecated pixel
+// format used, make sure you did set range correctly" per frame to
+// stderr - at 30 fps that's 1800 lines/minute spamming Studio's
+// console. We don't link libav directly (it's pulled in by gst-libav),
+// so we reach av_log_set_level through dlsym after gst_init has
+// already loaded libavutil into the process. AV_LOG_ERROR (16) is
+// loud enough to still surface real decoder failures.
+void silence_libav_warnings()
+{
+    constexpr int kAvLogError = 16;
+    using SetLevelFn = void (*)(int);
+    auto try_hush = [&](const char* soname) -> bool {
+        void* h = dlopen(soname, RTLD_NOW | RTLD_NOLOAD);
+        if (!h) return false;
+        if (auto fn = reinterpret_cast<SetLevelFn>(dlsym(h, "av_log_set_level"))) {
+            fn(kAvLogError);
+            dlclose(h);
+            return true;
+        }
+        dlclose(h);
+        return false;
+    };
+    if (try_hush("libavutil.so.59")) return;
+    if (try_hush("libavutil.so.58")) return;
+    if (try_hush("libavutil.so.57")) return;
+    if (try_hush("libavutil.so.56")) return;
+    if (try_hush("libavutil.so")) return;
+    (void)try_hush("libavutil.so.55");
+}
+
 void gst_init_once()
 {
     std::call_once(g_gst_init_flag, []() {
@@ -721,6 +754,7 @@ void gst_init_once()
         gst_debug_set_default_threshold(lvl);
         gst_debug_remove_log_function(gst_debug_log_default);
         gst_debug_add_log_function(gst_log_handler, nullptr, nullptr);
+        silence_libav_warnings();
     });
 }
 
@@ -1218,131 +1252,20 @@ void build_auth_packet(const TunnelUrl& url, uint8_t out[80])
                 std::min<size_t>(url.passwd.size(), 32));
 }
 
-// ---------------------------------------------------------------------
-// Minimal ZIP reader.
-//
-// .3mf files are PKZip archives; to give Studio's MediaFilePanel a
-// thumbnail we extract `Metadata/plate_1.png` out of them on the fly.
-// We only handle:
-//   * Uncompressed (method 0) entries,
-//   * DEFLATE (method 8) via zlib's raw `inflate`,
-// with a "use the central directory, not the local file headers"
-// strategy (local headers can have zero size fields when bit-3 of GPBF
-// is set). We read the entire .3mf into memory first - typical 3mf
-// sizes are <50 MB for a printed plate, well within tolerable RAM.
-// --------------------------------------------------------------------
-struct ZipEntry {
-    std::string  name;
-    std::uint64_t comp_size = 0;
-    std::uint64_t uncomp_size = 0;
-    std::uint64_t local_offset = 0;
-    std::uint16_t method = 0;
-};
-
-// Parses the central directory of a ZIP blob. Returns false if the
-// EOCD record isn't found in the last 64 KB (standard search window).
-bool zip_read_central(const std::vector<std::uint8_t>& zip,
-                      std::vector<ZipEntry>*           out)
-{
-    out->clear();
-    if (zip.size() < 22) return false;
-    std::size_t max = std::min<std::size_t>(zip.size() - 22, 65535);
-    std::size_t eocd = std::string::npos;
-    for (std::size_t off = 0; off <= max; ++off) {
-        std::size_t i = zip.size() - 22 - off;
-        if (zip[i] == 'P' && zip[i+1] == 'K' && zip[i+2] == 5 && zip[i+3] == 6) {
-            eocd = i;
-            break;
-        }
-    }
-    if (eocd == std::string::npos) return false;
-    auto u16 = [&](std::size_t i) -> std::uint32_t {
-        return zip[i] | (static_cast<std::uint32_t>(zip[i+1]) << 8);
-    };
-    auto u32 = [&](std::size_t i) -> std::uint32_t {
-        return zip[i] | (static_cast<std::uint32_t>(zip[i+1]) << 8)
-             | (static_cast<std::uint32_t>(zip[i+2]) << 16)
-             | (static_cast<std::uint32_t>(zip[i+3]) << 24);
-    };
-    std::uint32_t cd_size   = u32(eocd + 12);
-    std::uint32_t cd_offset = u32(eocd + 16);
-    std::uint32_t entries   = u16(eocd + 10);
-    if (cd_offset + cd_size > zip.size()) return false;
-
-    std::size_t i = cd_offset;
-    for (std::uint32_t n = 0; n < entries; ++n) {
-        if (i + 46 > zip.size()) return false;
-        if (!(zip[i] == 'P' && zip[i+1] == 'K' && zip[i+2] == 1 && zip[i+3] == 2))
-            return false;
-        ZipEntry e;
-        e.method       = u16(i + 10);
-        e.comp_size    = u32(i + 20);
-        e.uncomp_size  = u32(i + 24);
-        std::uint16_t name_len  = u16(i + 28);
-        std::uint16_t extra_len = u16(i + 30);
-        std::uint16_t cmt_len   = u16(i + 32);
-        e.local_offset = u32(i + 42);
-        if (i + 46 + name_len > zip.size()) return false;
-        e.name.assign(reinterpret_cast<const char*>(&zip[i + 46]), name_len);
-        out->push_back(std::move(e));
-        i += 46 + name_len + extra_len + cmt_len;
-    }
-    return true;
-}
-
-// Extracts one entry into `out`. `method=0` is raw copy, `method=8` is
-// zlib RAW deflate (no zlib header).
-bool zip_extract(const std::vector<std::uint8_t>& zip, const ZipEntry& e,
-                 std::vector<std::uint8_t>* out)
-{
-    out->clear();
-    if (e.local_offset + 30 > zip.size()) return false;
-    auto u16 = [&](std::size_t i) -> std::uint32_t {
-        return zip[i] | (static_cast<std::uint32_t>(zip[i+1]) << 8);
-    };
-    std::uint16_t name_len  = u16(e.local_offset + 26);
-    std::uint16_t extra_len = u16(e.local_offset + 28);
-    std::size_t data_off = e.local_offset + 30 + name_len + extra_len;
-    if (data_off + e.comp_size > zip.size()) return false;
-
-    if (e.method == 0) {
-        out->assign(zip.begin() + data_off,
-                    zip.begin() + data_off + e.comp_size);
-        return true;
-    }
-    if (e.method != 8) return false;
-
-    z_stream zs{};
-    // -MAX_WBITS = raw deflate (no zlib/gzip header/trailer).
-    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
-    zs.next_in  = const_cast<Bytef*>(&zip[data_off]);
-    zs.avail_in = static_cast<uInt>(e.comp_size);
-    out->resize(e.uncomp_size ? e.uncomp_size : e.comp_size * 4);
-    std::size_t produced = 0;
-    while (true) {
-        if (produced >= out->size()) out->resize(out->size() * 2);
-        zs.next_out  = out->data() + produced;
-        zs.avail_out = static_cast<uInt>(out->size() - produced);
-        int rc = inflate(&zs, Z_NO_FLUSH);
-        produced = out->size() - zs.avail_out;
-        if (rc == Z_STREAM_END) break;
-        if (rc == Z_BUF_ERROR && zs.avail_in == 0) break;
-        if (rc != Z_OK) { inflateEnd(&zs); return false; }
-    }
-    inflateEnd(&zs);
-    out->resize(produced);
-    return true;
-}
-
-// Looks up one named entry in the central directory. Returns nullptr
-// if no match.
-const ZipEntry* zip_find(const std::vector<ZipEntry>& dir, const std::string& name)
-{
-    for (const auto& e : dir) {
-        if (e.name == name) return &e;
-    }
-    return nullptr;
-}
+// Thin aliases onto the shared zip reader (include/obn/zip_reader.hpp).
+// PKZip is the container format for .3mf; we extract the plate PNG
+// preview out of it on the fly to feed Studio's MediaFilePanel.
+using ZipEntry = obn::zip::Entry;
+static inline bool zip_read_central(const std::vector<std::uint8_t>& z,
+                                    std::vector<ZipEntry>* o)
+{ return obn::zip::read_central(z, o); }
+static inline bool zip_extract(const std::vector<std::uint8_t>& z,
+                               const ZipEntry& e,
+                               std::vector<std::uint8_t>* o)
+{ return obn::zip::extract(z, e, o); }
+static inline const ZipEntry* zip_find(const std::vector<ZipEntry>& d,
+                                       const std::string& name)
+{ return obn::zip::find(d, name); }
 
 // ImageGrid.cpp renders each tile's thumbnail via
 //     dc.SetUserScale(content_w / img_w, content_h / img_h)
