@@ -1,5 +1,6 @@
 build/
 build-*/
+config.mk
 .cache/
 compile_commands.json
 *.o
@@ -10,3 +11,4 @@ compile_commands.json
 .vscode/
 .idea/
 patches/
+3rd_party/
