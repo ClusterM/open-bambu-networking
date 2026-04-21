@@ -47,6 +47,12 @@ reference implementations in
 [ha_bambu_lab](https://github.com/greghesp/ha-bambulab); everything
 else is reverse-engineered from MITM captures of the stock plugin.
 
+For the technical reference — how Studio loads, validates and calls
+the plugin, and the full list of ABI symbols and their semantics —
+see [NETWORK_PLUGIN.md](NETWORK_PLUGIN.md). For a per-function
+implementation status of this plugin against that ABI, see
+[STATUS.md](STATUS.md).
+
 Please note:
 
 **This project has been built entirely through the author's enthusiasm, with a tremendous personal investment of time, effort, and financial resources. If this work helps you, please consider supporting its further development in the [Support the Developer and the Project](#support-the-developer-and-the-project) section.**
@@ -103,6 +109,10 @@ with what works, what fails, and your firmware / OS / Studio version —
 that is how we turn "not tested" into documented reality. Bug reports,
 regressions, and small compatibility notes all belong in
 [**Issues**](https://github.com/ClusterM/open-bambu-networking/issues).
+
+The tables below are a feature-level view. For an ABI-level view —
+every single function Studio resolves from the plugin, with per-symbol
+implementation status and notes — see [STATUS.md](STATUS.md).
 
 Legend:
 
@@ -394,7 +404,11 @@ Used by Studio for the "Send to Printer" dialog (upload without
 printing), the eMMC pre-flight check in the regular Print job, and a
 handful of media-ability queries. The proprietary plugin serves these
 over a port-6000 TLS tunnel with a JSON command framer we haven't
-reimplemented.
+reimplemented. See
+[NETWORK_PLUGIN.md § 6.14](NETWORK_PLUGIN.md#614-file-transfer-abi-ft_)
+for the ABI contract and
+[STATUS.md § 6.14](STATUS.md#614-file-transfer-abi-ft_) for the
+per-symbol status of the two modes below.
 
 We have two modes, toggled at configure time with
 `-DOBN_FT_FTPS_FASTPATH=ON|OFF` (default **ON**):
