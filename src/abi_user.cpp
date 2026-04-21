@@ -121,17 +121,25 @@ std::string build_session_cmd(const obn::Agent* a, bool logout)
 
 } // namespace
 
+// Studio calls build_login_cmd / build_logout_cmd from
+// WebViewPanel::OnFreshLoginStatus, which is driven by a 2-second
+// wxTimer that starts as soon as the HomePage WebView posts its first
+// script message, and keeps running for the lifetime of that panel.
+// The sidebar uses the returned JSON to keep its avatar / login
+// status widget in sync. That means we get called roughly every two
+// seconds even when nothing about the session has changed; logging
+// at INFO would drown out everything else, so we stay at DEBUG.
 OBN_ABI std::string bambu_network_build_login_cmd(void* agent)
 {
     auto r = build_session_cmd(as_agent(agent), /*logout=*/false);
-    OBN_INFO("build_login_cmd -> len=%zu", r.size());
+    OBN_DEBUG("build_login_cmd -> len=%zu", r.size());
     return r;
 }
 
 OBN_ABI std::string bambu_network_build_logout_cmd(void* agent)
 {
     auto r = build_session_cmd(as_agent(agent), /*logout=*/true);
-    OBN_INFO("build_logout_cmd -> len=%zu", r.size());
+    OBN_DEBUG("build_logout_cmd -> len=%zu", r.size());
     return r;
 }
 
