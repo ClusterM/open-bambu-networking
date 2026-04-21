@@ -31,8 +31,8 @@ jobs:
   # Fast, architecture-independent check: compare the ABI surface
   # (bambu_networking.hpp + NetworkAgent.hpp + bambu_network_* dlsym list)
   # at the most recent bambulab/BambuStudio tag on github.com against the
-  # baseline snapshot committed to tools/abi_snapshot/. See
-  # tools/check_abi_compat.sh for the full list of checks.
+  # baseline under tools/abi_snapshot/vMM.mm.pp/ (series from the tag).
+  # See tools/check_abi_compat.sh for the full list of checks.
   abi-compat:
     name: abi-compat
     runs-on: ubuntu-24.04

@@ -33,6 +33,44 @@ if(NOT OBN_VERSION)
     )
 endif()
 
+# First three dotted components of OBN_VERSION (MM.mm.pp from MM.mm.pp.rr)
+# as a single preprocessor integer 0xMMmmpp for #if ABI_VERSION in
+# include/obn/bambu_networking.hpp (matches Studio's 8-char prefix gate).
+if(NOT OBN_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR
+        "OBN_VERSION must look like MM.mm.pp.rr with decimal components (got '${OBN_VERSION}').")
+endif()
+function(_obn_dec_string_to_int s outvar)
+    string(REGEX REPLACE "^0+" "" _t "${s}")
+    if(_t STREQUAL "")
+        set(_t "0")
+    endif()
+    math(EXPR _n "${_t}")
+    set(${outvar} "${_n}" PARENT_SCOPE)
+endfunction()
+function(_obn_byte_to_hex2 b outvar)
+    set(_digits "0123456789abcdef")
+    math(EXPR _hi "${b} / 16")
+    math(EXPR _lo "${b} % 16")
+    string(SUBSTRING "${_digits}" ${_hi} 1 _h1)
+    string(SUBSTRING "${_digits}" ${_lo} 1 _h2)
+    set(${outvar} "${_h1}${_h2}" PARENT_SCOPE)
+endfunction()
+_obn_dec_string_to_int("${CMAKE_MATCH_1}" _obn_b0)
+_obn_dec_string_to_int("${CMAKE_MATCH_2}" _obn_b1)
+_obn_dec_string_to_int("${CMAKE_MATCH_3}" _obn_b2)
+foreach(_obn_x IN ITEMS ${_obn_b0} ${_obn_b1} ${_obn_b2})
+    if(_obn_x GREATER 255)
+        message(FATAL_ERROR
+            "OBN_VERSION component out of 0..255 range after parsing '${OBN_VERSION}'.")
+    endif()
+endforeach()
+_obn_byte_to_hex2(${_obn_b0} _obn_h0)
+_obn_byte_to_hex2(${_obn_b1} _obn_h1)
+_obn_byte_to_hex2(${_obn_b2} _obn_h2)
+set(OBN_ABI_VERSION_HEX "0x${_obn_h0}${_obn_h1}${_obn_h2}")
+message(STATUS "obn: ABI_VERSION=${OBN_ABI_VERSION_HEX} (from OBN_VERSION=${OBN_VERSION})")
+
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
 # the Print job's eMMC pre-flight speaks a real transport instead of
 # reporting an immediate I/O error. The transport is FTPS (same one we
@@ -145,6 +183,7 @@ add_library(bambu_networking SHARED
 target_include_directories(bambu_networking PRIVATE include)
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
+    ABI_VERSION=${OBN_ABI_VERSION_HEX}
     OBN_FT_FTPS_FASTPATH=$<BOOL:${OBN_FT_FTPS_FASTPATH}>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
@@ -350,6 +389,7 @@ if(OBN_BUILD_TESTS)
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
     target_link_libraries(lan_live_test PRIVATE
         PkgConfig::MOSQUITTO

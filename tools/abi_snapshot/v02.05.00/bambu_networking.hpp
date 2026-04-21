@@ -5,10 +5,6 @@
 #include <functional>
 #include <map>
 
-#ifndef ABI_VERSION
-#error ABI_VERSION must be defined by the build system (see CMakeLists.txt).
-#endif
-
 extern std::string g_log_folder;
 extern std::string g_log_start_time;
 
@@ -100,6 +96,8 @@ namespace BBL {
 
 #define BAMBU_NETWORK_LIBRARY               "bambu_networking"
 #define BAMBU_NETWORK_AGENT_NAME            "bambu_network_agent"
+
+#define BAMBU_NETWORK_AGENT_VERSION         "02.05.00.xx"
 
 //iot preset type strings
 #define IOT_PRINTER_TYPE_STRING     "printer"
@@ -230,9 +228,6 @@ struct PrintParams {
     bool            task_vibration_cali;    /* vibration calibration of task */
     bool            task_layer_inspect;     /* first layer inspection of task */
     bool            task_record_timelapse;  /* record timelapse of task */
-#if ABI_VERSION >= 0x020503
-    bool            task_timelapse_use_internal;
-#endif
     bool            task_use_ams;
     std::string     task_bed_type;
     std::string     extra_options;

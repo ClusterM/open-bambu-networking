@@ -57,6 +57,23 @@ Please note:
 
 **This project has been built entirely through the author's enthusiasm, with a tremendous personal investment of time, effort, and financial resources. If this work helps you, please consider supporting its further development in the [Support the Developer and the Project](#support-the-developer-and-the-project) section.**
 
+
+## Supported platforms
+
+- Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
+- Linux aarch64 (cross-compile-friendly, see `cmake/toolchains/`).
+
+Windows and macOS are architected for but not yet built and tested: the ABI uses
+`std::string`/`std::map`/`std::function` across the boundary, which means we
+would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
+also enforces a matching code-signing publisher on those OSes unless the user
+sets `ignore_module_cert = 1`.
+
+## Supported Bambu Studio versions
+
+- **Minimum supported**: Bambu Studio **02.05.00.xx**
+- **Maximum supported**: Bambu Studio **02.06.00.xx**
+
 ## Developer Mode requirement
 
 Recent (2024+) printer firmware cryptographically verifies every MQTT command
@@ -533,33 +550,6 @@ Used by Studio as a fallback when LAN is unavailable and for the X1 family
 in non-LAN mode. Closed-source proprietary libraries (`libBambuTUTK` /
 `libBambuAgora`) implement them. We don't wrap either.
 **Scope:** out of scope — use LAN/Developer Mode instead.
-
-## Supported platforms
-
-- Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
-- Linux aarch64 (cross-compile-friendly, see `cmake/toolchains/`).
-
-Windows and macOS are architected for but not yet built and tested: the ABI uses
-`std::string`/`std::map`/`std::function` across the boundary, which means we
-would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
-also enforces a matching code-signing publisher on those OSes unless the user
-sets `ignore_module_cert = 1`.
-
-## Supported Bambu Studio versions
-
-- **Minimum supported**: Bambu Studio **2.6.0** (`SLIC3R_VERSION = 02.06.00.51`,
-  agent-version string `02.06.00.50`).
-- **Maximum tested**: Bambu Studio **2.6.0** — the plugin has not yet been
-  exercised against any newer release.
-
-The ABI surface vendored in `include/obn/bambu_networking.hpp` mirrors the
-header shipped in upstream tag
-[`v02.06.00.51`](https://github.com/bambulab/BambuStudio/tree/v02.06.00.51).
-Earlier Studio releases (for example the AppImage-based `v02.05.02.51`) use a
-slightly older layout of the `PrintParams` struct that is passed across the C
-ABI by value, so this build is not guaranteed to be loadable there — if you
-need it on an older Studio, rebuild the plugin from a matching git tag in
-`3rd_party/BambuStudio/`.
 
 ## Build and install
 

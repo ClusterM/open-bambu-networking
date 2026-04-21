@@ -1,68 +1,56 @@
 #!/bin/sh
 # ABI-compatibility checker for open-bambu-networking.
 #
-# Compares the Bambu Studio ABI surface we target against a baseline
-# snapshot committed to tools/abi_snapshot/. The snapshot is just the
-# upstream files at the tag recorded in tools/abi_snapshot/SOURCE_TAG.
-# Refreshing the snapshot is an explicit, reviewed step (--refresh); CI
-# runs the read-only check and fails if anything drifted.
+# Baselines live under tools/abi_snapshot/vMM.mm.pp/ (first three version
+# components of a Studio git tag, e.g. v02.06.00.51 -> v02.06.00). That
+# matches Studio's networking compatibility gate (first 8 chars of the
+# version string, e.g. "02.06.00").
 #
-# The checker runs five tests:
+# The checker runs four read-only tests (plus optional nm on a built .so):
 #
-#   1. upstream vs snapshot: src/slic3r/Utils/bambu_networking.hpp
-#      (Studio-side struct / enum / callback typedefs layout.)
+#   1. upstream vs snapshot: bambu_networking.hpp — struct / enum / typedefs.
+#      Before compare, BAMBU_NETWORK_AGENT_VERSION's last dotted component is
+#      replaced with "xx" on both sides so patch bumps do not false-fail.
 #
-#   2. upstream vs snapshot: src/slic3r/Utils/NetworkAgent.hpp
-#      (`func_*` typedefs Studio casts `dlsym` results into. Catches
-#       silent signature drift on existing ABI slots.)
+#   2. upstream vs snapshot: NetworkAgent.hpp (func_* typedefs for dlsym).
 #
-#   3. upstream vs snapshot: sorted list of every bambu_network_*
-#      symbol Studio's NetworkAgent::initialize_network_module()
-#      resolves via dlsym. Catches new / removed ABI slots.
+#   3. upstream vs snapshot: sorted bambu_network_* symbols from
+#      NetworkAgent.cpp dlsym calls.
 #
-#   4. repo self-consistency: include/obn/bambu_networking.hpp against
-#      the snapshot header (we vendor a verbatim copy; any drift here
-#      means our plugin is compiled against a stale layout).
+#   4. Repo: tests/probe_plugin.cpp symbol list vs snapshot symbols.txt.
 #
-#   5. repo self-consistency: the hard-coded symbol list in
-#      tests/probe_plugin.cpp against the snapshot (so the smoke test
-#      keeps checking every symbol Studio will ever ask for).
+# We intentionally do NOT byte-compare include/obn/bambu_networking.hpp to
+# the snapshot (variant A): the vendored header uses ABI_VERSION-gated
+# fields and omits BAMBU_NETWORK_AGENT_VERSION; drift vs upstream is caught
+# by (1) and by compiling the plugin with the right ABI_VERSION from CMake.
 #
-# Optional: if --so=PATH is given, runs `nm` on that shared object and
-# verifies every snapshot symbol is exported with type 'T' (defined,
-# global, text). CI uses this to check the built libbambu_networking.so
-# does not regress.
+# Upstream headers are always downloaded from raw.githubusercontent.com (curl;
+# needs network). With no --tag, the newest v* tag is taken from GitHub via
+# git ls-remote.
 #
 # Usage:
-#   tools/check_abi_compat.sh                 # compare snapshot to newest
-#                                             # tag found on github.com.
+#   tools/check_abi_compat.sh
 #   tools/check_abi_compat.sh --tag=v02.06.00.51
-#   tools/check_abi_compat.sh --offline       # use 3rd_party/BambuStudio
 #   tools/check_abi_compat.sh --so=build/libbambu_networking.so
 #   tools/check_abi_compat.sh --refresh [--tag=...]
-#                                             # overwrite the snapshot
-#                                             # with upstream contents
-#                                             # (then git diff / commit).
 
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SNAP="$REPO/tools/abi_snapshot"
+SNAP_ROOT="$REPO/tools/abi_snapshot"
 UPSTREAM_REPO="bambulab/BambuStudio"
 
 MODE="compare"
 TAG=""
-OFFLINE=0
 SO_PATH=""
 
 usage() {
-    sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,36p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
     case "$arg" in
         --tag=*)       TAG="${arg#*=}" ;;
-        --offline)     OFFLINE=1 ;;
         --refresh)     MODE="refresh" ;;
         --so=*)        SO_PATH="${arg#*=}" ;;
         -h|--help)     usage; exit 0 ;;
@@ -70,12 +58,43 @@ for arg in "$@"; do
     esac
 done
 
-# --- obtain upstream files at $TAG (or latest) ------------------------------
+# Strip trailing "-<n>-g<hash>" from `git describe` style tags.
+sanitize_tag_for_series() {
+    printf '%s' "$1" | sed -E 's/-[0-9]+-g[0-9a-fA-F]+$//'
+}
+
+# v02.06.00.51 or 02.06.00.51 -> v02.06.00
+abi_series_from_tag() {
+    t=$(sanitize_tag_for_series "$1")
+    case "$t" in
+        v*) raw="${t#v}" ;;
+        *)  raw="$t" ;;
+    esac
+    oldIFS=$IFS
+    IFS=.
+    # shellcheck disable=SC2086
+    set -- $raw
+    IFS=$oldIFS
+    if [ "$#" -lt 3 ]; then
+        echo "check_abi_compat: cannot derive snapshot series from tag '$1' (need MM.mm.pp[.rr])" >&2
+        exit 1
+    fi
+    printf 'v%s.%s.%s\n' "$1" "$2" "$3"
+}
+
+# Copy bambu_networking.hpp and normalize BAMBU_NETWORK_AGENT_VERSION last
+# component to xx (only on the #define line).
+normalize_bambu_net_hpp() {
+    in="$1"
+    out="$2"
+    perl -pe 'if(/^#define\s+BAMBU_NETWORK_AGENT_VERSION\s/) {
+        s/"(\d+\.\d+\.\d+)\.\d+"/"$1.xx"/;
+    }' "$in" > "$out"
+}
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-upstream_base=""
 resolve_tag() {
     if [ -n "$TAG" ]; then
         echo "$TAG"
@@ -89,40 +108,29 @@ resolve_tag() {
 
 fetch_upstream_file() {
     path="$1"; dst="$2"
-    if [ "$OFFLINE" -eq 1 ]; then
-        src="$REPO/3rd_party/BambuStudio/$path"
-        if [ ! -f "$src" ]; then
-            echo "check_abi_compat: --offline but $src does not exist" >&2
-            exit 1
-        fi
-        cp "$src" "$dst"
-    else
-        url="https://raw.githubusercontent.com/$UPSTREAM_REPO/$TAG/$path"
-        if ! curl -fsSL "$url" -o "$dst"; then
-            echo "check_abi_compat: cannot fetch $url" >&2
-            exit 1
-        fi
+    url="https://raw.githubusercontent.com/$UPSTREAM_REPO/$TAG/$path"
+    if ! curl -fsSL "$url" -o "$dst"; then
+        echo "check_abi_compat: cannot fetch $url" >&2
+        exit 1
     fi
 }
 
-if [ "$OFFLINE" -eq 1 ]; then
-    if [ -z "$TAG" ]; then
-        if [ -d "$REPO/3rd_party/BambuStudio/.git" ]; then
-            TAG=$(cd "$REPO/3rd_party/BambuStudio" && \
-                  git -c advice.detachedHead=false describe --tags HEAD 2>/dev/null \
-                  || echo "HEAD")
-        else
-            TAG="local"
-        fi
-    fi
-    upstream_base="offline ($REPO/3rd_party/BambuStudio)"
-else
-    [ -n "$TAG" ] || TAG=$(resolve_tag)
-    if [ -z "$TAG" ]; then
-        echo "check_abi_compat: could not resolve an upstream tag" >&2
-        exit 1
-    fi
-    upstream_base="github.com/$UPSTREAM_REPO@$TAG"
+[ -n "$TAG" ] || TAG=$(resolve_tag)
+if [ -z "$TAG" ]; then
+    echo "check_abi_compat: could not resolve an upstream tag (git ls-remote failed?)" >&2
+    exit 1
+fi
+upstream_base="github.com/$UPSTREAM_REPO@$TAG"
+
+SERIES=$(abi_series_from_tag "$TAG" || exit 1)
+SNAP="$SNAP_ROOT/$SERIES"
+if [ ! -d "$SNAP" ]; then
+    echo "check_abi_compat: no snapshot directory for series '$SERIES' (tag=$TAG)" >&2
+    echo "check_abi_compat: expected: $SNAP" >&2
+    echo "check_abi_compat: existing series under $SNAP_ROOT/:" >&2
+    ls -1 "$SNAP_ROOT" 2>/dev/null | sed 's/^/  /' >&2 || true
+    echo "check_abi_compat: add tools/abi_snapshot/$SERIES/ or run --refresh --tag=..." >&2
+    exit 1
 fi
 
 mkdir -p "$WORK/live"
@@ -134,19 +142,22 @@ grep -oE 'get_network_function\("bambu_network_[a-zA-Z_0-9]+"\)' "$WORK/live/Net
     | sed -E 's/^get_network_function\("//; s/"\)$//' \
     | sort -u > "$WORK/live/symbols.txt"
 
+normalize_bambu_net_hpp "$WORK/live/bambu_networking.hpp" "$WORK/live/bambu_networking.norm.hpp"
+
 # --- refresh mode -----------------------------------------------------------
 
 if [ "$MODE" = "refresh" ]; then
     mkdir -p "$SNAP"
-    cp "$WORK/live/bambu_networking.hpp" "$SNAP/bambu_networking.hpp"
-    cp "$WORK/live/NetworkAgent.hpp"     "$SNAP/NetworkAgent.hpp"
-    cp "$WORK/live/symbols.txt"          "$SNAP/symbols.txt"
+    cp "$WORK/live/bambu_networking.norm.hpp" "$SNAP/bambu_networking.hpp"
+    cp "$WORK/live/NetworkAgent.hpp"         "$SNAP/NetworkAgent.hpp"
+    cp "$WORK/live/symbols.txt"               "$SNAP/symbols.txt"
     printf '%s\n' "$TAG" > "$SNAP/SOURCE_TAG"
     cat <<EOF
 check_abi_compat: refreshed $SNAP/ from $upstream_base
 
 Next steps:
-    1. Update include/obn/bambu_networking.hpp to match the new snapshot.
+    1. Port any struct/callback changes into include/obn/bambu_networking.hpp
+       (ABI_VERSION gates + drop BAMBU_NETWORK_AGENT_VERSION as needed).
     2. Update tests/probe_plugin.cpp if the symbol list changed.
     3. Re-run ./configure and make test to confirm everything still builds.
     4. Commit the snapshot + code changes together.
@@ -159,7 +170,7 @@ fi
 FAIL=0
 
 echo "Comparing against $upstream_base"
-echo "Snapshot tag:   $(cat "$SNAP/SOURCE_TAG" 2>/dev/null || echo '<none>')"
+echo "Snapshot series: $SERIES  (tag: $(cat "$SNAP/SOURCE_TAG" 2>/dev/null || echo '<no SOURCE_TAG>'))"
 echo
 
 report_diff() {
@@ -178,7 +189,6 @@ report_diff() {
 }
 
 report_missing() {
-    # $1=label  $2=expected  $3=actual  $4=hint  $5=mode  ("exact"|"superset")
     label="$1"; expected="$2"; actual="$3"; hint="$4"; mode="${5:-exact}"
     missing=$(comm -23 "$expected" "$actual" || true)
     extra=$(comm -13 "$expected" "$actual" || true)
@@ -186,8 +196,6 @@ report_missing() {
         printf '  [PASS] %s\n' "$label"
         return 0
     fi
-    # In "superset" mode we only require actual to contain every expected
-    # entry; additional entries in `actual` are a notice, not an error.
     if [ "$mode" = 'superset' ] && [ -z "$missing" ]; then
         printf '  [PASS] %s (with %d unreferenced extras)\n' \
             "$label" "$(echo "$extra" | grep -c .)"
@@ -209,25 +217,22 @@ report_missing() {
     return 1
 }
 
+normalize_bambu_net_hpp "$SNAP/bambu_networking.hpp" "$WORK/snap_bambu.norm.hpp"
+
 echo 'Upstream vs snapshot:'
-report_diff 'bambu_networking.hpp' \
-    "$SNAP/bambu_networking.hpp" "$WORK/live/bambu_networking.hpp" \
-    "Upstream changed structs/enums/callback typedefs. Review the diff, port to include/obn/bambu_networking.hpp, then run tools/check_abi_compat.sh --refresh."
+report_diff 'bambu_networking.hpp (agent version ignored)' \
+    "$WORK/snap_bambu.norm.hpp" "$WORK/live/bambu_networking.norm.hpp" \
+    "Upstream changed structs/enums/callback typedefs. Port to include/obn/bambu_networking.hpp, then tools/check_abi_compat.sh --refresh --tag=$TAG"
 report_diff 'NetworkAgent.hpp (func_* typedef source)' \
     "$SNAP/NetworkAgent.hpp" "$WORK/live/NetworkAgent.hpp" \
-    "Upstream changed a func_* typedef signature or added a new one. Re-check every matching plugin-side implementation, then run tools/check_abi_compat.sh --refresh."
+    "Upstream changed a func_* typedef signature or added a new one. Re-check plugin implementations, then tools/check_abi_compat.sh --refresh --tag=$TAG"
 report_missing 'bambu_network_* symbol list (NetworkAgent.cpp dlsym calls)' \
     "$SNAP/symbols.txt" "$WORK/live/symbols.txt" \
     "Upstream added / removed ABI slots. Implement missing ones in src/abi_*.cpp, add them to tests/probe_plugin.cpp, then --refresh."
 
 echo
 echo 'Repo self-consistency:'
-report_diff 'include/obn/bambu_networking.hpp vs snapshot' \
-    "$SNAP/bambu_networking.hpp" "$REPO/include/obn/bambu_networking.hpp" \
-    "Our vendored header drifted from the snapshot. This means we'd build the plugin against a different struct layout than Studio expects. Resync include/obn/bambu_networking.hpp to tools/abi_snapshot/bambu_networking.hpp."
 
-# Extract tests/probe_plugin.cpp's symbol list (strings inside the
-# kBambuNetworkSymbols[] array).
 awk '
     /kBambuNetworkSymbols\[\]/      { inside = 1; next }
     inside && /\};/                 { inside = 0; next }
@@ -271,10 +276,9 @@ cat <<EOF
 ABI drift detected.
 
 To review and accept upstream changes (after porting them into the plugin):
-    tools/check_abi_compat.sh --refresh $( [ -n "$TAG" ] && echo "--tag=$TAG" )
+    tools/check_abi_compat.sh --refresh --tag=$TAG
 
-To bail out and pin the plugin to the snapshot tag instead:
-    Put --tag=$(cat "$SNAP/SOURCE_TAG" 2>/dev/null || echo '<tag>') in the caller
-    (in CI: .github/workflows/build.yml abi-compat job).
+To pin CI to a fixed upstream tag instead of latest:
+    Pass --tag=... in .github/workflows/build.yml abi-compat job.
 EOF
 exit 1
