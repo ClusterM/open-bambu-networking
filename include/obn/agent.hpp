@@ -320,6 +320,27 @@ public:
     // Bearer + optional Studio certification headers for api.bambulab.com.
     std::map<std::string, std::string> cloud_api_http_headers() const;
 
+    // ------------------------------------------------------------------
+    // User preset cache (bambu_network_get_setting_list2 -> get_user_presets).
+    // ------------------------------------------------------------------
+    // Studio splits cloud-preset sync across two ABI calls: first
+    // get_setting_list2() walks the cloud catalogue and decides what
+    // needs downloading, then get_user_presets() hands the downloaded
+    // blobs back to the GUI so it can persist them as local files.
+    // Between those two calls we buffer the downloaded values_maps
+    // here, keyed by preset name. Concurrency-safe.
+    void preset_cache_reset();
+    void preset_cache_put(std::string name,
+                         std::map<std::string, std::string> values);
+    // Moves the cache out; subsequent calls return an empty map.
+    std::map<std::string, std::map<std::string, std::string>>
+        preset_cache_drain();
+
+    // Cloud user_id of the authenticated session (stringified), or "".
+    // Preset-sync includes this in every values_map it builds for
+    // Studio's load_user_preset().
+    std::string cloud_user_id() const;
+
 private:
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -383,6 +404,10 @@ private:
     // connect_printer() stores the MQTT/FTPS password (access code) here so
     // bambu_network_bind can POST it to the cloud as bind_code.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
+
+    // Buffer populated by bambu_network_get_setting_list2 and drained
+    // by bambu_network_get_user_presets. See preset_cache_* above.
+    std::map<std::string, std::map<std::string, std::string>> preset_cache_;
 
     // Callbacks - stored, not (yet) invoked.
     BBL::OnMsgArrivedFn       on_ssdp_msg_{};

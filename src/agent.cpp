@@ -1084,6 +1084,34 @@ std::map<std::string, std::string> Agent::cloud_api_http_headers() const
     return h;
 }
 
+std::string Agent::cloud_user_id() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return auth_store_ ? auth_store_->snapshot().user_id : std::string{};
+}
+
+void Agent::preset_cache_reset()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    preset_cache_.clear();
+}
+
+void Agent::preset_cache_put(std::string name,
+                             std::map<std::string, std::string> values)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    preset_cache_[std::move(name)] = std::move(values);
+}
+
+std::map<std::string, std::map<std::string, std::string>>
+Agent::preset_cache_drain()
+{
+    std::map<std::string, std::map<std::string, std::string>> out;
+    std::lock_guard<std::mutex> lk(mu_);
+    out.swap(preset_cache_);
+    return out;
+}
+
 bool Agent::user_logged_in() const
 {
     return auth_store_ && auth_store_->snapshot().logged_in();

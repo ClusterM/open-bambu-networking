@@ -661,7 +661,143 @@ Print-job stages — the `SendingPrintJobStage` enum (`bambu_networking.hpp:146-
 
 `CheckFn = std::function<bool(std::map<std::string,std::string>)>`, `ProgressFn = std::function<void(int)>`.
 
-### 6.10. HTTP / service
+All six entry points are thin wrappers over one REST resource —
+
+```
+<method> /v1/iot-service/api/slicer/setting[/<setting_id>]?version=<bundle>&public=false
+```
+
+— on the cloud API host; see §6.10.1 for base URL, headers and the common response envelope that apply here and to every other HTTP endpoint the plugin touches. Preset IDs are prefixed by type (observed in live responses):
+
+| Type | ID prefix | Public counterpart |
+|------|-----------|---------------------|
+| `print` (process) | `PPUS…` | `GP…` |
+| `filament` | `PFUS…` | `GFS…` / `GFL…` |
+| `printer` (machine) | `PMUS…` | `GM…` |
+
+#### 6.9.1. Per-method schema
+
+**`GET /slicer/setting?public=false&version=<bundle>` — list metadata** (called from `get_setting_list` / `get_setting_list2`):
+
+```json
+{
+  "message": "success", "code": null, "error": null,
+  "print":    { "private": [ /* Meta, … */ ], "public": [] },
+  "printer":  { "private": [ /* Meta, … */ ], "public": [] },
+  "filament": { "private": [ /* Meta, … */ ], "public": [] },
+  "settings": []
+}
+```
+
+Every entry in `private[]` is metadata only — no `setting` payload:
+
+```json
+{
+  "setting_id": "PFUS7bf6d4b8df15d8",
+  "name": "Bambu PLA Tough @BBL P1P 0.2 nozzle",
+  "version": "0.0.0.0",
+  "update_time": "2026-04-06 19:03:50",
+  "base_id": null,
+  "filament_id": null,
+  "filament_vendor": null,
+  "filament_type": null,
+  "filament_is_support": null,
+  "nozzle_temperature": null,
+  "nozzle_hrc": null,
+  "inherits": null,
+  "nickname": null
+}
+```
+
+`update_time` is rendered as `"YYYY-MM-DD HH:MM:SS"` in UTC; `load_user_preset()` expects unix seconds, so the plugin converts.
+
+**`GET /slicer/setting/<setting_id>` — full preset** (observed only by direct probe; the stock plugin does **not** call it):
+
+```json
+{
+  "message": "success", "code": null, "error": null,
+  "setting_id": "PFUS7bf6d4b8df15d8",
+  "name": "Bambu PLA Tough @BBL P1P 0.2 nozzle",
+  "type": "filament",
+  "version": "0.0.0.0",
+  "base_id": null, "filament_id": null, "nickname": null,
+  "update_time": "2026-04-06 19:03:50",
+  "public": false,
+  "setting": {
+    "activate_air_filtration": 0,
+    "compatible_printers": "\"Bambu Lab P1P 0.2 nozzle\"",
+    "filament_type": "\"PLA\"",
+    "...": "..."
+  }
+}
+```
+
+Values inside `setting` are already in the `ConfigOption::serialize()` form Studio's loader expects (quoted scalars, semicolon-separated lists, etc.). Some keys are echoed as native JSON numbers instead of strings; callers coerce.
+
+The `user_id` of the owner is **not** returned by either endpoint — `PresetCollection::load_user_preset()` requires it, so callers must inject their own from the authenticated session.
+
+**`POST /slicer/setting` — create** (called from `request_setting_id`). Request:
+
+```json
+{
+  "name": "<preset name>",
+  "type": "filament|print|printer",
+  "version": "<bundle version>",
+  "base_id": "<parent system preset id or empty>",
+  "filament_id": "<filament id or empty>",
+  "setting": { "<option>": "<serialized value>", "...": "..." }
+}
+```
+
+Response on success:
+
+```json
+{ "message": "success", "code": null, "error": null,
+  "setting_id": "PFUSdce8291f0b44ab",
+  "update_time": "2026-04-21 17:56:43" }
+```
+
+Missing mandatory fields return `HTTP 400` with a plain-text error (e.g. `field "version" is not set`); `type` outside `{print,filament,printer}` returns `HTTP 422` with `{"detail":"Invalid input parameters"}`.
+
+**`PATCH /slicer/setting/<setting_id>` — update** (called from `put_setting`): same body shape as `POST`; same response. `PATCH` against a non-existent id returns `HTTP 422`.
+
+**`DELETE /slicer/setting/<setting_id>` — remove** (called from `delete_setting`): `{"message":"success","code":null,"error":null}`. Idempotent: `DELETE` of a missing id still answers `200`.
+
+#### 6.9.2. `values_map` keys the loader expects
+
+`PresetCollection::load_user_preset(name, values_map, ...)` rejects a preset unless `values_map` contains, at minimum:
+
+| Key | Source | Notes |
+|-----|--------|-------|
+| `version` | response `version` | Must be parseable by `Semver::parse`; preset is skipped if cloud major > Studio major. |
+| `setting_id` | response `setting_id` | Used as the stable identifier Studio writes back into the preset file. |
+| `updated_time` | response `update_time` | **Unix seconds as a decimal string**, not the ISO string the server returns. |
+| `user_id` | authenticated session | Server does not include it; caller must inject. |
+| `base_id` | response `base_id` | Empty string when the preset is a custom root. |
+| `type` | response `type` | `print` / `filament` / `printer`; top-level collection key in list response. |
+| `filament_id` | response `filament_id` | Only mandatory when `type == "filament"` and `base_id` is empty. |
+| `inherits` | inside `setting` | Pass-pass from cloud; parent lookup during load. |
+| (all other preset options) | inside `setting` | Merged into `DynamicPrintConfig` via `load_string_map`. |
+
+On a fresh machine Studio's local preset cache is empty, so the stock plugin's metadata-only list walk produces no visible presets — the loader has a `setting_id` but no `setting` map to merge in. Cross-device sync therefore only works if the plugin *also* issues `GET /slicer/setting/<id>` per entry and builds the full `values_map` itself.
+
+#### 6.9.3. Call sequence
+
+`GUI_App::start_sync_user_preset()` drives the whole thing on a worker thread (`src/slic3r/GUI/GUI_App.cpp`):
+
+1. One-shot catalogue walk:
+   1. `m_agent->get_setting_list2(bundle_version, check_fn, progress_fn, cancel_fn)` — enumerates all user presets. For each catalogue entry the plugin invokes `check_fn` with `{type, name, setting_id, updated_time}`; the closure returns `true` when the local `PresetCollection::need_sync()` says this row is newer than the on-disk copy. Progress 0-100 drives a modal `ProgressDialog`.
+   2. On success Studio calls `reload_settings()`, which calls `m_agent->get_user_presets(&map)` and feeds the map into `preset_bundle->load_user_presets(app_config, map, ...)`.
+2. Continuous background loop, 100 ms tick, every 20 ticks:
+   1. For each of `print` / `filament` / `printer` collections, `PresetCollection::get_user_presets(&result_presets)` produces the dirty local presets.
+   2. Each dirty preset is handed to `sync_preset(preset)`, which calls `get_differed_values_to_update` to produce a `values_map`, then:
+      - `preset->sync_info == "create"` or empty → `request_setting_id(name, &values_map, &http_code)` (POST).
+      - `preset->sync_info == "update"` → `put_setting(setting_id, name, &values_map, &http_code)` (PATCH).
+   3. `delete_cache_presets` list (presets removed locally) → `delete_setting(id)` one-by-one.
+
+The sync loop checks `values_map["code"] == "14"` to detect the server's "preset quota exceeded" response and shows a `BBLUserPresetExceedLimit` notification without retrying further creates for that preset type.
+
+### 6.10. HTTP / cloud service
 
 | Symbol | Signature |
 |--------|-----------|
@@ -677,6 +813,66 @@ Print-job stages — the `SendingPrintJobStage` enum (`bambu_networking.hpp:146-
 | `bambu_network_report_consent` | `int(void*, std::string expand)` |
 
 `TaskQueryParams` (`bambu_networking.hpp:243-249`): `dev_id`, `status`, `offset`, `limit`.
+
+#### 6.10.1. Common cloud transport
+
+Every REST call the plugin makes — authentication, bind, print-job orchestration, preset sync, device firmware, MakerWorld — lands on the same regional API host, chosen by the user's `country_code` in `app_config` (the same switch `GUI_App::get_http_url` uses for the plugin manifest, see §2.1):
+
+| Region | API host | Web host |
+|--------|----------|----------|
+| `US` / default | `https://api.bambulab.com` | `https://bambulab.com` |
+| `CN` | `https://api.bambulab.cn` | `https://bambulab.cn` |
+
+All authenticated endpoints require exactly one mandatory header:
+
+```
+Authorization: Bearer <access_token>
+```
+
+MITM dumps of the stock plugin show it also sending the full Studio fingerprint on every request — `User-Agent: bambu_network_agent/<ver>`, plus `X-BBL-Client-ID`, `X-BBL-Client-Name`, `X-BBL-Client-Type`, `X-BBL-Client-Version`, `X-BBL-Device-ID`, `X-BBL-Language`, `X-BBL-OS-Type`, `X-BBL-OS-Version`, `X-BBL-Agent-Version`, `X-BBL-Executable-info`, `X-BBL-Agent-OS-Type`, and anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for the API to accept the call. They influence analytics only.
+
+Most JSON responses share a common envelope:
+
+```json
+{
+  "message": "success" | "<human message>",
+  "code":    null      | <integer error>,
+  "error":   null      | "<string>",
+  "...endpoint-specific fields..."
+}
+```
+
+`code` is the "business" error code the GUI inspects (for example `14` for preset quota exceeded, `2` for missing resources). Transport-level failures surface as non-2xx HTTP codes — typically `400` for malformed bodies, `401` for a missing/expired bearer, `422` for invalid-input (e.g. `PATCH` against an unknown ID), `5xx` for server-side failures.
+
+For endpoints that return a plain-text error (notably `POST /slicer/setting` with a missing mandatory field) the body is a bare string — the envelope is absent.
+
+#### 6.10.2. What each ABI call does behind the curtain
+
+All paths below are relative to the regional API host from §6.10.1. The "evidence" column states how firm the mapping is — either `MITM` (seen in a live dump of the stock plugin), `probe` (issued by hand with `curl` against production), `source` (read out of Studio's own code) or `stub` (the plugin never hits the network and Studio is happy with a canned response).
+
+- **`get_studio_info_url`** — string accessor, no HTTP call. The stock plugin returns a URL for the "news / banner" side panel (usually a MakerWorld page); an empty string disables the panel. `open-bambu-networking` returns empty. *Evidence: source, stub.*
+- **`set_extra_http_header`** — pure state update. Studio calls it during startup and on region/language switches to attach fingerprint headers to every subsequent request. The plugin stores the map and folds it into outgoing header sets; the server ignores the contents. *Evidence: source.*
+- **`get_my_message`** — the Message Centre bell polls this for `(type, after, limit)`. Studio parses `http_body` as JSON and expects an envelope with a `messages[]` array. The exact URL was not captured in our MITM dumps (the stock plugin only emits it when there is something in the cloud inbox for the user); the most likely candidate from community traces is `GET /v1/user-service/my/messages?type=<t>&after=<unix>&limit=<n>`. The plugin currently returns an empty body with `http_code = 0` — Studio's parser treats that as "no messages" and the bell stays clear. *Evidence: source + stub; URL unconfirmed.*
+- **`check_user_task_report`** — polled after every print to decide whether to show the "rate this print" prompt. The output contract is `*task_id` (zero means "nothing to report") and `*printable`. Stock endpoint was not captured; `open-bambu-networking` returns `0 / false` unconditionally, which is the documented way to suppress the popup. *Evidence: source + stub; URL unconfirmed.*
+- **`get_user_print_info`** — `GET /v1/iot-service/api/user/bind`. This is the single source for the cloud side of the Devices tab. Response shape (from MITM plus our own probes): `{"devices":[{ "dev_id", "name", "online", "print_status", "dev_model_name", "dev_product_name", "dev_access_code", ... }]}`. Studio's `DeviceManager::parse_user_print_info` reads slightly different field names — `dev_name`, `dev_online`, `task_status` — so the plugin remaps on the way out (see `src/abi_http.cpp::remap_bind_payload`). *Evidence: MITM + probe.*
+- **`get_user_tasks`** — the Cloud Task / History grid. Studio passes the whole `http_body` through to its JSON parser. The stock endpoint is not captured in our dumps. Plugin currently returns an empty body, which leaves the grid empty. *Evidence: source + stub; URL unconfirmed.*
+- **`get_task_plate_index`** — looks up which plate a given cloud `task_id` ran on. Studio falls back to plate `0` on failure. Plugin returns `plate_index = -1`. *Evidence: source + stub; URL unconfirmed.*
+- **`get_subtask_info`** — MakerWorld subtask detail fetch; Studio pulls the printer-card hero image from `context.plates[<plate_idx>].thumbnail.url` in the response. `content` is a JSON *string* holding an inner `{info:{plate_idx}}` envelope — both shapes are in `DeviceManager.cpp`. The stock cloud URL is unconfirmed; under `OBN_ENABLE_WORKAROUNDS` the plugin synthesises a minimal response whenever the subtask id looks like `lan-<fnv>` (emitted by our own LAN push-status rewrite) and points `url` at the local `cover_server` serving the PNG extracted from `/cache/<name>.3mf`. See `src/abi_http.cpp::bambu_network_get_subtask_info`. *Evidence: source + workaround; cloud URL unconfirmed.*
+- **`get_slice_info`** — slice summary (time / weight / material cost / layer thumbnails) for a cloud task. Plugin returns empty. *Evidence: source + stub; URL unconfirmed.*
+- **`report_consent`** — one-shot "I accepted the privacy / telemetry dialog" notification, body `{"expand":"<flag>"}`. Studio ignores the return value. Plugin returns `0` without hitting the network. *Evidence: source + stub; URL unconfirmed.*
+
+The plugin's other HTTP-heavy surfaces follow the same transport and envelope rules but live in their own sections because of their size. The endpoints below are all verified against real traffic unless marked:
+
+| Concern | Endpoint(s) | Section | Evidence |
+|---------|-------------|---------|----------|
+| Bearer-token login / refresh / profile | `POST /v1/user-service/user/ticket/<T>`, `POST /v1/user-service/user/refreshtoken`, `GET /v1/user-service/my/profile` | §6.5 | MITM + probe |
+| Device bind / unbind / rename | `POST /v1/iot-service/api/user/bind`, `GET /v1/iot-service/api/user/bind`, `PATCH /v1/iot-service/api/user/device/info`, `DELETE /v1/iot-service/api/user/bind?dev_id=<id>` | §6.6 | MITM + probe |
+| Printer firmware catalogue | stock: unknown cloud catalogue call; ours: synthesised from MQTT state | §6.7 | source only (stock) |
+| Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, `PUT /v1/iot-service/api/user/notification`, `GET /v1/iot-service/api/user/notification?action=upload&ticket=<t>`, `PATCH /v1/iot-service/api/user/project/<pid>`, `GET /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf`, `POST /v1/user-service/my/task` | §6.8 | MITM |
+| User presets sync | `<m> /v1/iot-service/api/slicer/setting[/<id>]?public=false&version=<bundle>` | §6.9 | MITM + probe |
+| MakerWorld / Mall, OSS upload | various `design-service` / `iot-service` / OSS paths | §6.12 | not captured |
+| Camera / live view / HMS snapshot | not captured | §6.11 | — |
+| Analytics / telemetry | not captured | §6.13 | — |
 
 ### 6.11. Camera
 

@@ -159,16 +159,18 @@ Source: [src/abi_print.cpp](src/abi_print.cpp).
 
 ## 6.9. User presets
 
-Source: [src/abi_presets.cpp](src/abi_presets.cpp). None of this ABI is actually wired to a remote backend; user presets sync to disk is driven by Studio itself once `get_user_id()` returns a session-backed value.
+Source: [src/abi_presets.cpp](src/abi_presets.cpp), [src/cloud_presets.cpp](src/cloud_presets.cpp). Full CRUD against Bambu's `api.bambulab.com/v1/iot-service/api/slicer/setting` endpoint, using only the user's bearer token (the stock `X-BBL-*` fingerprint headers aren't required by the server).
+
+This implementation goes a step beyond the stock plugin. Studio's original `bambu_networking.so` only retrieves metadata (`setting_id`, `name`, `update_time`, …) from `GET /setting`, assuming the actual preset bodies are present on disk — so wiping the local preset directory permanently loses cloud-stored configs on that machine. We additionally call `GET /setting/<id>` for every preset Studio's `CheckFn` asks us to sync, and feed the full flattened config into `get_user_presets()` so true cross-device sync works even on a fresh install.
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_user_presets` | ❌ | Returns `SUCCESS` with an empty map. |
-| `bambu_network_request_setting_id` | ❌ | Returns an empty string (no cloud setting id is minted). |
-| `bambu_network_put_setting` | ❌ | Returns `ERR_PUT_SETTING_FAILED` (no upload endpoint). |
-| `bambu_network_get_setting_list` | ❌ | Returns `SUCCESS`; no bundle download is performed. |
-| `bambu_network_get_setting_list2` | ❌ | Same as above. |
-| `bambu_network_delete_setting` | ❌ | Returns `SUCCESS`; no cloud delete is issued. |
+| `bambu_network_get_user_presets` | ✅ | Drains the cache populated by the preceding `get_setting_list2` call into Studio's `map<name, values_map>`. |
+| `bambu_network_request_setting_id` | ✅ | `POST /slicer/setting` with `{name, type, version, base_id, filament_id, setting:{…}}`. Returns the new `PPUS/PFUS/PMUS` id, refreshes `values_map["updated_time"]`, and surfaces server `code` (e.g. `"14"` = preset limit) into `values_map["code"]` so Studio's limit handling keeps working. |
+| `bambu_network_put_setting` | ✅ | `PATCH /slicer/setting/<id>` with the same body shape as create. Refreshes `values_map["updated_time"]`. |
+| `bambu_network_get_setting_list` | ✅ | Full sync (no filter): lists all user presets, downloads every body, caches for `get_user_presets`. |
+| `bambu_network_get_setting_list2` | ✨ | Stock plugin only lists metadata and relies on local files. We additionally `GET /slicer/setting/<id>` for presets the Studio-provided `CheckFn` flags as needed, so cross-device sync actually delivers the content. |
+| `bambu_network_delete_setting` | ✅ | `DELETE /slicer/setting/<id>`; server-side idempotent (missing id still returns 200). |
 
 ---
 
