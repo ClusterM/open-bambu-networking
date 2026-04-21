@@ -579,67 +579,66 @@ sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
 
 ### Configure, build, install
 
-From the repository root, run **three commands** in order:
-
-1. **`cmake -S . -B build`** — creates the `build/` folder and records how the
-   project will be compiled **and where files will be copied on install**.
-   On Linux the default install location is **`~/.config/BambuStudio`** (the same
-   place Bambu Studio uses). You do **not** need any extra flags for a normal setup.
-2. **`cmake --build build -j"$(nproc)"`** — compiles the plugin.
-3. **`cmake --install build`** — copies the built `.so` files and metadata into
-   the folder chosen in step 1 (by default `plugins/` and `ota/plugins/` under
-   `~/.config/BambuStudio`).
+From the repository root, the usual three commands:
 
 ```sh
-cmake -S . -B build
-cmake --build build -j"$(nproc)"
-cmake --install build
+./configure
+make
+make install
 ```
 
-**Only if** you want the plugin installed somewhere other than `~/.config/BambuStudio`,
-add **`-DCMAKE_INSTALL_PREFIX=…` to the first command** (the `cmake -S . -B build`
-line), with an absolute path. Example:
+No `sudo` needed — the default install prefix is inside your home directory.
 
-```sh
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/opt/my-bambu
-cmake --build build -j"$(nproc)"
-cmake --install build
-```
+That's it. `./configure` is a thin wrapper around CMake that writes the build
+tree into `build/` and picks sensible defaults for a typical Linux user:
+install prefix `~/.config/BambuStudio` (the same directory Bambu Studio uses),
+release build, every optional feature enabled. `make install` then:
 
-After step 3, a typical Linux layout looks like:
+1. copies the four shared objects + manifest into that directory:
+   - `~/.config/BambuStudio/plugins/libbambu_networking.so`
+   - `~/.config/BambuStudio/plugins/libBambuSource.so` (stub)
+   - `~/.config/BambuStudio/plugins/liblive555.so` (stub)
+   - `~/.config/BambuStudio/ota/plugins/network_plugins.json`
+2. edits `~/.config/BambuStudio/BambuStudio.conf` so Studio trusts this
+   plugin and stops trying to re-download its own on every launch — sets
+   `"installed_networking": "1"` and `"update_network_plugin": "false"`
+   under the `"app"` object, with a `.obn-bak` backup next to the
+   original. This step is skipped when the install prefix is not the
+   default BambuStudio dir (staging trees stay clean), or you can turn
+   it off explicitly with `./configure --no-conf-patch`.
 
-- `~/.config/BambuStudio/plugins/libbambu_networking.so`
-- `~/.config/BambuStudio/plugins/libBambuSource.so` (stub)
-- `~/.config/BambuStudio/plugins/liblive555.so` (stub)
-- `~/.config/BambuStudio/ota/plugins/network_plugins.json`
+`make uninstall` walks the install manifest and removes whatever was put
+down; `make clean` / `make distclean` drop build artefacts; `make test`
+runs the smoke tests via `ctest`.
 
-**Studio version string:** Bambu Studio compares the plugin version to its own
-using the **first 8 characters** of `bambu_network_get_version()`. If your Studio
-build complains about a version mismatch, configure again with an explicit
-`OBN_VERSION` on the **same first line** as in this example (only when needed):
+### `./configure` options
 
-```sh
-cmake -S . -B build -DOBN_VERSION=02.05.02.99
-```
+`./configure --help` prints the full list; the most useful ones:
 
-(e.g. AppImage `v02.05.02.51` matches prefix `02.05.02`; a main-branch BambuStudio
-source tree often expects `02.05.03` — details in the table below.)
-
-### CMake cache options (reference)
-
-Pass these on the **first** `cmake -S . -B build …` line (see above). Defaults
-match a typical Linux install; change only when you know you need to.
-
-| Option | Default | What it does |
+| Flag | Default | What it does |
 | --- | --- | --- |
-| `CMAKE_INSTALL_PREFIX` | `$HOME/.config/BambuStudio` on native Linux builds | Where `cmake --install` places `plugins/` and `ota/plugins/`. Ignored if you already set a prefix in an existing build tree — reconfigure or delete `build/` to pick up the default. |
-| `OBN_VERSION` | tracked to latest Bambu Studio release | The version string `bambu_network_get_version()` returns. Studio checks only the first 8 chars (`MAJOR.MINOR.PATCH`). |
-| `OBN_ENABLE_WORKAROUNDS` | `ON` | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With `OFF` the plugin is a strict drop-in: same wire protocols the stock plugin uses and nothing else. Studio will transparently lose every workaround-backed feature (file browser stays empty, Send greys out on P2S, etc.) but nothing half-done runs at runtime. |
-| `OBN_FT_FTPS_FASTPATH` | `ON` | Serve the `ft_*` C ABI over FTPS for LAN URLs (media-ability probe + STOR-based upload with live progress). Turn `OFF` to keep every `ft_*` call as a polite-failure stub; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `OBN_ENABLE_WORKAROUNDS`. |
+| `--prefix=DIR` | `$HOME/.config/BambuStudio` on Linux | Where `make install` copies the shared objects and the OTA manifest. When this does not point at the default BambuStudio dir, the `BambuStudio.conf` patch is skipped automatically — you are clearly building into a staging tree. |
+| `--build-type=TYPE` | `Release` | `Release`, `Debug`, `RelWithDebInfo`, `MinSizeRel`. Maps to `-DCMAKE_BUILD_TYPE=…`. |
+| `--with-version=VER` | auto-detected from `<prefix>/BambuStudio.conf` | The version string `bambu_network_get_version()` reports. Studio compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.*` and a main-branch source build usually wants `02.05.03.*`. When `--with-version` is not given, `./configure` reads `app.version` from the Studio config in the install prefix and bumps the last component to `99` so our plugin always looks "newer" than the agent Studio ships with itself. If neither the flag nor the config file is available, `./configure` refuses to proceed rather than hard-code a stale default that would silently fail Studio's compatibility gate at runtime. Maps to `-DOBN_VERSION=…`. |
+| `--disable-workarounds` | enabled | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With this passed the plugin is a strict drop-in — same wire protocols, nothing else. Studio transparently loses every workaround-backed feature (the LAN file browser stays empty, Send greys out on P2S, and so on) but nothing half-done runs at runtime. Maps to `-DOBN_ENABLE_WORKAROUNDS=OFF`. |
+| `--disable-ftps-fastpath` | enabled | Stub out the `ft_*` C ABI; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `--disable-workarounds`. Maps to `-DOBN_FT_FTPS_FASTPATH=OFF`. |
+| `--no-conf-patch` | patch enabled | Do not edit `BambuStudio.conf` during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_STUDIO_CONF=OFF`. |
+| `--build-dir=DIR` | `build` | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side. |
+| `--cmake-arg=ARG` | none | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable. |
+
+If you prefer to drive CMake directly, `./configure` is completely optional —
+everything is still a normal CMake project. The `CMAKE_*` / `OBN_*` cache
+variables (`CMAKE_INSTALL_PREFIX`, `OBN_VERSION`, `OBN_ENABLE_WORKAROUNDS`,
+`OBN_FT_FTPS_FASTPATH`, `OBN_PATCH_STUDIO_CONF`, `OBN_BUILD_TESTS`) are
+named right there in `CMakeLists.txt` and behave exactly as the configure
+flags above.
 
 ### First-time Studio configuration
 
-Edit `~/.config/BambuStudio/BambuStudio.conf`, section `"app"`:
+`make install` edits `~/.config/BambuStudio/BambuStudio.conf` for you on the
+first run (see the list above). If you skipped that step — or if Studio has
+never been launched on this machine so the file does not exist yet — add
+these two keys to the `"app"` object by hand:
 
 ```json
 "installed_networking": "1",

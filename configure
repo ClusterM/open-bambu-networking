@@ -1,0 +1,182 @@
+#!/bin/sh
+# Autotools-style wrapper around CMake. Drops a ready-to-build tree in
+# ./build/ (or wherever --build-dir points) and writes a tiny config.mk
+# so the top-level Makefile knows the build directory. Every knob below
+# maps 1:1 to a CMake cache variable; run cmake directly if you want
+# something this script does not expose.
+set -eu
+
+BUILD_DIR=build
+BUILD_TYPE=Release
+PREFIX=""
+OBN_VERSION=""
+WORKAROUNDS=ON
+FTPS_FASTPATH=ON
+TESTS=ON
+PATCH_CONF=ON
+EXTRA_CMAKE_ARGS=""
+
+usage() {
+    cat <<'EOF'
+Usage: ./configure [OPTIONS]
+
+Prepares an out-of-tree CMake build so 'make' and 'make install' work.
+Running it again is safe -- it refreshes the build tree with the new flags.
+
+Install paths:
+  --prefix=DIR           Install prefix; where 'make install' copies the
+                         libraries. Defaults to $HOME/.config/BambuStudio
+                         on Linux (same directory Bambu Studio uses).
+
+Build settings:
+  --build-dir=DIR        Build directory (default: build).
+  --build-type=TYPE      Release | Debug | RelWithDebInfo | MinSizeRel
+                         (default: Release).
+  --with-version=VER     Override the version string reported via
+                         bambu_network_get_version(). When not set,
+                         configure reads BambuStudio.conf in the install
+                         prefix (~/.config/BambuStudio by default),
+                         grabs app.version and bumps the last component
+                         to 99. Launch Bambu Studio once so it writes
+                         this file, or pass --with-version=... by hand.
+
+Optional features (all enabled by default):
+  --disable-workarounds      Strict drop-in replacement: every non-stock
+                             code path is compiled out. Features that
+                             depend on them (P2S Send, LAN file browser,
+                             SD-over-MQTT, MJPEG transcode) disappear
+                             cleanly. Re-enable with --enable-workarounds.
+  --disable-ftps-fastpath    Stub out the ft_* fast path; Studio falls
+                             back to its internal FTP for 'Send to
+                             Printer'. Re-enable with
+                             --enable-ftps-fastpath.
+  --disable-tests            Do not build probe_plugin / *_live_test
+                             smoke tests. Re-enable with --enable-tests.
+  --no-conf-patch            'make install' will not edit
+                             $HOME/.config/BambuStudio/BambuStudio.conf.
+                             (The patch only runs when the install prefix
+                             is the default BambuStudio dir anyway.)
+
+Other:
+  --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
+                         multiple flags (e.g. --cmake-arg=-GNinja).
+  -h, --help             Show this help and exit.
+
+Examples:
+  ./configure
+  ./configure --prefix=/opt/my-bambu --build-type=Debug
+  ./configure --disable-workarounds --no-conf-patch
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*)                PREFIX="${arg#*=}" ;;
+        --build-dir=*)             BUILD_DIR="${arg#*=}" ;;
+        --build-type=*)            BUILD_TYPE="${arg#*=}" ;;
+        --with-version=*)          OBN_VERSION="${arg#*=}" ;;
+        --disable-workarounds)     WORKAROUNDS=OFF ;;
+        --enable-workarounds)      WORKAROUNDS=ON ;;
+        --disable-ftps-fastpath)   FTPS_FASTPATH=OFF ;;
+        --enable-ftps-fastpath)    FTPS_FASTPATH=ON ;;
+        --disable-tests)           TESTS=OFF ;;
+        --enable-tests)            TESTS=ON ;;
+        --no-conf-patch)           PATCH_CONF=OFF ;;
+        --with-conf-patch)         PATCH_CONF=ON ;;
+        --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
+        -h|--help)                 usage; exit 0 ;;
+        *)
+            printf 'configure: unknown option: %s\n\n' "$arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! command -v cmake >/dev/null 2>&1; then
+    echo "configure: cmake is required but was not found in \$PATH" >&2
+    exit 1
+fi
+
+# Auto-detect the Studio version from BambuStudio.conf when the user did
+# not pass --with-version. The plugin must report a version whose first 8
+# characters match SLIC3R_VERSION (see README), so the simplest reliable
+# source is the config file of the Studio we are installing next to:
+# boost::json pretty-prints one '"version" : "X.Y.Z.W"' line at the top
+# level of the "app" object. We bump the last component to 99 so the
+# plugin always looks "newer" than the agent Studio shipped with itself.
+# If auto-detection fails we refuse to guess: shipping a plugin with a
+# stale hard-coded version silently breaks Studio's compatibility gate
+# on the user's machine, and that failure mode is much nastier than a
+# configure-time error.
+if [ -z "$OBN_VERSION" ]; then
+    if [ -n "$PREFIX" ]; then
+        conf="$PREFIX/BambuStudio.conf"
+    else
+        conf="${HOME:-}/.config/BambuStudio/BambuStudio.conf"
+    fi
+
+    detected=""
+    if [ -r "$conf" ]; then
+        detected=$(sed -n \
+            's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' \
+            "$conf" | head -n1)
+    fi
+
+    if [ -z "$detected" ]; then
+        cat >&2 <<EOF
+configure: cannot determine the plugin version automatically.
+
+  Tried to read "version" from: $conf
+  $( [ -r "$conf" ] || echo "(file does not exist or is not readable)" )
+
+  Launch Bambu Studio at least once so it writes its config, or pass the
+  version explicitly, for example:
+
+      ./configure --with-version=02.05.02.99
+
+  Studio compares only the first 8 characters ("MAJOR.MINOR.PATCH"), so
+  use X.Y.Z from the Studio you are installing next to and put .99 last.
+EOF
+        exit 1
+    fi
+
+    OBN_VERSION=$(echo "$detected" | sed -E 's/\.[0-9]+$/.99/')
+    echo "configure: detected Bambu Studio $detected in $conf"
+    echo "configure: plugin version set to $OBN_VERSION (override with --with-version=...)"
+fi
+
+set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+[ -n "$PREFIX" ]      && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
+[ -n "$OBN_VERSION" ] && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
+set -- "$@" \
+    -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
+    -DOBN_FT_FTPS_FASTPATH="$FTPS_FASTPATH" \
+    -DOBN_BUILD_TESTS="$TESTS" \
+    -DOBN_PATCH_STUDIO_CONF="$PATCH_CONF"
+# shellcheck disable=SC2086
+[ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
+
+echo "configure: cmake $*"
+cmake "$@"
+
+# The top-level Makefile reads this to find the build tree. Everything
+# else lives in CMakeCache.txt and survives 'make clean'.
+{
+    echo "# Generated by ./configure. Re-run it to refresh."
+    printf 'BUILD_DIR := %s\n' "$BUILD_DIR"
+} > config.mk
+
+cat <<EOF
+
+configure: done.
+
+Next steps:
+  make             # build   (delegates to: cmake --build $BUILD_DIR)
+  make install     # install (delegates to: cmake --install $BUILD_DIR)
+                   # also patches ~/.config/BambuStudio/BambuStudio.conf
+                   # when installing to the default BambuStudio dir
+  make test        # run the smoke tests
+
+Re-run './configure --help' for the full list of options.
+EOF

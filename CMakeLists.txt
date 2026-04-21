@@ -17,9 +17,21 @@ if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
 endif()
 
 # The plugin's reported version must have the same first-8-char prefix as
-# Bambu Studio's SLIC3R_VERSION. AppImage v02.05.02.51 expects prefix
-# "02.05.02"; source builds from the main branch currently expect "02.05.03".
-set(OBN_VERSION "02.05.02.99" CACHE STRING "Plugin version reported via bambu_network_get_version()")
+# Bambu Studio's SLIC3R_VERSION (AppImage v02.05.02.51 expects prefix
+# "02.05.02"; source builds from the main branch currently expect
+# "02.05.03"). We deliberately refuse to pick a default: a stale hardcode
+# silently breaks Studio's compatibility gate on the user's machine,
+# which is a much worse failure mode than failing at configure time.
+# The top-level ./configure wrapper auto-detects this from the installed
+# BambuStudio.conf; bare `cmake -S . -B build` callers need to pass
+# -DOBN_VERSION=... by hand.
+set(OBN_VERSION "" CACHE STRING "Plugin version reported via bambu_network_get_version()")
+if(NOT OBN_VERSION)
+    message(FATAL_ERROR
+        "OBN_VERSION is not set. Run ./configure (it auto-detects from "
+        "BambuStudio.conf) or pass -DOBN_VERSION=MAJOR.MINOR.PATCH.99 to cmake."
+    )
+endif()
 
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
 # the Print job's eMMC pre-flight speaks a real transport instead of
@@ -50,6 +62,17 @@ option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
 #     (stock speaks a proprietary port-6000 CTRL protocol)
 # See "What works" and "Workaround reference" in README.md.
 option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
+
+# When ON, 'cmake --install' (and therefore 'make install') will also
+# edit ~/.config/BambuStudio/BambuStudio.conf so Studio trusts this
+# plugin: sets "app.installed_networking"="1" and
+# "app.update_network_plugin"="false". The patch only runs when the
+# install prefix is the default BambuStudio dir - if you installed
+# into a staging tree with --prefix=..., the per-user config is
+# untouched regardless of this flag. A backup file (*.obn-bak) is
+# written whenever the file actually changes.
+option(OBN_PATCH_STUDIO_CONF
+    "Edit ~/.config/BambuStudio/BambuStudio.conf after install" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -203,6 +226,63 @@ configure_file(packaging/network_plugins.json.in
     ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json
     DESTINATION ota/plugins)
+
+# First-time Studio configuration: on a fresh profile Studio will try
+# to redownload its own network plugin from the cloud unless the user
+# flips two keys in BambuStudio.conf. We can do that automatically at
+# install time, but only when installing to the default BambuStudio
+# data dir - otherwise the prefix is clearly a staging tree and we
+# should not touch the user's live config.
+if(OBN_PATCH_STUDIO_CONF AND UNIX AND NOT APPLE)
+    install(CODE [[
+        set(_home "$ENV{HOME}")
+        if(_home STREQUAL "")
+            message(STATUS "obn: $HOME is not set, skipping BambuStudio.conf patch")
+        else()
+            set(_expected "${_home}/.config/BambuStudio")
+            if(NOT CMAKE_INSTALL_PREFIX STREQUAL _expected)
+                message(STATUS
+                    "obn: install prefix (${CMAKE_INSTALL_PREFIX}) is not ${_expected}; "
+                    "BambuStudio.conf is untouched. Edit it by hand if needed: "
+                    "set \"installed_networking\":\"1\" and \"update_network_plugin\":\"false\" under \"app\".")
+            else()
+                set(_conf "${_expected}/BambuStudio.conf")
+                if(NOT EXISTS "${_conf}")
+                    message(STATUS
+                        "obn: ${_conf} does not exist yet -- launch Bambu Studio once "
+                        "to create it, then re-run 'make install' (or set "
+                        "\"installed_networking\" / \"update_network_plugin\" by hand).")
+                else()
+                    file(READ "${_conf}" _orig)
+                    set(_body "${_orig}")
+                    string(JSON _app_type ERROR_VARIABLE _err TYPE "${_body}" app)
+                    if(_err OR NOT _app_type STREQUAL "OBJECT")
+                        message(WARNING
+                            "obn: ${_conf} has no top-level \"app\" object; "
+                            "skipping patch. Error: ${_err}")
+                    else()
+                        string(JSON _body SET "${_body}"
+                            app installed_networking "\"1\"")
+                        string(JSON _body SET "${_body}"
+                            app update_network_plugin "\"false\"")
+                        if(NOT _body STREQUAL _orig)
+                            file(WRITE "${_conf}.obn-bak" "${_orig}")
+                            file(WRITE "${_conf}" "${_body}")
+                            message(STATUS
+                                "obn: patched ${_conf} "
+                                "(backup saved to ${_conf}.obn-bak)")
+                        else()
+                            message(STATUS
+                                "obn: ${_conf} already has "
+                                "installed_networking=1 and "
+                                "update_network_plugin=false")
+                        endif()
+                    endif()
+                endif()
+            endif()
+        endif()
+    ]])
+endif()
 
 # --------------------------------------------------------------------------
 # tests (compiled only if BUILD_TESTING is on)

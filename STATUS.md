@@ -25,7 +25,7 @@ Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_li
 | Function | Status | Notes |
 | --- | :--: | --- |
 | `bambu_network_check_debug_consistent` | ✅ | Always returns `true`. A single release-mode `.so` is expected to satisfy both Studio build flavours. |
-| `bambu_network_get_version` | ✅ | Returns `OBN_VERSION_STRING` (default `02.05.02.99`, configurable at build time). First 8 characters are kept in sync with shipped `SLIC3R_VERSION` to pass the compatibility gate. |
+| `bambu_network_get_version` | ✅ | Returns `OBN_VERSION_STRING`, auto-detected at configure time from `<prefix>/BambuStudio.conf` (or `--with-version=…`). First 8 characters are kept in sync with shipped `SLIC3R_VERSION` to pass the compatibility gate. |
 | `bambu_network_create_agent` | ✅ | Allocates the internal agent and bootstraps logging from the supplied `log_dir`. |
 | `bambu_network_destroy_agent` | ✅ | Deletes the agent instance. |
 | `bambu_network_init_log` | ✅ | No-op here: log sinks are configured inside `create_agent`, before the first log line. |

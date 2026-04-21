@@ -23,11 +23,10 @@ std::mutex        g_init_mu;
 // format so the servers don't treat us as a scraper.
 std::string default_user_agent()
 {
-#ifdef OBN_VERSION_STRING
-    return std::string("BBL-Slicer/v") + OBN_VERSION_STRING;
-#else
-    return "BBL-Slicer/v02.05.02.99";
+#ifndef OBN_VERSION_STRING
+#    error "OBN_VERSION_STRING is not defined; build through the top-level ./configure or pass -DOBN_VERSION=... to cmake"
 #endif
+    return std::string("BBL-Slicer/v") + OBN_VERSION_STRING;
 }
 
 size_t on_body(void* ptr, size_t size, size_t nmemb, void* userdata)

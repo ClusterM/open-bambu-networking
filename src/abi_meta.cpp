@@ -3,14 +3,15 @@
 #include "obn/abi_export.hpp"
 
 #ifndef OBN_VERSION_STRING
-#    define OBN_VERSION_STRING "02.05.02.99"
+#    error "OBN_VERSION_STRING is not defined; build through the top-level ./configure or pass -DOBN_VERSION=... to cmake"
 #endif
 
-// Returned to Studio's NetworkAgent::get_version(). Studio validates the first
-// 8 characters against its own SLIC3R_VERSION in check_networking_version()
-// (see src/slic3r/GUI/GUI_App.cpp). The default value is chosen to match the
-// shipped AppImage; pass -DOBN_VERSION=... at configure time for source
-// builds.
+// Returned to Studio's NetworkAgent::get_version(). Studio validates the
+// first 8 characters against its own SLIC3R_VERSION in
+// check_networking_version() (see src/slic3r/GUI/GUI_App.cpp). The value
+// is injected from -DOBN_VERSION=... at CMake configure time; the
+// top-level ./configure auto-detects it from the installed
+// BambuStudio.conf, refusing to pick a stale default.
 OBN_ABI std::string bambu_network_get_version()
 {
     return std::string(OBN_VERSION_STRING);
