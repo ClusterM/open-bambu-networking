@@ -47,6 +47,10 @@ reference implementations in
 [ha_bambu_lab](https://github.com/greghesp/ha-bambulab); everything
 else is reverse-engineered from MITM captures of the stock plugin.
 
+Please note:
+
+**This project has been built entirely through the author's enthusiasm, with a tremendous personal investment of time, effort, and financial resources. If this work helps you, please consider supporting its further development in the [Support the Developer and the Project](#support-the-developer-and-the-project) section.**
+
 ## Developer Mode requirement
 
 Recent (2024+) printer firmware cryptographically verifies every MQTT command
@@ -700,3 +704,17 @@ into a proper redacting logger is on the TODO list.)
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Support the Developer and the Project
+
+* [GitHub Sponsors](https://github.com/sponsors/ClusterM)
+
+* [Patreon](https://www.patreon.com/c/ClusterMeerkat)
+
+* [Buy Me A Coffee](https://www.buymeacoffee.com/cluster)
+
+* [Sber](https://messenger.online.sberbank.ru/sl/Lnb2OLE4JsyiEhQgC)
+
+* [Donation Alerts](https://www.donationalerts.com/r/clustermeerkat)
+
+* [Boosty](https://boosty.to/cluster)
