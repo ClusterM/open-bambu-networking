@@ -15,7 +15,7 @@
 //     opt into via SSL_SESSION_dup when available.
 //
 // Only the operations needed by print and probe paths are implemented:
-// connect/login, STOR (upload), DELE, SIZE, MLSD/LIST, QUIT.
+// connect/login, STOR (upload), DELE, SIZE, LIST, QUIT.
 
 #include <cstdint>
 #include <functional>
@@ -47,8 +47,8 @@ struct ConnectConfig {
 using ProgressFn = std::function<bool(std::uint64_t uploaded,
                                       std::uint64_t total)>;
 
-// One entry returned from `list_entries` / `mlsd`. Field values that
-// the server didn't provide are left empty / zero.
+// One entry returned from `list_entries`. Field values that the server
+// didn't provide are left empty / zero.
 struct Entry {
     std::string name;        // file name only, no directory prefix
     std::uint64_t size = 0;  // bytes; 0 for directories
@@ -88,11 +88,11 @@ public:
     // empty on success).
     std::string list(const std::string& path, std::string& err_out);
 
-    // Structured directory listing. Tries MLSD first (returns size/mtime
-    // as standardised facts), falls back to LIST with a best-effort
-    // parser for `ls -l` style output. On success *entries is populated
-    // and the returned string is empty; on error *entries is cleared
-    // and the returned string describes the failure.
+    // Structured directory listing. Issues LIST and runs a best-effort
+    // parser on the `ls -l` style output (Bambu firmware does not
+    // implement MLSD). On success *entries is populated and the
+    // returned string is empty; on error *entries is cleared and the
+    // returned string describes the failure.
     std::string list_entries(const std::string& path,
                              std::vector<Entry>* entries);
 

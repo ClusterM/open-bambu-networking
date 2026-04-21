@@ -1,5 +1,6 @@
 #include "obn/ftps.hpp"
 
+#include "ftps_parse.hpp"
 #include "obn/log.hpp"
 
 #include <arpa/inet.h>
@@ -564,80 +565,7 @@ std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
 }
 
 namespace {
-
-// Parses the `modify=YYYYMMDDHHMMSS[.frac];size=N;type=file;` fact list
-// that MLSD prepends in front of each name. Keys are case-insensitive.
-void parse_mlsd_facts(const std::string& facts, obn::ftps::Entry* e)
-{
-    std::size_t i = 0;
-    while (i < facts.size()) {
-        std::size_t sep = facts.find(';', i);
-        if (sep == std::string::npos) sep = facts.size();
-        std::string fact = facts.substr(i, sep - i);
-        i = sep + 1;
-        auto eq = fact.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = fact.substr(0, eq);
-        std::string v = fact.substr(eq + 1);
-        for (auto& c : k) c = std::tolower(static_cast<unsigned char>(c));
-        if (k == "type") {
-            for (auto& c : v) c = std::tolower(static_cast<unsigned char>(c));
-            e->is_dir = (v == "dir" || v == "cdir" || v == "pdir");
-        } else if (k == "size") {
-            e->size = std::strtoull(v.c_str(), nullptr, 10);
-        } else if (k == "modify") {
-            // YYYYMMDDHHMMSS, 14 digits minimum. UTC per RFC 3659.
-            if (v.size() >= 14) {
-                std::tm tm{};
-                auto num = [&](int off, int len) {
-                    return std::atoi(v.substr(off, len).c_str());
-                };
-                tm.tm_year = num(0, 4) - 1900;
-                tm.tm_mon  = num(4, 2) - 1;
-                tm.tm_mday = num(6, 2);
-                tm.tm_hour = num(8, 2);
-                tm.tm_min  = num(10, 2);
-                tm.tm_sec  = num(12, 2);
-                // timegm() treats tm as UTC - which is what MLSD demands.
-                e->mtime = static_cast<std::uint64_t>(timegm(&tm));
-            }
-        }
-    }
-}
-
-// Last-resort parser for `ls -l` style LIST output. Only extracts name,
-// size and is_dir; no mtime (that'd require re-implementing ls's
-// month-name locale handling, which isn't worth it when MLSD works).
-void parse_ls_line(const std::string& line, obn::ftps::Entry* e)
-{
-    if (line.empty()) return;
-    e->is_dir = (line[0] == 'd');
-    // Typical format: "drwxr-xr-x 2 root root 4096 Mar 24 12:34 name"
-    // Columns: perms / links / owner / group / size / mon / day / time / name
-    std::size_t i = 0;
-    int col = 0;
-    std::size_t size_start = std::string::npos;
-    std::size_t name_start = std::string::npos;
-    while (i < line.size() && col < 8) {
-        while (i < line.size() && line[i] == ' ') ++i;
-        std::size_t start = i;
-        while (i < line.size() && line[i] != ' ') ++i;
-        if (col == 4) { size_start = start; }
-        ++col;
-    }
-    while (i < line.size() && line[i] == ' ') ++i;
-    name_start = i;
-    if (size_start != std::string::npos) {
-        e->size = std::strtoull(line.c_str() + size_start, nullptr, 10);
-    }
-    if (name_start != std::string::npos) {
-        e->name = line.substr(name_start);
-        // Skip symlink target portion "name -> target" if present.
-        auto arrow = e->name.find(" -> ");
-        if (arrow != std::string::npos) e->name = e->name.substr(0, arrow);
-    }
-}
-
+using obn::ftps::detail::parse_ls_line;
 } // namespace
 
 std::string Client::list_entries(const std::string& path,
@@ -645,54 +573,15 @@ std::string Client::list_entries(const std::string& path,
 {
     if (entries) entries->clear();
 
-    // Try MLSD first - standardised, machine-readable. Bambu firmware
-    // (vsftpd) supports it.
+    // Bambu firmware (across O1S/X1/P1/P2S/A1 and their FTP daemons)
+    // does not advertise MLSD in FEAT and rejects it with 500 Unknown
+    // command. Don't bother trying -- just issue LIST. parse_ls_line
+    // recovers size / name / is_dir / mtime from the `ls -l` output.
     std::string err;
     int data_fd = open_data_tcp(*p_, p_->host, err);
     if (data_fd < 0) return err;
 
-    int code = p_->send_cmd(path.empty() ? "MLSD" : "MLSD " + path);
-    if (code == 150 || code == 125) {
-        SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-        if (!data_ssl) { ::close(data_fd); return err; }
-        std::string body;
-        char buf[1024];
-        while (true) {
-            int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
-            if (n <= 0) break;
-            body.append(buf, buf + n);
-        }
-        SSL_shutdown(data_ssl);
-        SSL_free(data_ssl);
-        ::close(data_fd);
-        int done = p_->read_reply(nullptr);
-        if (done != 226 && done != 250) return "MLSD finish code=" + std::to_string(done);
-
-        std::size_t i = 0;
-        while (i < body.size()) {
-            auto nl = body.find('\n', i);
-            std::string line = body.substr(i, (nl == std::string::npos ? body.size() : nl) - i);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            i = (nl == std::string::npos) ? body.size() : (nl + 1);
-            auto sp = line.find(' ');
-            if (sp == std::string::npos) continue;
-            Entry e;
-            parse_mlsd_facts(line.substr(0, sp), &e);
-            e.name = line.substr(sp + 1);
-            if (e.name == "." || e.name == "..") continue;
-            if (entries) entries->push_back(std::move(e));
-        }
-        return {};
-    }
-
-    // MLSD failed or unsupported - fall back to LIST on the same data
-    // socket? No, the socket was consumed by the rejected MLSD reply;
-    // open a fresh one.
-    ::close(data_fd);
-
-    data_fd = open_data_tcp(*p_, p_->host, err);
-    if (data_fd < 0) return err;
-    code = p_->send_cmd(path.empty() ? "LIST" : "LIST " + path);
+    int code = p_->send_cmd(path.empty() ? "LIST" : "LIST " + path);
     if (code != 150 && code != 125) {
         ::close(data_fd);
         return "LIST rejected: code=" + std::to_string(code);
@@ -713,6 +602,7 @@ std::string Client::list_entries(const std::string& path,
     if (done != 226 && done != 250) return "LIST finish code=" + std::to_string(done);
 
     std::size_t i = 0;
+    std::size_t without_mtime_ls = 0;
     while (i < body.size()) {
         auto nl = body.find('\n', i);
         std::string line = body.substr(i, (nl == std::string::npos ? body.size() : nl) - i);
@@ -722,8 +612,12 @@ std::string Client::list_entries(const std::string& path,
         Entry e;
         parse_ls_line(line, &e);
         if (e.name.empty() || e.name == "." || e.name == "..") continue;
+        if (e.mtime == 0) ++without_mtime_ls;
         if (entries) entries->push_back(std::move(e));
     }
+    if (entries)
+        OBN_DEBUG("ftps: LIST %s -> %zu entries (%zu without parsable date)",
+                  path.c_str(), entries->size(), without_mtime_ls);
     return {};
 }
 

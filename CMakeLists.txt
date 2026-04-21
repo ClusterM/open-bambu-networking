@@ -311,6 +311,14 @@ if(OBN_BUILD_TESTS)
     target_include_directories(ftps_live_test PRIVATE include)
     target_link_libraries(ftps_live_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
+    # Hermetic unit test for src/ftps_parse.hpp. Exercises the `ls -l`
+    # parser that populates Entry::mtime -- a regression there causes
+    # every file in Studio's storage tab to show up as 1970 (Bambu
+    # firmware has no MLSD, so LIST is the only thing we have).
+    add_executable(ftps_parse_test tests/ftps_parse_test.cpp)
+    target_include_directories(ftps_parse_test PRIVATE include src)
+    add_test(NAME ftps_parse COMMAND ftps_parse_test)
+
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
