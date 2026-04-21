@@ -1,0 +1,112 @@
+# Build and test open-bambu-networking on Linux x86_64 and aarch64.
+#
+# Version strategy: the plugin must report a string whose first 8 characters
+# match Bambu Studio's SLIC3R_VERSION. We therefore look up the most recent
+# tag in https://github.com/bambulab/BambuStudio.git at CI time, strip the
+# leading "v", and bump the last component to "99" (same rule ./configure
+# uses for local auto-detection). This means CI follows upstream releases
+# automatically -- no manual version bumps in this repo.
+#
+# Artifacts (one set per architecture):
+#   * libbambu_networking.so
+#   * libBambuSource.so
+#   * liblive555.so
+#   * network_plugins.json
+
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config ca-certificates git \
+            libmosquitto-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libpng-dev libjpeg-dev
+
+      - name: Resolve plugin version from upstream Bambu Studio
+        id: ver
+        run: |
+          set -eu
+          tag=$(git ls-remote --tags --refs \
+                   https://github.com/bambulab/BambuStudio.git 'refs/tags/v*' \
+                 | awk -F/ '{print $NF}' \
+                 | sort -V \
+                 | tail -n1)
+          if [ -z "$tag" ]; then
+              echo "::error::could not list tags at bambulab/BambuStudio" >&2
+              exit 1
+          fi
+          upstream=${tag#v}
+          plugin=$(printf '%s' "$upstream" | sed -E 's/\.[0-9]+$/.99/')
+          echo "upstream tag    : $tag"
+          echo "upstream version: $upstream"
+          echo "plugin version  : $plugin"
+          {
+              echo "upstream_tag=$tag"
+              echo "upstream_version=$upstream"
+              echo "plugin_version=$plugin"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --with-version='${{ steps.ver.outputs.plugin_version }}' \
+            --no-conf-patch
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run tests
+        # The only ctest target that does real I/O is `lan_live`, and it
+        # self-skips when OBN_PRINTER_IP / _SERIAL / _ACCESS_CODE are unset,
+        # which is always the case here. `plugin_symbols` is a pure dlopen
+        # smoke test and exercises every ABI symbol Studio looks up.
+        run: make test
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.so dist/
+          cp build/libBambuSource.so      dist/
+          cp build/liblive555.so          dist/
+          cp build/network_plugins.json   dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-bambu-networking-linux-${{ matrix.arch }}-${{ steps.ver.outputs.plugin_version }}
+          path: dist/
+          if-no-files-found: error
