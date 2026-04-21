@@ -177,13 +177,27 @@ void emit(Level lvl, const char* file, int line, const char* func, const char* f
     std::lock_guard<std::mutex> lk(s.mu);
     ensure_initialized_locked(s);
 
-    auto write_to = [&](FILE* f) {
+    auto write_line = [&](FILE* f, bool obn_stderr_prefix) {
         if (!f) return;
+        if (obn_stderr_prefix)
+            std::fputs("[obn] ", f);
         std::fprintf(f, "%s [%3s] [%ld] %s:%d %s: %s\n",
                      ts, level_name(lvl), tid(), base, line, func, msg);
     };
-    write_to(s.fp);
-    if (s.echo_stderr) write_to(stderr);
+
+    // File sink (normal case: obn.log or another path). No prefix — the
+    // file is ours alone.
+    if (s.fp && s.fp != stderr)
+        write_line(s.fp, false);
+
+    // Stderr: prefix every line with [obn] so it does not visually merge
+    // with Bambu Studio's own logging on the same stream.
+    const bool stderr_is_only_sink = (s.fp == stderr);
+    if (stderr_is_only_sink) {
+        write_line(stderr, true);
+    } else if (s.echo_stderr) {
+        write_line(stderr, true);
+    }
 
     if (msg != small) std::free(msg);
 }

@@ -670,7 +670,8 @@ you opt in — this keeps disk noise down for everyday use.
 
 **Where it goes.**
 
-- **Default:** stderr only (`OBN_LOG_STDERR=1`).
+- **Default:** stderr only (`OBN_LOG_STDERR=1`), each line prefixed with
+  `[obn] ` so it is easy to grep apart from Bambu Studio’s own stderr.
 - **File next to Studio’s data directory:** set `OBN_LOG_TO_FILE=1` to
   append to `<data_dir>/obn.log`, where `data_dir` is the path Studio
   passes to `bambu_network_create_agent` (typically
@@ -690,7 +691,7 @@ call — export them *before* launching Studio):
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `OBN_LOG_LEVEL` | `info` | Threshold: `trace`, `debug`, `info`, `warn`, `error`, `off`. |
-| `OBN_LOG_STDERR` | `1` | When `1`, copy every line to stderr. Set to `0` to suppress the console copy (only useful together with a file sink). |
+| `OBN_LOG_STDERR` | `1` | When `1`, copy every line to stderr with an `[obn] ` prefix. Set to `0` to suppress the console copy (only useful together with a file sink). |
 | `OBN_LOG_TO_FILE` | *(unset)* | Set to `1`/`true`/`yes` to append to `<data_dir>/obn.log` after Studio passes `data_dir`. Ignored if `OBN_LOG_FILE` is set. |
 | `OBN_LOG_FILE` | *(unset)* | Absolute path to a log file. Creates the file sink when non-empty. |
 
@@ -714,9 +715,13 @@ OBN_LOG_LEVEL=trace OBN_LOG_FILE=/tmp/obn-session.log bambu-studio
 
 **Line format:**
 
+On stderr, each line starts with `[obn] `, then:
+
 ```
 YYYY-mm-dd HH:MM:SS.uuuuuu [LVL] [tid] file.cpp:line func_name: message
 ```
+
+The file sink (if any) omits the `[obn] ` prefix — the file is plugin-only.
 
 where `tid` is the OS thread id — useful to correlate MQTT
 background-thread activity with Studio main-thread ABI calls.

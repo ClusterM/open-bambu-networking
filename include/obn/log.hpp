@@ -18,7 +18,9 @@
 //                     passed from Studio to create_agent). Ignored if
 //                     OBN_LOG_FILE is set (including empty: console-only).
 //   OBN_LOG_LEVEL     trace | debug | info | warn | error | off (default: info).
-//   OBN_LOG_STDERR    0|1 (default: 1) - copy every line to stderr.
+//   OBN_LOG_STDERR    0|1 (default: 1) - copy every line to stderr, each
+//                     line prefixed with "[obn] " so it is distinct from
+//                     Bambu Studio's own stderr output.
 //
 // The logger intentionally leaks a static singleton: the plugin is unloaded
 // together with the process, so there is no cleanup hazard.
