@@ -27,7 +27,7 @@ Key players:
 
 > Note: the code occasionally refers to two further libraries, **`BambuSource`** and **`live555`**. These are the camera/player and the RTSP stack; they are fetched and installed through the exact same mechanism and live next to the main library, but the "Network Plugin" contract proper is `bambu_networking`.
 
-The current Studio version pinned in sources is `SLIC3R_VERSION = "02.05.03.61"` (`version.inc`); the expected agent version is `BAMBU_NETWORK_AGENT_VERSION = "02.05.03.65"` (`src/slic3r/Utils/bambu_networking.hpp:100`).
+The current Studio version pinned in sources (tag `v02.06.00.51`) is `SLIC3R_VERSION = "02.06.00.51"` (`version.inc`); the expected agent version is `BAMBU_NETWORK_AGENT_VERSION = "02.06.00.50"` (`src/slic3r/Utils/bambu_networking.hpp:100`).
 
 ---
 
@@ -80,10 +80,10 @@ std::string GUI_App::get_plugin_url(std::string name, std::string country_code)
 }
 ```
 
-For the networking plugin the helper is called with `name == "plugins"`. For `SLIC3R_VERSION = "02.05.03.61"` the request becomes:
+For the networking plugin the helper is called with `name == "plugins"`. For `SLIC3R_VERSION = "02.06.00.51"` the request becomes:
 
 ```
-GET https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.05.03.00
+GET https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.06.00.00
 ```
 
 ### 2.3. Response format (JSON manifest)
@@ -260,7 +260,7 @@ Minimal valid file:
 
 ```json
 {
-  "version": "02.05.03.65",
+  "version": "02.06.00.50",
   "description": "…",
   "force": false
 }
@@ -348,9 +348,9 @@ The main check is that the first **8 characters** of the version string match, i
 bool GUI_App::check_networking_version()
 {
     std::string network_ver = Slic3r::NetworkAgent::get_version();
-    std::string studio_ver = SLIC3R_VERSION;   // "02.05.03.61"
+    std::string studio_ver = SLIC3R_VERSION;   // "02.06.00.51"
     if (network_ver.length() >= 8) {
-        if (network_ver.substr(0,8) == studio_ver.substr(0,8)) {  // "02.05.03"
+        if (network_ver.substr(0,8) == studio_ver.substr(0,8)) {  // "02.06.00"
             m_networking_compatible = true;
             return true;
         }
@@ -360,7 +360,7 @@ bool GUI_App::check_networking_version()
 }
 ```
 
-For `SLIC3R_VERSION = "02.05.03.61"` the plugin must return **a string starting with `"02.05.03"`** (e.g. `"02.05.03.65"`). Otherwise Studio marks it incompatible, sets `m_networking_need_update=true` and pops up the update dialog.
+For `SLIC3R_VERSION = "02.06.00.51"` the plugin must return **a string starting with `"02.06.00"`** (e.g. `"02.06.00.50"`). Otherwise Studio marks it incompatible, sets `m_networking_need_update=true` and pops up the update dialog.
 
 > Observation: on Linux this version check is effectively the **only** formal compatibility gate — see § 5.2, where the signature check is a no-op on that platform.
 
