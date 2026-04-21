@@ -215,6 +215,17 @@ set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
 # install (copies into <prefix>/plugins/)
 # --------------------------------------------------------------------------
 
+# A brand-new Bambu Studio profile may not have created plugins/ or
+# ota/plugins/ yet (Studio often creates them only after the first
+# official plugin download). cmake --install can then fail copying
+# into a missing parent. Create the dirs explicitly before any
+# install(TARGETS|FILES) into them. Use \${CMAKE_INSTALL_PREFIX} so the
+# path is resolved at install time (honours cmake --install --prefix).
+install(CODE "
+    file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/plugins\")
+    file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/ota/plugins\")
+")
+
 install(TARGETS bambu_networking BambuSource live555
     LIBRARY DESTINATION plugins
 )
