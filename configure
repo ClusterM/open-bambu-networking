@@ -123,6 +123,11 @@ if ! command -v cmake >/dev/null 2>&1; then
     exit 1
 fi
 
+if [ "$VENDOR_MOSQUITTO" = ON ] && ! command -v git >/dev/null 2>&1; then
+    echo "configure: --vendor-mosquitto requires git, but it was not found in \$PATH" >&2
+    exit 1
+fi
+
 has_cjson_dev_headers() {
     if command -v pkg-config >/dev/null 2>&1; then
         if pkg-config --exists libcjson >/dev/null 2>&1 || \
