@@ -19,6 +19,8 @@ on:
   push:
   workflow_dispatch:
   pull_request:
+  schedule:
+    - cron: '15 2 * * *'
 
 permissions:
   contents: read
@@ -38,7 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install tools
         run: |
@@ -62,7 +64,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install build dependencies
         run: |
@@ -133,7 +135,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: open-bambu-networking-linux-${{ matrix.arch }}-${{ steps.ver.outputs.plugin_version }}
           path: dist/
