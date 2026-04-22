@@ -639,7 +639,7 @@ No `sudo` needed — the default install prefix is inside your home directory.
 That's it. `./configure` is a thin wrapper around CMake that writes the build
 tree into `build/` and picks sensible defaults for a typical Linux user:
 install prefix `~/.config/BambuStudio` (the same directory Bambu Studio uses),
-release build, every optional feature enabled. `make install` then:
+release build. `make install` then:
 
 1. copies the four shared objects + manifest into that directory:
    - `~/.config/BambuStudio/plugins/libbambu_networking.so`
@@ -669,6 +669,7 @@ runs the smoke tests via `ctest`.
 | `--with-version=VER` | auto-detected from `<prefix>/BambuStudio.conf` | The version string `bambu_network_get_version()` reports. Studio compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.*` and a main-branch source build usually wants `02.05.03.*`. When `--with-version` is not given, `./configure` reads `app.version` from the Studio config in the install prefix and bumps the last component to `99` so our plugin always looks "newer" than the agent Studio ships with itself. If neither the flag nor the config file is available, `./configure` refuses to proceed rather than hard-code a stale default that would silently fail Studio's compatibility gate at runtime. Maps to `-DOBN_VERSION=…`. |
 | `--disable-workarounds` | enabled | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With this passed the plugin is a strict drop-in — same wire protocols, nothing else. Studio transparently loses every workaround-backed feature (the LAN file browser stays empty, Send greys out on P2S, and so on) but nothing half-done runs at runtime. Maps to `-DOBN_ENABLE_WORKAROUNDS=OFF`. |
 | `--disable-ftps-fastpath` | enabled | Stub out the `ft_*` C ABI; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `--disable-workarounds`. Maps to `-DOBN_FT_FTPS_FASTPATH=OFF`. |
+| `--enable-tests` | disabled | Build `probe_plugin`, `ftps_parse_test`, and `*_live_test` smoke tests. Default is off for regular user builds; CI enables it explicitly. Maps to `-DOBN_BUILD_TESTS=ON`. |
 | `--no-conf-patch` | patch enabled | Do not edit `BambuStudio.conf` during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_STUDIO_CONF=OFF`. |
 | `--build-dir=DIR` | `build` | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side. |
 | `--cmake-arg=ARG` | none | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable. |

@@ -404,7 +404,7 @@ endif()
 # tests (compiled only if BUILD_TESTING is on)
 # --------------------------------------------------------------------------
 
-option(OBN_BUILD_TESTS "Build smoke tests" ON)
+option(OBN_BUILD_TESTS "Build smoke tests" OFF)
 if(OBN_BUILD_TESTS)
     enable_testing()
     add_executable(probe_plugin tests/probe_plugin.cpp)

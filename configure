@@ -12,7 +12,7 @@ PREFIX=""
 OBN_VERSION=""
 WORKAROUNDS=ON
 FTPS_FASTPATH=ON
-TESTS=ON
+TESTS=OFF
 PATCH_CONF=ON
 STATIC_MOSQUITTO=OFF
 VENDOR_MOSQUITTO=OFF
@@ -42,7 +42,7 @@ Build settings:
                          to 99. Launch Bambu Studio once so it writes
                          this file, or pass --with-version=... by hand.
 
-Optional features (all enabled by default):
+Optional features:
   --disable-workarounds      Strict drop-in replacement: every non-stock
                              code path is compiled out. Features that
                              depend on them (P2S Send, LAN file browser,
@@ -52,8 +52,9 @@ Optional features (all enabled by default):
                              back to its internal FTP for 'Send to
                              Printer'. Re-enable with
                              --enable-ftps-fastpath.
-  --disable-tests            Do not build probe_plugin / *_live_test
-                             smoke tests. Re-enable with --enable-tests.
+  --enable-tests             Build probe_plugin / *_live_test smoke tests
+                             (disabled by default). Disable again with
+                             --disable-tests.
   --no-conf-patch            'make install' will not edit
                              $HOME/.config/BambuStudio/BambuStudio.conf.
                              (The patch only runs when the install prefix

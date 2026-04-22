@@ -102,6 +102,7 @@ jobs:
           ./configure \
             --build-type=Release \
             --vendor-mosquitto \
+            --enable-tests \
             --with-version='${{ steps.ver.outputs.plugin_version }}' \
             --no-conf-patch
 
