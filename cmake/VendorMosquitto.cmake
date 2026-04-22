@@ -12,25 +12,17 @@ function(obn_vendor_mosquitto_setup)
         GIT_PROGRESS TRUE
     )
 
-    FetchContent_GetProperties(eclipse_mosquitto)
-    if(NOT eclipse_mosquitto_POPULATED)
-        FetchContent_Populate(eclipse_mosquitto)
-        # CACHE+FORCE so mosquitto's option() calls (CMP0077 OLD) cannot reset these.
-        set(WITH_BROKER OFF CACHE BOOL "" FORCE)
-        set(WITH_APPS OFF CACHE BOOL "" FORCE)
-        set(WITH_CLIENTS OFF CACHE BOOL "" FORCE)
-        set(WITH_PLUGINS OFF CACHE BOOL "" FORCE)
-        set(WITH_DOCS OFF CACHE BOOL "" FORCE)
-        set(WITH_TESTS OFF CACHE BOOL "" FORCE)
-        set(WITH_STATIC_LIBRARIES ON CACHE BOOL "" FORCE)
-        set(WITH_PIC ON CACHE BOOL "" FORCE)
-        set(WITH_LIB_CPP OFF CACHE BOOL "" FORCE)
-        add_subdirectory(
-            "${eclipse_mosquitto_SOURCE_DIR}"
-            "${eclipse_mosquitto_BINARY_DIR}"
-            EXCLUDE_FROM_ALL
-        )
-    endif()
+    # CACHE+FORCE so mosquitto's option() calls (CMP0077 OLD) cannot reset these.
+    set(WITH_BROKER OFF CACHE BOOL "" FORCE)
+    set(WITH_APPS OFF CACHE BOOL "" FORCE)
+    set(WITH_CLIENTS OFF CACHE BOOL "" FORCE)
+    set(WITH_PLUGINS OFF CACHE BOOL "" FORCE)
+    set(WITH_DOCS OFF CACHE BOOL "" FORCE)
+    set(WITH_TESTS OFF CACHE BOOL "" FORCE)
+    set(WITH_STATIC_LIBRARIES ON CACHE BOOL "" FORCE)
+    set(WITH_PIC ON CACHE BOOL "" FORCE)
+    set(WITH_LIB_CPP OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(eclipse_mosquitto)
 
     if(NOT TARGET libmosquitto_static)
         message(FATAL_ERROR
