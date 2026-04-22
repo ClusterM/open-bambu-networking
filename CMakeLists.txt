@@ -112,6 +112,16 @@ option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" O
 option(OBN_PATCH_STUDIO_CONF
     "Edit ~/.config/BambuStudio/BambuStudio.conf after install" ON)
 
+# When ON, pkg-config resolves libmosquitto with --static (Libs.private,
+# transitive deps). Ignored when OBN_VENDOR_MOSQUITTO is ON.
+option(OBN_STATIC_MOSQUITTO "Link libmosquitto via pkg-config --static" OFF)
+
+# Fetch and build eclipse/mosquitto as a static PIC library — no libmosquitto-dev
+# or libmosquitto.a on the host. Requires Git and network at configure time.
+option(OBN_VENDOR_MOSQUITTO "Bundle libmosquitto via FetchContent (static PIC)" OFF)
+set(OBN_MOSQUITTO_GIT_TAG "v2.1.2"
+    CACHE STRING "Git tag for eclipse/mosquitto when OBN_VENDOR_MOSQUITTO is ON")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -135,9 +145,62 @@ add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
 # --------------------------------------------------------------------------
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
-pkg_check_modules(CURL     REQUIRED IMPORTED_TARGET libcurl)
 find_package(OpenSSL REQUIRED)
+
+if(OBN_VENDOR_MOSQUITTO AND OBN_STATIC_MOSQUITTO)
+    message(WARNING
+        "OBN_VENDOR_MOSQUITTO and OBN_STATIC_MOSQUITTO are both ON — "
+        "using the bundled mosquitto build; system static libmosquitto (pkg-config) is ignored.")
+endif()
+
+if(OBN_VENDOR_MOSQUITTO)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
+    obn_vendor_mosquitto_setup()
+elseif(OBN_STATIC_MOSQUITTO)
+    pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
+    set(_obn_prev_lib_suffix "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    find_library(MOSQUITTO_STATIC_ARCHIVE NAMES mosquitto
+        PATHS ${MOSQUITTO_LIBRARY_DIRS}
+        NO_DEFAULT_PATH)
+    if(NOT MOSQUITTO_STATIC_ARCHIVE)
+        find_library(MOSQUITTO_STATIC_ARCHIVE NAMES mosquitto)
+    endif()
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_obn_prev_lib_suffix}")
+    if(NOT MOSQUITTO_STATIC_ARCHIVE OR NOT MOSQUITTO_STATIC_ARCHIVE MATCHES "\\.a$")
+        message(FATAL_ERROR
+            "OBN_STATIC_MOSQUITTO is ON but libmosquitto.a was not found "
+            "(resolved '${MOSQUITTO_STATIC_ARCHIVE}'). Many distros ship only "
+            "the shared library in libmosquitto-dev — build mosquitto with "
+            "BUILD_SHARED_LIBS=OFF or pass -DOBN_STATIC_MOSQUITTO=OFF.")
+    endif()
+    execute_process(
+        COMMAND "${PKG_CONFIG_EXECUTABLE}" --static --libs libmosquitto
+        OUTPUT_VARIABLE _obn_mosq_ldflags
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _obn_mosq_ld_rc)
+    if(NOT _obn_mosq_ld_rc EQUAL 0)
+        message(FATAL_ERROR "pkg-config --static --libs libmosquitto failed (code ${_obn_mosq_ld_rc})")
+    endif()
+    string(REGEX REPLACE "-lmosquitto(\\s|$)" "${MOSQUITTO_STATIC_ARCHIVE}\\1"
+        _obn_mosq_ldflags "${_obn_mosq_ldflags}")
+    separate_arguments(_obn_mosq_link UNIX_COMMAND "${_obn_mosq_ldflags}")
+    message(STATUS "obn: linking libmosquitto statically (${MOSQUITTO_STATIC_ARCHIVE})")
+else()
+    pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
+endif()
+
+if(NOT OBN_VENDOR_MOSQUITTO)
+    add_library(obn_mosquitto_iface INTERFACE)
+    if(OBN_STATIC_MOSQUITTO)
+        target_include_directories(obn_mosquitto_iface INTERFACE ${MOSQUITTO_INCLUDE_DIRS})
+        target_link_libraries(obn_mosquitto_iface INTERFACE ${_obn_mosq_link})
+    else()
+        target_link_libraries(obn_mosquitto_iface INTERFACE PkgConfig::MOSQUITTO)
+    endif()
+endif()
+
+pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 # zlib is shared between bambu_networking (cover_cache: unpacks
 # Metadata/plate_N.png out of /cache/<name>.3mf to show it as the
 # printing-task thumbnail) and BambuSource (same unpack, but for the
@@ -188,7 +251,7 @@ target_compile_definitions(bambu_networking PRIVATE
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 target_link_libraries(bambu_networking PRIVATE
-    PkgConfig::MOSQUITTO
+    obn_mosquitto_iface
     PkgConfig::CURL
     OpenSSL::SSL
     OpenSSL::Crypto
@@ -392,7 +455,7 @@ if(OBN_BUILD_TESTS)
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
     target_link_libraries(lan_live_test PRIVATE
-        PkgConfig::MOSQUITTO
+        obn_mosquitto_iface
         PkgConfig::CURL
         OpenSSL::SSL
         OpenSSL::Crypto

@@ -3,6 +3,39 @@
 Open-source drop-in replacement for Bambu Studio's proprietary `bambu_networking`
 plugin.
 
+## Table of contents
+
+- [Why this project exists](#why-this-project-exists)
+- [Supported platforms](#supported-platforms)
+- [Supported Bambu Studio versions](#supported-bambu-studio-versions)
+- [Developer Mode requirement](#developer-mode-requirement)
+- [What works](#what-works)
+  - [Basics (model-independent)](#basics-model-independent)
+  - [Printing](#printing)
+  - [Camera liveview](#camera-liveview)
+  - [File browser (Device → Files)](#file-browser-device--files)
+  - [Status / Device tab](#status--device-tab)
+  - [Firmware / model-specific fix-ups](#firmware--model-specific-fix-ups)
+  - [Platforms](#platforms)
+  - [Hardware reality (what each model actually does)](#hardware-reality-what-each-model-actually-does)
+  - [Model specifics](#model-specifics)
+- [Workaround reference](#workaround-reference)
+- [Cloud sign-in](#cloud-sign-in)
+- [What is **not** implemented](#what-is-not-implemented)
+  - [MQTT command signing (`err_code: 84033543`)](#mqtt-command-signing-err_code-84033543)
+  - [MakerWorld integration](#makerworld-integration)
+  - [FileTransfer module (`ft_*` C ABI)](#filetransfer-module-ft_-c-abi)
+  - [PrinterFileSystem (SD/USB browser UI in Studio)](#printerfilesystem-sdusb-browser-ui-in-studio)
+  - [TUTK / Agora cloud p2p transports](#tutk--agora-cloud-p2p-transports)
+- [Build and install](#build-and-install)
+  - [Dependencies (Linux)](#dependencies-linux)
+  - [Configure, build, install](#configure-build-install)
+  - [`./configure` options](#configure-options)
+  - [First-time Studio configuration](#first-time-studio-configuration)
+- [Logging](#logging)
+- [License](#license)
+- [Support the Developer and the Project](#support-the-developer-and-the-project)
+
 ## Why this project exists
 
 [Bambu Studio](https://github.com/bambulab/BambuStudio) is an excellent
@@ -595,6 +628,10 @@ make install
 
 No `sudo` needed — the default install prefix is inside your home directory.
 
+**Important**: If Studio runs in an **isolated environment** where **`libmosquitto` is not
+available or not visible** at runtime (**Flatpak**, **Docker**/**OCI** images, minimal
+sandboxes), add **`--vendor-mosquitto`** to `./configure` (see the [`./configure` options](#configure-options) table below).
+
 That's it. `./configure` is a thin wrapper around CMake that writes the build
 tree into `build/` and picks sensible defaults for a typical Linux user:
 install prefix `~/.config/BambuStudio` (the same directory Bambu Studio uses),
@@ -632,12 +669,9 @@ runs the smoke tests via `ctest`.
 | `--build-dir=DIR` | `build` | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side. |
 | `--cmake-arg=ARG` | none | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable. |
 
-If you prefer to drive CMake directly, `./configure` is completely optional —
-everything is still a normal CMake project. The `CMAKE_*` / `OBN_*` cache
-variables (`CMAKE_INSTALL_PREFIX`, `OBN_VERSION`, `OBN_ENABLE_WORKAROUNDS`,
-`OBN_FT_FTPS_FASTPATH`, `OBN_PATCH_STUDIO_CONF`, `OBN_BUILD_TESTS`) are
-named right there in `CMakeLists.txt` and behave exactly as the configure
-flags above.
+`./configure --help` also lists less common flags (including Mosquitto linking
+options). Driving **CMake** directly works the same way; see `OBN_*` and
+other cache variables in `CMakeLists.txt`.
 
 ### First-time Studio configuration
 

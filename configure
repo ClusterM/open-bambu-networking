@@ -14,6 +14,8 @@ WORKAROUNDS=ON
 FTPS_FASTPATH=ON
 TESTS=ON
 PATCH_CONF=ON
+STATIC_MOSQUITTO=OFF
+VENDOR_MOSQUITTO=OFF
 EXTRA_CMAKE_ARGS=""
 
 usage() {
@@ -56,6 +58,16 @@ Optional features (all enabled by default):
                              $HOME/.config/BambuStudio/BambuStudio.conf.
                              (The patch only runs when the install prefix
                              is the default BambuStudio dir anyway.)
+  --enable-static-mosquitto  Link the system libmosquitto.a (pkg-config
+                             --static). Only for the non-vendor build; if
+                             you pass --vendor-mosquitto you do not need this
+                             (vendor already embeds a static libmosquitto).
+  --disable-static-mosquitto Link the host libmosquitto.so (default without
+                             --vendor-mosquitto).
+  --vendor-mosquitto         Fetch/build eclipse/mosquitto and embed its
+                             static library (cmake ignores --enable-static-
+                             mosquitto when this is on). Needs git & network.
+  --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
 
 Other:
   --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
@@ -83,6 +95,10 @@ for arg in "$@"; do
         --enable-tests)            TESTS=ON ;;
         --no-conf-patch)           PATCH_CONF=OFF ;;
         --with-conf-patch)         PATCH_CONF=ON ;;
+        --enable-static-mosquitto)  STATIC_MOSQUITTO=ON ;;
+        --disable-static-mosquitto) STATIC_MOSQUITTO=OFF ;;
+        --vendor-mosquitto)        VENDOR_MOSQUITTO=ON ;;
+        --no-vendor-mosquitto)     VENDOR_MOSQUITTO=OFF ;;
         --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
         -h|--help)                 usage; exit 0 ;;
         *)
@@ -92,6 +108,12 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+if [ "$VENDOR_MOSQUITTO" = ON ] && [ "$STATIC_MOSQUITTO" = ON ]; then
+    printf '%s\n' \
+        'configure: warning: --vendor-mosquitto and --enable-static-mosquitto are both set;' \
+        '               the bundled mosquitto build is used (pkg-config static path ignored).' >&2
+fi
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "configure: cmake is required but was not found in \$PATH" >&2
@@ -153,7 +175,9 @@ set -- "$@" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
     -DOBN_FT_FTPS_FASTPATH="$FTPS_FASTPATH" \
     -DOBN_BUILD_TESTS="$TESTS" \
-    -DOBN_PATCH_STUDIO_CONF="$PATCH_CONF"
+    -DOBN_PATCH_STUDIO_CONF="$PATCH_CONF" \
+    -DOBN_STATIC_MOSQUITTO="$STATIC_MOSQUITTO" \
+    -DOBN_VENDOR_MOSQUITTO="$VENDOR_MOSQUITTO"
 # shellcheck disable=SC2086
 [ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
 
