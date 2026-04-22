@@ -648,6 +648,35 @@ The `PrintParams` struct (`src/slic3r/Utils/bambu_networking.hpp:192-241`) carri
 
 Print-job stages — the `SendingPrintJobStage` enum (`bambu_networking.hpp:146-156`): `Create=0, Upload=1, Waiting=2, Sending=3, Record=4, WaitPrinter=5, Finished=6, ERROR=7, Limit=8`.
 
+#### 6.8.1. Cloud upload flow in the plugin (what actually happens)
+
+Both cloud-facing print entry points converge into the same implementation path:
+
+- `bambu_network_start_print` -> `Agent::run_cloud_print_job(..., use_lan_channel=false)`
+- `bambu_network_start_local_print_with_record` -> `Agent::run_cloud_print_job(..., use_lan_channel=true)`
+
+The cloud side of the upload then follows this sequence:
+
+1. `POST /v1/iot-service/api/user/project`  
+   returns `project_id`, `model_id`, `profile_id`, plus the first presigned `upload_url` and `upload_ticket`.
+2. `PUT <upload_url>`  
+   uploads the config 3mf.
+3. `PUT /v1/iot-service/api/user/notification` and poll  
+   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`.
+4. `PATCH /v1/iot-service/api/user/project/<project_id>`  
+   first patch with placeholder `ftp://...` URL (mirrors stock plugin behaviour).
+5. `GET /v1/iot-service/api/user/upload?models=<model_id>_<profile_id>_<plate>.3mf`  
+   returns the second presigned URL for the main print-ready 3mf.
+6. `PUT <second presigned URL>`  
+   uploads the main 3mf.
+7. `PATCH /v1/iot-service/api/user/project/<project_id>`  
+   second patch with the real uploaded URL.
+8. `POST /v1/user-service/my/task`, then MQTT `project_file` publish.
+
+Terminology note:
+
+- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs (S3-style semantics in code/comments), not a plugin-side fixed OSS endpoint.
+
 ### 6.9. User presets
 
 | Symbol | Signature |

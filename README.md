@@ -32,6 +32,7 @@ plugin.
   - [Configure, build, install](#configure-build-install)
   - [`./configure` options](#configure-options)
   - [First-time Studio configuration](#first-time-studio-configuration)
+  - [Flatpak problems](#flatpak-problems)
 - [Logging](#logging)
 - [License](#license)
 - [Support the Developer and the Project](#support-the-developer-and-the-project)
@@ -689,6 +690,57 @@ these two keys to the `"app"` object by hand:
 "installed_networking": "1",
 "update_network_plugin": "false"
 ```
+
+### Flatpak problems
+
+Bambu Studio is often installed from Flathub. That layout is workable for this
+plugin, but the Flatpak **sandbox and runtime** introduce pitfalls the default
+`make install` path does not cover.
+
+**Install prefix.** Studio loads plugins from `<data_dir>/plugins/` (see
+[NETWORK_PLUGIN.md](NETWORK_PLUGIN.md)). Under Flatpak, `data_dir` is usually
+under `~/.var/app/<ApplicationId>/config/`, not `~/.config/BambuStudio`. For the
+common Flathub id `com.bambulab.BambuStudio`, configure and install like this
+(adjust the id if yours differs — check `flatpak list --app`):
+
+```sh
+./configure --prefix="$HOME/.var/app/com.bambulab.BambuStudio/config/BambuStudio" --vendor-mosquitto
+make && make install
+```
+
+**`libmosquitto`.** The Flatpak runtime often does not expose a compatible
+`libmosquitto` to code loaded via `dlopen` into the Studio process. Building
+with **`--vendor-mosquitto`** embeds Mosquitto statically and avoids that class
+of failures altogether (same rationale as in the boxed note under
+[Configure, build, install](#configure-build-install)).
+
+**GStreamer / camera.** `libBambuSource.so` from this project links GStreamer for
+the LAN camera path. Vendoring GStreamer (and its plugin stack) the same way we
+vendor Mosquitto is **not** realistically supported here — too large, too
+platform-specific, and tightly coupled to the host runtime. A Flatpak app
+ships its **own** GStreamer inside the sandbox; a plugin `.so` built on the
+host against **host** GStreamer libraries will not reliably resolve or match
+that stack. **Expect liveview / camera features to break or be absent** when
+using this plugin with Flatpak Studio, even if discovery, MQTT, and printing
+work.
+
+**Recommendation.** For the fewest surprises, run a **native** Studio package
+from your distribution or an **official AppImage**, or **build Studio from
+source** yourself so the plugin, wxWidgets, and multimedia stack all target the
+same environment.
+
+**AppImage compared to Flatpak.** They are not the same problem set. An
+AppImage typically carries Studio’s dependencies next to the binary and still
+uses the normal user **`~/.config/BambuStudio`** data directory on Linux, so the
+default `./configure` prefix is often correct without Flatpak’s `~/.var/app/…`
+rewiring. You may still need **`--vendor-mosquitto`** if the AppImage’s
+namespace does not expose a usable `libmosquitto` to the plugin. GStreamer is
+more likely to work than under Flatpak **if** the plugin is built against a
+toolchain and library versions compatible with what that AppImage ships;
+otherwise you can still hit `dlopen`/ABI or `libstdc++` mismatches. When in
+doubt, prefer matching Studio’s release environment (same distro packages or
+same upstream build instructions) or building both Studio and the plugin from
+source.
 
 ## Logging
 
