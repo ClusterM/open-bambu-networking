@@ -66,7 +66,8 @@ Optional features (all enabled by default):
                              --vendor-mosquitto).
   --vendor-mosquitto         Fetch/build eclipse/mosquitto and embed its
                              static library (cmake ignores --enable-static-
-                             mosquitto when this is on). Needs git & network.
+                             mosquitto when this is on). Needs git, network,
+                             and cJSON development headers.
   --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
 
 Other:
@@ -117,6 +118,37 @@ fi
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "configure: cmake is required but was not found in \$PATH" >&2
+    exit 1
+fi
+
+has_cjson_dev_headers() {
+    if command -v pkg-config >/dev/null 2>&1; then
+        if pkg-config --exists libcjson >/dev/null 2>&1 || \
+           pkg-config --exists cjson >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    for hdr in \
+        /usr/include/cjson/cJSON.h \
+        /usr/local/include/cjson/cJSON.h \
+        /usr/include/cJSON.h \
+        /usr/local/include/cJSON.h
+    do
+        [ -r "$hdr" ] && return 0
+    done
+
+    return 1
+}
+
+if [ "$VENDOR_MOSQUITTO" = ON ] && ! has_cjson_dev_headers; then
+    cat >&2 <<'EOF'
+configure: --vendor-mosquitto requires cJSON development headers, but they were not found.
+
+Install the package and run configure again:
+  Debian/Ubuntu: sudo apt install libcjson-dev
+  Fedora/RHEL:   sudo dnf install cjson-devel
+EOF
     exit 1
 fi
 
