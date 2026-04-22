@@ -183,6 +183,17 @@ EOF
     exit 1
 fi
 
+# On Linux, default the install prefix to match CMakeLists.txt and README.
+# Always pass -DCMAKE_INSTALL_PREFIX below when PREFIX is set. If we omit it,
+# CMake keeps the previous CMAKE_INSTALL_PREFIX in CMakeCache.txt — so after
+# ./configure --prefix=.../flatpak/... a plain ./configure would still install
+# to the old path while version detection reads ~/.config/BambuStudio.conf.
+if [ -z "$PREFIX" ]; then
+    case "$(uname -s)" in
+        Linux) PREFIX="${HOME:-}/.config/BambuStudio" ;;
+    esac
+fi
+
 # Auto-detect the Studio version from BambuStudio.conf when the user did
 # not pass --with-version. The plugin must report a version whose first 8
 # characters match SLIC3R_VERSION (see README), so the simplest reliable
