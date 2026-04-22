@@ -598,6 +598,9 @@ headers for everything the project links against:
 | GStreamer (BambuSource camera path) | `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev` | `gstreamer1-devel`, `gstreamer1-plugins-base-devel` |
 | Images (BambuSource) | `libpng-dev`, `libjpeg-dev` | `libpng-devel`, `libjpeg-turbo-devel` |
 
+> Note  
+> `libcjson-dev` and `uthash-dev` are required for `--vendor-mosquitto` option only (see below).
+
 One-shot install examples:
 
 ```sh
@@ -628,9 +631,10 @@ make install
 
 No `sudo` needed — the default install prefix is inside your home directory.
 
-**Important**: If Studio runs in an **isolated environment** where **`libmosquitto` is not
-available or not visible** at runtime (**Flatpak**, **Docker**/**OCI** images, minimal
-sandboxes), add **`--vendor-mosquitto`** to `./configure` (see the [`./configure` options](#configure-options) table below).
+> **Important!**  
+> If Studio runs in an **isolated environment** where **`libmosquitto` is not
+> available or not visible** at runtime (**Flatpak**, **Docker**/**OCI** images, minimal
+> sandboxes), add **`--vendor-mosquitto`** to `./configure` (see the [`./configure` options](#configure-options) table below).
 
 That's it. `./configure` is a thin wrapper around CMake that writes the build
 tree into `build/` and picks sensible defaults for a typical Linux user:
