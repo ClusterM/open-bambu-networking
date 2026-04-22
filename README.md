@@ -594,7 +594,7 @@ headers for everything the project links against:
 | Component | Debian / Ubuntu packages | Fedora-style packages |
 | --- | --- | --- |
 | Toolchain | `build-essential`, `cmake`, `pkg-config` | `gcc-c++`, `cmake`, `pkgconf-pkg-config` |
-| MQTT / JSON / HTTP / TLS / zlib | `libmosquitto-dev`, `libcjson-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
+| MQTT / JSON / HTTP / TLS / zlib | `libmosquitto-dev`, `libcjson-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
 | GStreamer (BambuSource camera path) | `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev` | `gstreamer1-devel`, `gstreamer1-plugins-base-devel` |
 | Images (BambuSource) | `libpng-dev`, `libjpeg-dev` | `libpng-devel`, `libjpeg-turbo-devel` |
 
@@ -603,7 +603,7 @@ One-shot install examples:
 ```sh
 # Debian / Ubuntu
 sudo apt install build-essential cmake pkg-config \
-  libmosquitto-dev libcjson-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
+  libmosquitto-dev libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libpng-dev libjpeg-dev
 ```
@@ -611,7 +611,7 @@ sudo apt install build-essential cmake pkg-config \
 ```sh
 # Fedora
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
-  mosquitto-devel cjson-devel libcurl-devel openssl-devel zlib-devel \
+  mosquitto-devel cjson-devel uthash-devel libcurl-devel openssl-devel zlib-devel \
   gstreamer1-devel gstreamer1-plugins-base-devel \
   libpng-devel libjpeg-turbo-devel
 ```

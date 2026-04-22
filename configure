@@ -67,7 +67,8 @@ Optional features (all enabled by default):
   --vendor-mosquitto         Fetch/build eclipse/mosquitto and embed its
                              static library (cmake ignores --enable-static-
                              mosquitto when this is on). Needs git, network,
-                             and cJSON development headers.
+                             cJSON development headers, and utlist.h
+                             (usually from uthash-dev / uthash-devel).
   --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
 
 Other:
@@ -141,6 +142,19 @@ has_cjson_dev_headers() {
     return 1
 }
 
+has_utlist_header() {
+    for hdr in \
+        /usr/include/utlist.h \
+        /usr/local/include/utlist.h \
+        /usr/include/uthash/utlist.h \
+        /usr/local/include/uthash/utlist.h
+    do
+        [ -r "$hdr" ] && return 0
+    done
+
+    return 1
+}
+
 if [ "$VENDOR_MOSQUITTO" = ON ] && ! has_cjson_dev_headers; then
     cat >&2 <<'EOF'
 configure: --vendor-mosquitto requires cJSON development headers, but they were not found.
@@ -148,6 +162,17 @@ configure: --vendor-mosquitto requires cJSON development headers, but they were 
 Install the package and run configure again:
   Debian/Ubuntu: sudo apt install libcjson-dev
   Fedora/RHEL:   sudo dnf install cjson-devel
+EOF
+    exit 1
+fi
+
+if [ "$VENDOR_MOSQUITTO" = ON ] && ! has_utlist_header; then
+    cat >&2 <<'EOF'
+configure: --vendor-mosquitto requires utlist.h (uthash development headers), but it was not found.
+
+Install the package and run configure again:
+  Debian/Ubuntu: sudo apt install uthash-dev
+  Fedora/RHEL:   sudo dnf install uthash-devel
 EOF
     exit 1
 fi
