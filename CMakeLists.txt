@@ -138,7 +138,10 @@ endif()
 # Hide every symbol by default, explicitly export only the ABI functions via
 # __attribute__((visibility("default"))). Keeps the library slim and avoids
 # name clashes with Studio's own symbols.
-add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
+add_compile_options(
+    -fvisibility=hidden
+    $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
+)
 
 # --------------------------------------------------------------------------
 # libbambu_networking.so  (main plugin)

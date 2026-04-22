@@ -28,6 +28,14 @@ function(obn_vendor_mosquitto_setup)
         message(FATAL_ERROR
             "obn: bundled mosquitto did not produce target libmosquitto_static")
     endif()
+    # Upstream sets full include paths for libmosquitto (shared), but the
+    # static target misses libcommon/common includes while still compiling
+    # sources that include property_common.h.
+    target_include_directories(libmosquitto_static PRIVATE
+        "${eclipse_mosquitto_SOURCE_DIR}/common"
+        "${eclipse_mosquitto_SOURCE_DIR}/deps/picohttpparser"
+        "${eclipse_mosquitto_SOURCE_DIR}/libcommon"
+    )
 
     add_library(obn_mosquitto_iface INTERFACE)
     target_include_directories(obn_mosquitto_iface INTERFACE
