@@ -1,6 +1,7 @@
 build/
 build-*/
 config.mk
+config.ps1
 .cache/
 compile_commands.json
 *.o
@@ -8,6 +9,12 @@ compile_commands.json
 *.dylib
 *.dll
 *.a
+*.lib
+*.exe
+*.pdb
+*.log
+.vcpkg/
+vcpkg_installed/
 .vscode/
 .idea/
 patches/

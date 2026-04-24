@@ -1,8 +1,7 @@
 #include "obn/agent.hpp"
 
-#include <sys/stat.h>
-
 #include <chrono>
+#include <filesystem>
 #include <cstdint>
 #include <map>
 #include <thread>
@@ -816,8 +815,8 @@ std::string Agent::bambu_ca_bundle_path() const
     //                        printer's device cert (CN=<serial>, issuer=
     //                        BBL Device CA N7-V2). This one is what we want.
     std::string path = folder + "/printer.cer";
-    struct stat st{};
-    if (::stat(path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) return path;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec)) return path;
     return {};
 }
 

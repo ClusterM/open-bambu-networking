@@ -22,6 +22,20 @@ function(obn_vendor_mosquitto_setup)
     set(WITH_STATIC_LIBRARIES ON CACHE BOOL "" FORCE)
     set(WITH_PIC ON CACHE BOOL "" FORCE)
     set(WITH_LIB_CPP OFF CACHE BOOL "" FORCE)
+    # We link OpenSSL ourselves; mosquitto's FindOpenSSL path should
+    # pick up the vcpkg one when CMAKE_TOOLCHAIN_FILE is set.
+    set(WITH_TLS ON CACHE BOOL "" FORCE)
+    set(WITH_TLS_PSK ON CACHE BOOL "" FORCE)
+    set(WITH_THREADING ON CACHE BOOL "" FORCE)
+    if(WIN32)
+        # mosquitto keeps uthash (utlist.h/uthash.h) in deps/ and pulls
+        # them in from the client library sources unconditionally; leave
+        # bundled deps enabled so headers resolve against mosquitto's own
+        # copy rather than requiring an external uthash package.
+        set(WITH_BUNDLED_DEPS ON CACHE BOOL "" FORCE)
+        set(WITH_CJSON OFF CACHE BOOL "" FORCE)
+        set(WITH_SRV OFF CACHE BOOL "" FORCE)
+    endif()
     FetchContent_MakeAvailable(eclipse_mosquitto)
 
     if(NOT TARGET libmosquitto_static)
@@ -30,9 +44,13 @@ function(obn_vendor_mosquitto_setup)
     endif()
     # Upstream sets full include paths for libmosquitto (shared), but the
     # static target misses libcommon/common includes while still compiling
-    # sources that include property_common.h.
+    # sources that include property_common.h. It also forgets to honour
+    # WITH_BUNDLED_DEPS for libmosquitto_static even though the sources
+    # themselves unconditionally include <utlist.h>/<uthash.h>, which ship
+    # under deps/.
     target_include_directories(libmosquitto_static PRIVATE
         "${eclipse_mosquitto_SOURCE_DIR}/common"
+        "${eclipse_mosquitto_SOURCE_DIR}/deps"
         "${eclipse_mosquitto_SOURCE_DIR}/deps/picohttpparser"
         "${eclipse_mosquitto_SOURCE_DIR}/libcommon"
     )
@@ -52,6 +70,11 @@ function(obn_vendor_mosquitto_setup)
         if(_obn_vendor_librt)
             target_link_libraries(obn_mosquitto_iface INTERFACE "${_obn_vendor_librt}")
         endif()
+    endif()
+    if(WIN32)
+        # mosquitto's sockets layer calls WSAStartup/closesocket/etc.;
+        # make sure both our code and the static library see ws2_32.
+        target_link_libraries(obn_mosquitto_iface INTERFACE ws2_32)
     endif()
 
     message(STATUS "obn: using vendored libmosquitto_static (${OBN_MOSQUITTO_GIT_TAG})")

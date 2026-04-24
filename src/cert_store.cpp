@@ -1,18 +1,11 @@
 #include "obn/cert_store.hpp"
 
 #include "obn/log.hpp"
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "obn/platform.hpp"
 
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 
 #include <openssl/err.h>
@@ -37,32 +30,19 @@ void init_openssl_once()
     });
 }
 
-int set_nonblocking(int fd)
-{
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
 // Waits for `fd` to become readable or writable (depending on `want_write`)
 // with a timeout expressed in milliseconds. Returns 1 on ready, 0 on timeout,
-// -1 on error.
-int wait_fd(int fd, bool want_write, int timeout_ms)
+// -1 on error. Implemented via the platform's poll wrapper so WSAPoll is
+// used on Windows (select() is awkward on non-BSD sockets).
+int wait_fd(obn::plat::socket_t fd, bool want_write, int timeout_ms)
 {
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(fd, &set);
-    struct timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    return ::select(fd + 1,
-                    want_write ? nullptr : &set,
-                    want_write ? &set : nullptr,
-                    nullptr, &tv);
+    return obn::plat::wait_socket(fd, want_write ? POLLOUT : POLLIN, timeout_ms);
 }
 
-int connect_with_timeout(const std::string& host, int port, int timeout_ms)
+obn::plat::socket_t connect_with_timeout(const std::string& host, int port, int timeout_ms)
 {
+    obn::plat::ensure_sockets_initialised();
+
     // getaddrinfo handles both IPv4 literals and hostnames. Printers are
     // typically reached by IPv4 literal, but we accept hostnames for parity
     // with the rest of the plugin.
@@ -76,23 +56,39 @@ int connect_with_timeout(const std::string& host, int port, int timeout_ms)
     if (gai != 0 || !res) {
         OBN_WARN("cert_store: getaddrinfo(%s) failed: %s", host.c_str(),
                  ::gai_strerror(gai));
-        return -1;
+        return obn::plat::kInvalidSocket;
     }
 
-    int fd = -1;
+    obn::plat::socket_t fd = obn::plat::kInvalidSocket;
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (set_nonblocking(fd) < 0) { ::close(fd); fd = -1; continue; }
-        int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (!obn::plat::is_valid_socket(fd)) continue;
+        if (obn::plat::set_nonblocking(fd) < 0) {
+            obn::plat::close_socket(fd);
+            fd = obn::plat::kInvalidSocket;
+            continue;
+        }
+        int rc = ::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         if (rc == 0) break;
-        if (errno != EINPROGRESS) { ::close(fd); fd = -1; continue; }
+        int e = obn::plat::socket_last_error();
+        if (e != obn::plat::kEINPROGRESS && e != obn::plat::kEWOULDBLOCK) {
+            obn::plat::close_socket(fd);
+            fd = obn::plat::kInvalidSocket;
+            continue;
+        }
         int w = wait_fd(fd, /*want_write=*/true, timeout_ms);
-        if (w <= 0) { ::close(fd); fd = -1; continue; }
+        if (w <= 0) {
+            obn::plat::close_socket(fd);
+            fd = obn::plat::kInvalidSocket;
+            continue;
+        }
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) < 0 || so_err != 0) {
-            ::close(fd); fd = -1; continue;
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                         reinterpret_cast<char*>(&so_err), &so_len) < 0 || so_err != 0) {
+            obn::plat::close_socket(fd);
+            fd = obn::plat::kInvalidSocket;
+            continue;
         }
         break;
     }
@@ -100,7 +96,7 @@ int connect_with_timeout(const std::string& host, int port, int timeout_ms)
     return fd;
 }
 
-bool drive_ssl_connect(SSL* ssl, int fd, int timeout_ms)
+bool drive_ssl_connect(SSL* ssl, obn::plat::socket_t fd, int timeout_ms)
 {
     for (;;) {
         int rc = ::SSL_connect(ssl);
@@ -127,29 +123,17 @@ std::string device_cert_path(const std::string& config_dir, const std::string& d
 
 bool ensure_parent_dir(const std::string& file_path)
 {
-    auto slash = file_path.find_last_of('/');
-    if (slash == std::string::npos) return true;
-    std::string dir = file_path.substr(0, slash);
-    // Walk the path and mkdir each segment; ignores EEXIST.
-    std::string acc;
-    acc.reserve(dir.size());
-    if (!dir.empty() && dir.front() == '/') acc.push_back('/');
-    size_t i = (acc.empty() ? 0 : 1);
-    while (i <= dir.size()) {
-        if (i == dir.size() || dir[i] == '/') {
-            if (!acc.empty() && acc != "/") {
-                if (::mkdir(acc.c_str(), 0755) != 0 && errno != EEXIST) {
-                    OBN_WARN("cert_store: mkdir(%s) failed: %s",
-                             acc.c_str(), std::strerror(errno));
-                    return false;
-                }
-            }
-            if (i == dir.size()) break;
-            acc.push_back('/');
-        } else {
-            acc.push_back(dir[i]);
-        }
-        ++i;
+    // Delegates to std::filesystem::create_directories which handles both
+    // POSIX '/' and Windows '\\' separators and is idempotent for
+    // already-existing directories (returns false without setting ec).
+    std::filesystem::path parent = std::filesystem::path(file_path).parent_path();
+    if (parent.empty()) return true;
+    std::error_code ec;
+    std::filesystem::create_directories(parent, ec);
+    if (ec) {
+        OBN_WARN("cert_store: create_directories(%s) failed: %s",
+                 parent.string().c_str(), ec.message().c_str());
+        return false;
     }
     return true;
 }
@@ -161,8 +145,8 @@ bool capture_peer_cert_pem(const std::string& host,
 {
     init_openssl_once();
 
-    int fd = connect_with_timeout(host, port, timeout_ms);
-    if (fd < 0) {
+    obn::plat::socket_t fd = connect_with_timeout(host, port, timeout_ms);
+    if (!obn::plat::is_valid_socket(fd)) {
         OBN_WARN("cert_store: TCP connect %s:%d failed", host.c_str(), port);
         return false;
     }
@@ -170,7 +154,7 @@ bool capture_peer_cert_pem(const std::string& host,
     SSL_CTX* ctx = ::SSL_CTX_new(::TLS_client_method());
     if (!ctx) {
         OBN_ERROR("cert_store: SSL_CTX_new failed");
-        ::close(fd);
+        obn::plat::close_socket(fd);
         return false;
     }
     // We deliberately do not set VERIFY_PEER here: the whole point is to
@@ -181,13 +165,17 @@ bool capture_peer_cert_pem(const std::string& host,
     SSL* ssl = ::SSL_new(ctx);
     if (!ssl) {
         ::SSL_CTX_free(ctx);
-        ::close(fd);
+        obn::plat::close_socket(fd);
         return false;
     }
     // Set SNI so that servers multiplexing on IP route correctly. Printers
     // ignore it but Studio's own plugin sends the dev_ip as SNI, so we match.
     ::SSL_set_tlsext_host_name(ssl, host.c_str());
-    ::SSL_set_fd(ssl, fd);
+    // OpenSSL's SSL_set_fd takes int; Winsock's SOCKET is a UINT_PTR but
+    // the handle values fit in int for the ranges the OS hands out. Use
+    // the documented cast path (SOCKET -> int) — this is exactly what
+    // Studio's own plugin does on Windows.
+    ::SSL_set_fd(ssl, static_cast<int>(fd));
 
     bool ok = drive_ssl_connect(ssl, fd, timeout_ms);
     if (!ok) {
@@ -199,7 +187,7 @@ bool capture_peer_cert_pem(const std::string& host,
         ::SSL_shutdown(ssl);
         ::SSL_free(ssl);
         ::SSL_CTX_free(ctx);
-        ::close(fd);
+        obn::plat::close_socket(fd);
         return false;
     }
 
@@ -231,7 +219,7 @@ bool capture_peer_cert_pem(const std::string& host,
     ::SSL_shutdown(ssl);
     ::SSL_free(ssl);
     ::SSL_CTX_free(ctx);
-    ::close(fd);
+    obn::plat::close_socket(fd);
     return wrote;
 }
 

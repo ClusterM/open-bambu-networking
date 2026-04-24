@@ -42,8 +42,13 @@ enum Level : int {
 void configure_from_log_dir(const std::string& log_dir);
 
 // Low-level emitter. Use the OBN_* macros below instead of calling directly.
+#if defined(__GNUC__) || defined(__clang__)
+#  define OBN_PRINTF_FMT(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx)))
+#else
+#  define OBN_PRINTF_FMT(fmt_idx, va_idx)
+#endif
 void emit(Level lvl, const char* file, int line, const char* func, const char* fmt, ...)
-    __attribute__((format(printf, 5, 6)));
+    OBN_PRINTF_FMT(5, 6);
 
 // Current threshold, used by macros to skip argument evaluation when muted.
 Level threshold();

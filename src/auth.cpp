@@ -2,15 +2,13 @@
 
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/platform.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <errno.h>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace obn::auth {
 
@@ -23,7 +21,7 @@ std::string to_iso8601(clock::time_point tp)
     auto t = clock::to_time_t(tp);
     char buf[80];
     std::tm tm{};
-    gmtime_r(&t, &tm);
+    obn::plat::gmtime_safe(t, &tm);
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec);
@@ -44,8 +42,7 @@ clock::time_point parse_iso8601(const std::string& s)
     tm.tm_hour = h;
     tm.tm_min  = mi;
     tm.tm_sec  = se;
-    // timegm is Linux-specific; we're targeting Linux/glibc.
-    auto t = timegm(&tm);
+    auto t = obn::plat::timegm_portable(&tm);
     return clock::from_time_t(t);
 }
 
@@ -99,8 +96,7 @@ void Store::persist_locked() const
 
     std::string tmp = path_ + ".tmp";
     {
-        // Write with umask-style 0600 permissions.
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = obn::plat::open_secure_write(tmp.c_str());
         if (fd < 0) {
             OBN_ERROR("auth: open(%s) failed: %s", tmp.c_str(), std::strerror(errno));
             return;
@@ -125,19 +121,24 @@ void Store::persist_locked() const
         add("nick_name",     s_.nick_name);
         add("avatar",        s_.avatar, /*last=*/true);
         body += "}\n";
-        ssize_t written = ::write(fd, body.data(), body.size());
-        ::fsync(fd);
-        ::close(fd);
-        if (written < static_cast<ssize_t>(body.size())) {
+        int written = obn::plat::write_all(fd, body.data(), body.size());
+        obn::plat::fsync_fd(fd);
+        obn::plat::close_fd(fd);
+        if (written < static_cast<int>(body.size())) {
             OBN_ERROR("auth: partial write on %s", tmp.c_str());
-            ::unlink(tmp.c_str());
+            obn::plat::unlink_path(tmp.c_str());
             return;
         }
     }
-    if (::rename(tmp.c_str(), path_.c_str()) != 0) {
+    // std::filesystem::rename replaces the target atomically on POSIX and
+    // Windows (since ReplaceFile-backed Win10 builds). Avoids the need to
+    // delete the destination first.
+    std::error_code rec;
+    std::filesystem::rename(tmp, path_, rec);
+    if (rec) {
         OBN_ERROR("auth: rename(%s -> %s) failed: %s",
-                  tmp.c_str(), path_.c_str(), std::strerror(errno));
-        ::unlink(tmp.c_str());
+                  tmp.c_str(), path_.c_str(), rec.message().c_str());
+        obn::plat::unlink_path(tmp.c_str());
     }
 }
 
@@ -182,7 +183,7 @@ void Store::clear()
 {
     std::lock_guard<std::mutex> lk(mu_);
     s_ = {};
-    if (!path_.empty()) ::unlink(path_.c_str());
+    if (!path_.empty()) obn::plat::unlink_path(path_.c_str());
 }
 
 bool Store::needs_refresh(std::chrono::seconds margin) const

@@ -2,15 +2,7 @@
 
 #include "ftps_parse.hpp"
 #include "obn/log.hpp"
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "obn/platform.hpp"
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -58,23 +50,18 @@ std::string openssl_last_error()
     return buf;
 }
 
-int set_nonblocking(int fd)
+using obn::plat::socket_t;
+using obn::plat::kInvalidSocket;
+
+int wait_fd(socket_t fd, short events, int timeout_ms)
 {
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return obn::plat::wait_socket(fd, events, timeout_ms);
 }
 
-int wait_fd(int fd, short events, int timeout_ms)
+socket_t connect_tcp(const std::string& host, int port, int timeout_ms, std::string& err)
 {
-    pollfd p{};
-    p.fd     = fd;
-    p.events = events;
-    return ::poll(&p, 1, timeout_ms);
-}
+    obn::plat::ensure_sockets_initialised();
 
-int connect_tcp(const std::string& host, int port, int timeout_ms, std::string& err)
-{
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -82,42 +69,52 @@ int connect_tcp(const std::string& host, int port, int timeout_ms, std::string& 
     int rv = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &ai);
     if (rv != 0 || !ai) {
         err = std::string{"getaddrinfo: "} + ::gai_strerror(rv);
-        return -1;
+        return kInvalidSocket;
     }
 
-    int fd = -1;
+    socket_t fd = kInvalidSocket;
     for (addrinfo* a = ai; a; a = a->ai_next) {
         fd = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (fd < 0) continue;
-        if (set_nonblocking(fd) < 0) { ::close(fd); fd = -1; continue; }
+        if (!obn::plat::is_valid_socket(fd)) continue;
+        if (obn::plat::set_nonblocking(fd) < 0) {
+            obn::plat::close_socket(fd);
+            fd = kInvalidSocket;
+            continue;
+        }
 
-        int rc = ::connect(fd, a->ai_addr, a->ai_addrlen);
+        int rc = ::connect(fd, a->ai_addr, static_cast<int>(a->ai_addrlen));
         if (rc == 0) break;
-        if (errno == EINPROGRESS) {
+        int e = obn::plat::socket_last_error();
+        if (e == obn::plat::kEINPROGRESS || e == obn::plat::kEWOULDBLOCK) {
             if (wait_fd(fd, POLLOUT, timeout_ms) > 0) {
                 int soerr = 0; socklen_t slen = sizeof(soerr);
-                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 && soerr == 0) break;
-                err = std::string{"connect: "} + std::strerror(soerr ? soerr : errno);
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&soerr), &slen) == 0 && soerr == 0)
+                    break;
+                err = "connect: " + obn::plat::socket_strerror(
+                    soerr ? soerr : obn::plat::socket_last_error());
             } else {
                 err = "connect: timeout";
             }
         } else {
-            err = std::string{"connect: "} + std::strerror(errno);
+            err = "connect: " + obn::plat::socket_strerror(e);
         }
-        ::close(fd);
-        fd = -1;
+        obn::plat::close_socket(fd);
+        fd = kInvalidSocket;
     }
     ::freeaddrinfo(ai);
 
-    if (fd < 0 && err.empty()) err = "connect failed";
+    if (!obn::plat::is_valid_socket(fd) && err.empty()) err = "connect failed";
     int yes = 1;
-    if (fd >= 0) ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    if (obn::plat::is_valid_socket(fd))
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes));
     return fd;
 }
 
 // Drives SSL_connect / SSL_write / SSL_read until it stops returning
 // WANT_READ/WANT_WRITE, bounded by timeout_ms.
-int drive_ssl(SSL* ssl, int fd, int (*op)(SSL*), int timeout_ms)
+int drive_ssl(SSL* ssl, socket_t fd, int (*op)(SSL*), int timeout_ms)
 {
     for (;;) {
         int r = op(ssl);
@@ -132,7 +129,7 @@ int drive_ssl(SSL* ssl, int fd, int (*op)(SSL*), int timeout_ms)
     }
 }
 
-bool ssl_write_all(SSL* ssl, int fd, const void* buf, std::size_t len, int timeout_ms)
+bool ssl_write_all(SSL* ssl, socket_t fd, const void* buf, std::size_t len, int timeout_ms)
 {
     const char* p   = static_cast<const char*>(buf);
     std::size_t off = 0;
@@ -149,7 +146,7 @@ bool ssl_write_all(SSL* ssl, int fd, const void* buf, std::size_t len, int timeo
     return true;
 }
 
-int ssl_read_some(SSL* ssl, int fd, void* buf, std::size_t max_len, int timeout_ms)
+int ssl_read_some(SSL* ssl, socket_t fd, void* buf, std::size_t max_len, int timeout_ms)
 {
     for (;;) {
         int r = SSL_read(ssl, buf, static_cast<int>(max_len));
@@ -171,12 +168,12 @@ int ssl_read_some(SSL* ssl, int fd, void* buf, std::size_t max_len, int timeout_
 // -------------------------------------------------------------------
 
 struct Client::Impl {
-    SSL_CTX* ctx        = nullptr;
-    SSL*     ctrl_ssl   = nullptr;
-    int      ctrl_fd    = -1;
+    SSL_CTX*   ctx        = nullptr;
+    SSL*       ctrl_ssl   = nullptr;
+    socket_t   ctrl_fd    = kInvalidSocket;
     std::string host;
-    int      control_timeout_ms = 10000;
-    int      data_timeout_ms    = 60000;
+    int        control_timeout_ms = 10000;
+    int        data_timeout_ms    = 60000;
 
     // Line-oriented read buffer for the control channel.
     std::string ctrl_buf;
@@ -184,7 +181,10 @@ struct Client::Impl {
     ~Impl()
     {
         if (ctrl_ssl) { SSL_shutdown(ctrl_ssl); SSL_free(ctrl_ssl); ctrl_ssl = nullptr; }
-        if (ctrl_fd >= 0) { ::close(ctrl_fd); ctrl_fd = -1; }
+        if (obn::plat::is_valid_socket(ctrl_fd)) {
+            obn::plat::close_socket(ctrl_fd);
+            ctrl_fd = kInvalidSocket;
+        }
         if (ctx) { SSL_CTX_free(ctx); ctx = nullptr; }
     }
 
@@ -269,8 +269,8 @@ std::string Client::connect(const ConnectConfig& cfg)
     p_->host               = cfg.host;
 
     std::string err;
-    int fd = connect_tcp(cfg.host, cfg.port, p_->control_timeout_ms, err);
-    if (fd < 0) return "tcp: " + err;
+    socket_t fd = connect_tcp(cfg.host, cfg.port, p_->control_timeout_ms, err);
+    if (!obn::plat::is_valid_socket(fd)) return "tcp: " + err;
     p_->ctrl_fd = fd;
 
     p_->ctx = SSL_CTX_new(TLS_client_method());
@@ -297,7 +297,7 @@ std::string Client::connect(const ConnectConfig& cfg)
 
     p_->ctrl_ssl = SSL_new(p_->ctx);
     if (!p_->ctrl_ssl) return "SSL_new: " + openssl_last_error();
-    SSL_set_fd(p_->ctrl_ssl, fd);
+    SSL_set_fd(p_->ctrl_ssl, static_cast<int>(fd));
     SSL_set_tlsext_host_name(p_->ctrl_ssl, cfg.host.c_str());
     if (drive_ssl(p_->ctrl_ssl, fd, SSL_connect, p_->control_timeout_ms) <= 0) {
         return "TLS handshake: " + openssl_last_error();
@@ -331,44 +331,44 @@ std::string Client::connect(const ConnectConfig& cfg)
 // *after* the client issues STOR/LIST and the 150 reply is sent, so we
 // have to interleave: PASV -> data TCP -> command -> 150 -> data TLS
 // handshake -> transfer.
-static int open_data_tcp(Client::Impl& p, const std::string& host, std::string& err)
+static socket_t open_data_tcp(Client::Impl& p, const std::string& host, std::string& err)
 {
     std::string body;
     int code = p.send_cmd("PASV", &body);
     if (code != 227) {
         err = "PASV rejected: code=" + std::to_string(code);
-        return -1;
+        return kInvalidSocket;
     }
     auto lp = body.find('(');
     auto rp = body.find(')');
     if (lp == std::string::npos || rp == std::string::npos || rp <= lp) {
         err = "PASV bad body: " + body;
-        return -1;
+        return kInvalidSocket;
     }
     std::string addr = body.substr(lp + 1, rp - lp - 1);
     int h1, h2, h3, h4, p1, p2;
     if (std::sscanf(addr.c_str(), "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
         err = "PASV parse: " + addr;
-        return -1;
+        return kInvalidSocket;
     }
     int data_port = p1 * 256 + p2;
     OBN_DEBUG("ftps: PASV -> %d.%d.%d.%d:%d (reconnecting to control host %s)",
               h1, h2, h3, h4, data_port, host.c_str());
 
     std::string connect_err;
-    int fd = connect_tcp(host, data_port, p.control_timeout_ms, connect_err);
-    if (fd < 0) err = "data tcp: " + connect_err;
+    socket_t fd = connect_tcp(host, data_port, p.control_timeout_ms, connect_err);
+    if (!obn::plat::is_valid_socket(fd)) err = "data tcp: " + connect_err;
     return fd;
 }
 
 // Performs the delayed TLS handshake on a data socket after the server
 // accepted the STOR/LIST (150). Caller owns the returned SSL*.
-static SSL* wrap_data_tls(Client::Impl& p, SSL* ctrl_ssl, int fd,
+static SSL* wrap_data_tls(Client::Impl& p, SSL* ctrl_ssl, socket_t fd,
                           const std::string& host, std::string& err)
 {
     SSL* data_ssl = SSL_new(p.ctx);
     if (!data_ssl) { err = "data SSL_new"; return nullptr; }
-    SSL_set_fd(data_ssl, fd);
+    SSL_set_fd(data_ssl, static_cast<int>(fd));
     SSL_set_tlsext_host_name(data_ssl, host.c_str());
     // Reuse the control channel's TLS session. Some FTPS servers
     // (pureftpd when hardened, newer vsftpd builds with
@@ -397,19 +397,19 @@ std::string Client::stor(const std::string& local_path,
     f.seekg(0, std::ios::beg);
 
     std::string err;
-    int data_fd = open_data_tcp(*p_, p_->host, err);
-    if (data_fd < 0) return err;
+    socket_t data_fd = open_data_tcp(*p_, p_->host, err);
+    if (!obn::plat::is_valid_socket(data_fd)) return err;
 
     // Printer must reply 150 "Opening BINARY connection" before it
     // expects TLS handshake on the data socket.
     int code = p_->send_cmd("STOR " + remote_path);
     if (code != 150 && code != 125) {
-        ::close(data_fd);
+        obn::plat::close_socket(data_fd);
         return "STOR rejected: code=" + std::to_string(code);
     }
 
     SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { ::close(data_fd); return err; }
+    if (!data_ssl) { obn::plat::close_socket(data_fd); return err; }
 
     std::vector<char>  buf(64 * 1024);
     std::uint64_t      sent = 0;
@@ -423,7 +423,7 @@ std::string Client::stor(const std::string& local_path,
         {
             SSL_shutdown(data_ssl);
             SSL_free(data_ssl);
-            ::close(data_fd);
+            obn::plat::close_socket(data_fd);
             return "data write: " + openssl_last_error();
         }
         sent += static_cast<std::uint64_t>(n);
@@ -436,7 +436,7 @@ std::string Client::stor(const std::string& local_path,
                 if (!progress(sent, total)) {
                     SSL_shutdown(data_ssl);
                     SSL_free(data_ssl);
-                    ::close(data_fd);
+                    obn::plat::close_socket(data_fd);
                     return "upload cancelled";
                 }
             }
@@ -449,7 +449,7 @@ std::string Client::stor(const std::string& local_path,
     // it before reading the reply.
     SSL_shutdown(data_ssl);
     SSL_free(data_ssl);
-    ::close(data_fd);
+    obn::plat::close_socket(data_fd);
 
     std::string body;
     int done = p_->read_reply(&body);
@@ -463,18 +463,18 @@ std::string Client::stor(const std::string& local_path,
 std::string Client::list(const std::string& path, std::string& err_out)
 {
     std::string err;
-    int data_fd = open_data_tcp(*p_, p_->host, err);
-    if (data_fd < 0) { err_out = err; return {}; }
+    socket_t data_fd = open_data_tcp(*p_, p_->host, err);
+    if (!obn::plat::is_valid_socket(data_fd)) { err_out = err; return {}; }
 
     int code = p_->send_cmd(path.empty() ? "LIST" : "LIST " + path);
     if (code != 150 && code != 125) {
-        ::close(data_fd);
+        obn::plat::close_socket(data_fd);
         err_out = "LIST rejected: code=" + std::to_string(code);
         return {};
     }
 
     SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { ::close(data_fd); err_out = err; return {}; }
+    if (!data_ssl) { obn::plat::close_socket(data_fd); err_out = err; return {}; }
 
     std::string body;
     char buf[1024];
@@ -485,7 +485,7 @@ std::string Client::list(const std::string& path, std::string& err_out)
     }
     SSL_shutdown(data_ssl);
     SSL_free(data_ssl);
-    ::close(data_fd);
+    obn::plat::close_socket(data_fd);
 
     int done = p_->read_reply(nullptr);
     if (done != 226 && done != 250) {
@@ -526,16 +526,16 @@ std::string Client::size(const std::string& remote_path,
 std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
 {
     std::string err;
-    int data_fd = open_data_tcp(*p_, p_->host, err);
-    if (data_fd < 0) return err;
+    socket_t data_fd = open_data_tcp(*p_, p_->host, err);
+    if (!obn::plat::is_valid_socket(data_fd)) return err;
 
     int code = p_->send_cmd("RETR " + remote_path);
     if (code != 150 && code != 125) {
-        ::close(data_fd);
+        obn::plat::close_socket(data_fd);
         return "RETR rejected: code=" + std::to_string(code);
     }
     SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { ::close(data_fd); return err; }
+    if (!data_ssl) { obn::plat::close_socket(data_fd); return err; }
 
     char buf[64 * 1024];
     bool aborted = false;
@@ -555,7 +555,7 @@ std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
     }
     SSL_shutdown(data_ssl);
     SSL_free(data_ssl);
-    ::close(data_fd);
+    obn::plat::close_socket(data_fd);
 
     std::string body;
     int done = p_->read_reply(&body);
@@ -578,16 +578,16 @@ std::string Client::list_entries(const std::string& path,
     // command. Don't bother trying -- just issue LIST. parse_ls_line
     // recovers size / name / is_dir / mtime from the `ls -l` output.
     std::string err;
-    int data_fd = open_data_tcp(*p_, p_->host, err);
-    if (data_fd < 0) return err;
+    socket_t data_fd = open_data_tcp(*p_, p_->host, err);
+    if (!obn::plat::is_valid_socket(data_fd)) return err;
 
     int code = p_->send_cmd(path.empty() ? "LIST" : "LIST " + path);
     if (code != 150 && code != 125) {
-        ::close(data_fd);
+        obn::plat::close_socket(data_fd);
         return "LIST rejected: code=" + std::to_string(code);
     }
     SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { ::close(data_fd); return err; }
+    if (!data_ssl) { obn::plat::close_socket(data_fd); return err; }
     std::string body;
     char buf[1024];
     while (true) {
@@ -597,7 +597,7 @@ std::string Client::list_entries(const std::string& path,
     }
     SSL_shutdown(data_ssl);
     SSL_free(data_ssl);
-    ::close(data_fd);
+    obn::plat::close_socket(data_fd);
     int done = p_->read_reply(nullptr);
     if (done != 226 && done != 250) return "LIST finish code=" + std::to_string(done);
 
@@ -635,7 +635,7 @@ void Client::quit()
     if (p_->ctrl_ssl) {
         // Best-effort: send QUIT if the channel is still usable, then
         // shutdown TLS.
-        if (p_->ctrl_fd >= 0) {
+        if (obn::plat::is_valid_socket(p_->ctrl_fd)) {
             std::string wire = "QUIT\r\n";
             ssl_write_all(p_->ctrl_ssl, p_->ctrl_fd, wire.data(), wire.size(), 1000);
             // Drain the 221 reply if it arrives promptly.
@@ -646,7 +646,10 @@ void Client::quit()
         SSL_free(p_->ctrl_ssl);
         p_->ctrl_ssl = nullptr;
     }
-    if (p_->ctrl_fd >= 0) { ::close(p_->ctrl_fd); p_->ctrl_fd = -1; }
+    if (obn::plat::is_valid_socket(p_->ctrl_fd)) {
+        obn::plat::close_socket(p_->ctrl_fd);
+        p_->ctrl_fd = kInvalidSocket;
+    }
     if (p_->ctx) { SSL_CTX_free(p_->ctx); p_->ctx = nullptr; }
 }
 

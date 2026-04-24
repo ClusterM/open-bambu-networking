@@ -1,5 +1,7 @@
 #pragma once
 
+#include "obn/platform.hpp"
+
 #include <atomic>
 #include <functional>
 #include <map>
@@ -64,7 +66,7 @@ public:
 private:
     void run_();
 
-    int                  fd_{-1};
+    obn::plat::socket_t  fd_{obn::plat::kInvalidSocket};
     std::thread          worker_;
     std::atomic<bool>    running_{false};
     std::mutex           cb_mu_;

@@ -1,12 +1,7 @@
 #include "obn/ssdp.hpp"
 
 #include "obn/log.hpp"
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "obn/platform.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -192,20 +187,27 @@ bool Discovery::start(int port, OnMessage cb)
         cb_ = std::move(cb);
     }
 
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        OBN_ERROR("ssdp: socket() failed: %s", std::strerror(errno));
+    obn::plat::ensure_sockets_initialised();
+
+    obn::plat::socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (!obn::plat::is_valid_socket(fd)) {
+        OBN_ERROR("ssdp: socket() failed: %s",
+                  obn::plat::socket_strerror(obn::plat::socket_last_error()).c_str());
         return false;
     }
 
     int yes = 1;
-    if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-        OBN_WARN("ssdp: SO_REUSEADDR failed: %s", std::strerror(errno));
+    if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
+        OBN_WARN("ssdp: SO_REUSEADDR failed: %s",
+                 obn::plat::socket_strerror(obn::plat::socket_last_error()).c_str());
     }
     // Required on Linux to receive packets destined for 255.255.255.255 on
-    // sockets bound to INADDR_ANY.
-    if (::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)) < 0) {
-        OBN_WARN("ssdp: SO_BROADCAST failed: %s", std::strerror(errno));
+    // sockets bound to INADDR_ANY. Harmless on Windows.
+    if (::setsockopt(fd, SOL_SOCKET, SO_BROADCAST,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
+        OBN_WARN("ssdp: SO_BROADCAST failed: %s",
+                 obn::plat::socket_strerror(obn::plat::socket_last_error()).c_str());
     }
 
     sockaddr_in addr{};
@@ -214,8 +216,9 @@ bool Discovery::start(int port, OnMessage cb)
     addr.sin_port        = htons(static_cast<uint16_t>(port));
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         OBN_ERROR("ssdp: bind(:%d) failed: %s (another SSDP listener running?)",
-                  port, std::strerror(errno));
-        ::close(fd);
+                  port,
+                  obn::plat::socket_strerror(obn::plat::socket_last_error()).c_str());
+        obn::plat::close_socket(fd);
         return false;
     }
 
@@ -224,9 +227,10 @@ bool Discovery::start(int port, OnMessage cb)
     ip_mreq mreq{};
     mreq.imr_multiaddr.s_addr = ::inet_addr("239.255.255.250");
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                     reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
         OBN_DEBUG("ssdp: IP_ADD_MEMBERSHIP 239.255.255.250 failed (ignored): %s",
-                  std::strerror(errno));
+                  obn::plat::socket_strerror(obn::plat::socket_last_error()).c_str());
     }
 
     fd_ = fd;
@@ -240,11 +244,16 @@ void Discovery::stop()
 {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
-    int fd = fd_;
-    fd_ = -1;
+    obn::plat::socket_t fd = fd_;
+    fd_ = obn::plat::kInvalidSocket;
     // Closing the socket wakes up recvfrom() with EBADF / zero bytes.
-    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
-    if (fd >= 0) ::close(fd);
+#if defined(_WIN32)
+    constexpr int kShutdownBoth = SD_BOTH;
+#else
+    constexpr int kShutdownBoth = SHUT_RDWR;
+#endif
+    if (obn::plat::is_valid_socket(fd)) ::shutdown(fd, kShutdownBoth);
+    if (obn::plat::is_valid_socket(fd)) obn::plat::close_socket(fd);
 
     if (worker_.joinable()) worker_.join();
 
@@ -262,13 +271,15 @@ void Discovery::run_()
     while (running_.load(std::memory_order_acquire)) {
         sockaddr_in src{};
         socklen_t   slen = sizeof(src);
-        ssize_t n = ::recvfrom(fd_, buf.data(), kBufSize, 0,
-                               reinterpret_cast<sockaddr*>(&src), &slen);
+        int n = ::recvfrom(fd_, buf.data(), static_cast<int>(kBufSize), 0,
+                           reinterpret_cast<sockaddr*>(&src), &slen);
         if (n <= 0) {
             if (!running_.load(std::memory_order_acquire)) break;
-            if (errno == EINTR) continue;
-            if (errno == EBADF) break;
-            OBN_WARN("ssdp: recvfrom failed: %s", std::strerror(errno));
+            int e = obn::plat::socket_last_error();
+            if (e == obn::plat::kEINTR) continue;
+            if (e == obn::plat::kEBADF) break;
+            OBN_WARN("ssdp: recvfrom failed: %s",
+                     obn::plat::socket_strerror(e).c_str());
             break;
         }
 

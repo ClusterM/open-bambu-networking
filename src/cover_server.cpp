@@ -12,15 +12,16 @@
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include "obn/cover_cache.hpp"
 #include "obn/log.hpp"
+#include "obn/platform.hpp"
+
+#if defined(_WIN32)
+// Windows recv/send return int and take int buffer sizes. The POSIX ssize_t
+// doesn't exist; we alias to int so the same code compiles without further
+// #ifdefs inside the request handlers.
+using ssize_t = int;
+#endif
 
 namespace fs = std::filesystem;
 
@@ -53,31 +54,33 @@ std::string read_file(const fs::path& p)
     return body;
 }
 
-void send_all(int fd, const std::string& data)
+void send_all(obn::plat::socket_t fd, const std::string& data)
 {
     std::size_t off = 0;
     while (off < data.size()) {
-        ssize_t n = ::send(fd, data.data() + off, data.size() - off, 0);
+        int n = ::send(fd, data.data() + off,
+                       static_cast<int>(data.size() - off), 0);
         if (n <= 0) return;
         off += static_cast<std::size_t>(n);
     }
 }
 
-void send_status(int fd, int code, const std::string& reason)
+void send_status(obn::plat::socket_t fd, int code, const std::string& reason)
 {
     std::string r = "HTTP/1.1 " + std::to_string(code) + " " + reason +
                     "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
     send_all(fd, r);
 }
 
-void handle_one(int fd)
+void handle_one(obn::plat::socket_t fd)
 {
     // Read request header into a bounded buffer. 4 KB is plenty for a
     // line like "GET /cover/cover-XXXXXXXX-p1.png HTTP/1.1".
     char  buf[4096];
     std::size_t got = 0;
     while (got < sizeof(buf) - 1) {
-        ssize_t n = ::recv(fd, buf + got, sizeof(buf) - 1 - got, 0);
+        int n = ::recv(fd, buf + got,
+                       static_cast<int>(sizeof(buf) - 1 - got), 0);
         if (n <= 0) break;
         got += static_cast<std::size_t>(n);
         buf[got] = 0;
@@ -167,29 +170,35 @@ int Server::start()
 {
     if (running_.load()) return 0;
 
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return errno ? errno : -1;
+    obn::plat::ensure_sockets_initialised();
+
+    obn::plat::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!obn::plat::is_valid_socket(fd)) {
+        int e = obn::plat::socket_last_error();
+        return e ? e : -1;
+    }
     int on = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                 reinterpret_cast<const char*>(&on), sizeof(on));
 
     sockaddr_in sa{};
     sa.sin_family      = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sa.sin_port        = 0;
     if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-        int e = errno;
-        ::close(fd);
+        int e = obn::plat::socket_last_error();
+        obn::plat::close_socket(fd);
         return e ? e : -1;
     }
     if (::listen(fd, 8) != 0) {
-        int e = errno;
-        ::close(fd);
+        int e = obn::plat::socket_last_error();
+        obn::plat::close_socket(fd);
         return e ? e : -1;
     }
     socklen_t sl = sizeof(sa);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) {
-        int e = errno;
-        ::close(fd);
+        int e = obn::plat::socket_last_error();
+        obn::plat::close_socket(fd);
         return e ? e : -1;
     }
     listen_fd_ = fd;
@@ -203,43 +212,61 @@ int Server::start()
 void Server::stop()
 {
     if (!running_.exchange(false)) return;
-    int fd = listen_fd_;
-    listen_fd_ = -1;
-    if (fd >= 0) {
-        ::shutdown(fd, SHUT_RDWR);
-        ::close(fd);
+    obn::plat::socket_t fd = listen_fd_;
+    listen_fd_ = obn::plat::kInvalidSocket;
+#if defined(_WIN32)
+    constexpr int kShutdownBoth = SD_BOTH;
+#else
+    constexpr int kShutdownBoth = SHUT_RDWR;
+#endif
+    if (obn::plat::is_valid_socket(fd)) {
+        ::shutdown(fd, kShutdownBoth);
+        obn::plat::close_socket(fd);
     }
     if (accept_thread_.joinable()) accept_thread_.join();
 }
 
 void Server::accept_loop()
 {
+#if defined(_WIN32)
+    constexpr int kShutdownWrite = SD_SEND;
+#else
+    constexpr int kShutdownWrite = SHUT_WR;
+#endif
     while (running_.load()) {
         sockaddr_in ca{};
         socklen_t   cl = sizeof(ca);
-        int c = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ca), &cl);
-        if (c < 0) {
+        obn::plat::socket_t c =
+            ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ca), &cl);
+        if (!obn::plat::is_valid_socket(c)) {
             if (!running_.load()) break;
-            if (errno == EINTR) continue;
+            if (obn::plat::socket_last_error() == obn::plat::kEINTR) continue;
             break;
         }
         char ip[INET_ADDRSTRLEN] = {};
         ::inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         OBN_DEBUG("cover_server: accept from %s:%d", ip, ntohs(ca.sin_port));
-        std::thread([c]() {
+        std::thread([c, kShutdownWrite]() {
             handle_one(c);
             // Graceful HTTP close: send FIN (shutdown(WR)) so libsoup gets
             // the full body, then drain any trailing bytes the client
             // might send (RST-on-close otherwise eats the last segments).
             // SO_LINGER as a safety net caps the wait at 2s per connection.
             linger lo{1, 2};
-            ::setsockopt(c, SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
-            ::shutdown(c, SHUT_WR);
+            ::setsockopt(c, SOL_SOCKET, SO_LINGER,
+                         reinterpret_cast<const char*>(&lo), sizeof(lo));
+            ::shutdown(c, kShutdownWrite);
             char  sink[256];
+#if defined(_WIN32)
+            // Winsock SO_RCVTIMEO takes milliseconds as DWORD, not timeval.
+            DWORD tv = 2000;
+#else
             timeval tv{2, 0};
-            ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+            ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<const char*>(&tv), sizeof(tv));
             while (::recv(c, sink, sizeof(sink), 0) > 0) { /* drain */ }
-            ::close(c);
+            obn::plat::close_socket(c);
         }).detach();
     }
 }

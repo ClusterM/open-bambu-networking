@@ -14,6 +14,8 @@
 // requests over the lifetime of a print, so a thread pool would be
 // overkill.
 
+#include "obn/platform.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -47,8 +49,8 @@ public:
 private:
     void accept_loop();
 
-    int              listen_fd_ = -1;
-    std::atomic<int> port_{0};
+    obn::plat::socket_t listen_fd_{obn::plat::kInvalidSocket};
+    std::atomic<int>    port_{0};
     std::atomic<bool> running_{false};
     std::thread      accept_thread_;
 };

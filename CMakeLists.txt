@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Allow the top-level script(s) to ship a vcpkg toolchain without the
+# caller having to remember -DCMAKE_TOOLCHAIN_FILE=... A manifest at
+# the repo root takes precedence (that is what configure.ps1 emits).
+if(WIN32 AND NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file" FORCE)
+endif()
+
 project(open-bambu-networking
     VERSION 0.1.0
     DESCRIPTION "Open-source replacement for Bambu Studio's bambu_networking plugin"
@@ -6,11 +15,20 @@ project(open-bambu-networking
 )
 
 # Default install location: same tree Bambu Studio uses on Linux (~/.config/BambuStudio).
-# Override with -DCMAKE_INSTALL_PREFIX=... when needed.
+# On Windows it sits under %APPDATA%/BambuStudio. Override with
+# -DCMAKE_INSTALL_PREFIX=... when needed.
 if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
     if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
         if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
             set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.config/BambuStudio"
+                CACHE PATH "Install prefix (plugins/ and ota/plugins/ under it)" FORCE)
+        endif()
+    endif()
+elseif(WIN32 AND NOT CMAKE_CROSSCOMPILING)
+    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+        if(DEFINED ENV{APPDATA} AND NOT "$ENV{APPDATA}" STREQUAL "")
+            file(TO_CMAKE_PATH "$ENV{APPDATA}/BambuStudio" _obn_default_prefix)
+            set(CMAKE_INSTALL_PREFIX "${_obn_default_prefix}"
                 CACHE PATH "Install prefix (plugins/ and ota/plugins/ under it)" FORCE)
         endif()
     endif()
@@ -126,34 +144,76 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-# Bambu Studio is built against libstdc++ new C++11 ABI; match it.
-add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+if(NOT WIN32)
+    # Bambu Studio is built against libstdc++ new C++11 ABI; match it.
+    # MSVC doesn't use libstdc++, so this define is Linux-only.
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+endif()
 
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+if(MSVC)
+    # /W4 is the closest MSVC analogue to -Wall -Wextra. Silence a few
+    # warnings that would otherwise drown the build log without adding
+    # any value:
+    #   C4100: unreferenced formal parameter  (we pepper these in the
+    #          ABI so Studio's function-pointer layout keeps matching).
+    #   C4101: unreferenced local variable
+    #   C4127: conditional expression is constant
+    #   C4244/C4267: size_t/int narrowing noise in legacy zlib/jpeg APIs.
+    #   C4996: "deprecated" POSIX/CRT shims (our platform layer abstracts
+    #          them explicitly, we don't want MSVC scolding every call).
+    add_compile_options(/W4 /wd4100 /wd4101 /wd4127 /wd4244 /wd4267 /wd4996)
+    add_compile_definitions(
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN)
+    # UTF-8 source + runtime literals. MSVC defaults to the ACP which
+    # mangles the non-ASCII log strings we sometimes echo from printers.
+    add_compile_options(/utf-8)
+else()
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Hide every symbol by default, explicitly export only the ABI functions via
-# __attribute__((visibility("default"))). Keeps the library slim and avoids
-# name clashes with Studio's own symbols.
-add_compile_options(
-    -fvisibility=hidden
-    $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
-)
+if(NOT MSVC)
+    # Hide every symbol by default, explicitly export only the ABI
+    # functions via __attribute__((visibility("default"))). Keeps the
+    # library slim and avoids name clashes with Studio's own symbols.
+    # MSVC does the equivalent automatically via __declspec(dllexport).
+    add_compile_options(
+        -fvisibility=hidden
+        $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
+    )
+endif()
 
 # --------------------------------------------------------------------------
-# libbambu_networking.so  (main plugin)
+# libbambu_networking.so / bambu_networking.dll  (main plugin)
 # --------------------------------------------------------------------------
 
-find_package(PkgConfig REQUIRED)
+# pkg-config is the standard way we resolve deps on Linux. On Windows we
+# rely on vcpkg-provided find_package() scripts exclusively, since the
+# MSVC toolchain has no pkg-config shipped with it.
+if(NOT WIN32)
+    find_package(PkgConfig REQUIRED)
+endif()
 find_package(OpenSSL REQUIRED)
 
 if(OBN_VENDOR_MOSQUITTO AND OBN_STATIC_MOSQUITTO)
     message(WARNING
         "OBN_VENDOR_MOSQUITTO and OBN_STATIC_MOSQUITTO are both ON — "
         "using the bundled mosquitto build; system static libmosquitto (pkg-config) is ignored.")
+endif()
+
+if(WIN32 AND NOT OBN_VENDOR_MOSQUITTO)
+    # libmosquitto has no first-class vcpkg port with static+TLS that we
+    # can rely on across triplets, so on Windows we always vendor it via
+    # FetchContent unless the user opts out explicitly by setting
+    # OBN_VENDOR_MOSQUITTO=OFF (which then requires them to provide a
+    # libmosquitto import library on their own).
+    set(OBN_VENDOR_MOSQUITTO ON CACHE BOOL "Bundle libmosquitto via FetchContent" FORCE)
 endif()
 
 if(OBN_VENDOR_MOSQUITTO)
@@ -203,7 +263,15 @@ if(NOT OBN_VENDOR_MOSQUITTO)
     endif()
 endif()
 
-pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+if(WIN32)
+    # vcpkg's CURL port ships a CMake config target; we don't need
+    # pkg-config. Ask for HTTP, HTTPS, FTP, FTPS transports explicitly
+    # because the default port only advertises HTTP.
+    find_package(CURL REQUIRED)
+else()
+    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+endif()
+
 # zlib is shared between bambu_networking (cover_cache: unpacks
 # Metadata/plate_N.png out of /cache/<name>.3mf to show it as the
 # printing-task thumbnail) and BambuSource (same unpack, but for the
@@ -241,6 +309,7 @@ add_library(bambu_networking SHARED
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
+    src/platform.cpp
     src/print_job.cpp
     src/ssdp.cpp
     src/zip_reader.cpp
@@ -253,27 +322,105 @@ target_compile_definitions(bambu_networking PRIVATE
     OBN_FT_FTPS_FASTPATH=$<BOOL:${OBN_FT_FTPS_FASTPATH}>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
-target_link_libraries(bambu_networking PRIVATE
-    obn_mosquitto_iface
-    PkgConfig::CURL
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ZLIB::ZLIB
-)
+if(WIN32)
+    target_link_libraries(bambu_networking PRIVATE
+        obn_mosquitto_iface
+        CURL::libcurl
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+        # Winsock, IPHelper (for SSDP multi-IF NICs), Crypt32 (cert store),
+        # Bcrypt (OpenSSL's Schannel fallback + RAND_bytes on some configs).
+        ws2_32
+        iphlpapi
+        crypt32
+        bcrypt
+    )
+else()
+    target_link_libraries(bambu_networking PRIVATE
+        obn_mosquitto_iface
+        PkgConfig::CURL
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+endif()
 
-# No "lib" prefix rename: output is literally "libbambu_networking.so"
-set_target_properties(bambu_networking PROPERTIES
-    OUTPUT_NAME "bambu_networking"
-    PREFIX      "lib"
-)
+# Output is "libbambu_networking.so" on Linux and "bambu_networking.dll"
+# on Windows (no "lib" prefix, since Studio loads it by that name).
+if(WIN32)
+    set_target_properties(bambu_networking PROPERTIES
+        OUTPUT_NAME "bambu_networking"
+        PREFIX      ""
+    )
+    # mosquitto_common.dll is an imposed transitive dep of libmosquitto
+    # (FetchContent-built separately above) and by default lands in
+    # _deps/eclipse_mosquitto-build/libcommon/$<CONFIG>/. That is not on
+    # the loader search path for our plugin, so copy it next to
+    # bambu_networking.dll after each build.
+    if(TARGET mosquitto_common)
+        add_custom_command(TARGET bambu_networking POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:mosquitto_common>
+                $<TARGET_FILE_DIR:bambu_networking>
+            COMMENT "obn: staging mosquitto_common.dll next to bambu_networking.dll"
+        )
+    endif()
+else()
+    set_target_properties(bambu_networking PROPERTIES
+        OUTPUT_NAME "bambu_networking"
+        PREFIX      "lib"
+    )
+endif()
 
 # --------------------------------------------------------------------------
 # libBambuSource.so  (camera MJPG tunnel for P1/A1; consumed by Studio's
 # gstbambusrc element).
 # --------------------------------------------------------------------------
 
-pkg_check_modules(GST      REQUIRED IMPORTED_TARGET gstreamer-1.0)
-pkg_check_modules(GST_APP  REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+# Camera backend selection:
+#   - Linux defaults to GStreamer (same deps Studio's own gstbambusrc pulls in).
+#   - Windows defaults to ffmpeg/libav via vcpkg (no GStreamer dependency).
+# The OBN_CAMERA_BACKEND cache variable lets a packager override the
+# default on either platform.
+if(WIN32)
+    set(_obn_camera_default "ffmpeg")
+else()
+    set(_obn_camera_default "gstreamer")
+endif()
+set(OBN_CAMERA_BACKEND "${_obn_camera_default}"
+    CACHE STRING "Camera backend in BambuSource (gstreamer|ffmpeg)")
+set_property(CACHE OBN_CAMERA_BACKEND PROPERTY STRINGS gstreamer ffmpeg)
+
+if(OBN_CAMERA_BACKEND STREQUAL "gstreamer")
+    pkg_check_modules(GST     REQUIRED IMPORTED_TARGET gstreamer-1.0)
+    pkg_check_modules(GST_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+elseif(OBN_CAMERA_BACKEND STREQUAL "ffmpeg")
+    # vcpkg's ffmpeg port exposes per-feature CMake packages. We need
+    # the three pieces we use in stubs/BambuSource.cpp (muxers for
+    # RTSP/RTP, the H.264 decoder + MJPEG encoder in libavcodec, and
+    # swscale for the color-space conversion before MJPEG encode).
+    find_package(FFMPEG CONFIG QUIET)
+    if(NOT FFMPEG_FOUND)
+        # vcpkg exposes per-component packages too; fall back to those.
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
+            pkg_check_modules(AVCODEC  REQUIRED IMPORTED_TARGET libavcodec)
+            pkg_check_modules(AVUTIL   REQUIRED IMPORTED_TARGET libavutil)
+            pkg_check_modules(SWSCALE  REQUIRED IMPORTED_TARGET libswscale)
+        else()
+            message(FATAL_ERROR
+                "ffmpeg backend requested but neither find_package(FFMPEG) nor "
+                "pkg-config was able to locate libav*. On Windows, run the "
+                "top-level configure.ps1 so vcpkg fetches ffmpeg[core,avcodec,"
+                "avformat,swscale].")
+        endif()
+    endif()
+else()
+    message(FATAL_ERROR "OBN_CAMERA_BACKEND must be 'gstreamer' or 'ffmpeg' (got '${OBN_CAMERA_BACKEND}')")
+endif()
+
 # zlib is pulled in for the Metadata/plate_*.png unpacker used by
 # PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
 find_package(ZLIB REQUIRED)
@@ -281,8 +428,13 @@ find_package(ZLIB REQUIRED)
 # decode the /timelapse/thumbnail/*.jpg sidecars - both get padded to
 # the aspect of the Studio tile they're shown in (see
 # letterbox_image_to_aspect in stubs/BambuSource.cpp).
-pkg_check_modules(PNG      REQUIRED IMPORTED_TARGET libpng)
-pkg_check_modules(JPEG     REQUIRED IMPORTED_TARGET libjpeg)
+if(WIN32)
+    find_package(PNG  REQUIRED)
+    find_package(JPEG REQUIRED)
+else()
+    pkg_check_modules(PNG  REQUIRED IMPORTED_TARGET libpng)
+    pkg_check_modules(JPEG REQUIRED IMPORTED_TARGET libjpeg)
+endif()
 
 # BambuSource ships the PrinterFileSystem CTRL bridge (FTPS-backed file
 # browser for X1/P1S/P2S/A-series in LAN mode), so it needs ftps + json +
@@ -294,27 +446,68 @@ add_library(BambuSource SHARED
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
+    src/platform.cpp
     src/zip_reader.cpp
 )
 target_include_directories(BambuSource PRIVATE include)
 target_compile_definitions(BambuSource PRIVATE
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
-set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
-target_link_libraries(BambuSource PRIVATE
-    OpenSSL::SSL OpenSSL::Crypto
-    PkgConfig::GST PkgConfig::GST_APP
-    ZLIB::ZLIB
-    PkgConfig::PNG
-    PkgConfig::JPEG
-)
+if(OBN_CAMERA_BACKEND STREQUAL "gstreamer")
+    target_compile_definitions(BambuSource PRIVATE OBN_CAMERA_GSTREAMER=1)
+else()
+    target_compile_definitions(BambuSource PRIVATE OBN_CAMERA_FFMPEG=1)
+endif()
+
+if(WIN32)
+    set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "")
+else()
+    set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
+endif()
+
+if(WIN32)
+    target_link_libraries(BambuSource PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        ZLIB::ZLIB
+        PNG::PNG
+        JPEG::JPEG
+        ws2_32 iphlpapi crypt32 bcrypt
+    )
+else()
+    target_link_libraries(BambuSource PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        ZLIB::ZLIB
+        PkgConfig::PNG
+        PkgConfig::JPEG
+    )
+endif()
+
+if(OBN_CAMERA_BACKEND STREQUAL "gstreamer")
+    target_link_libraries(BambuSource PRIVATE PkgConfig::GST PkgConfig::GST_APP)
+elseif(OBN_CAMERA_BACKEND STREQUAL "ffmpeg")
+    if(FFMPEG_FOUND)
+        target_include_directories(BambuSource PRIVATE ${FFMPEG_INCLUDE_DIRS})
+        target_link_libraries(BambuSource PRIVATE ${FFMPEG_LIBRARIES})
+    else()
+        target_link_libraries(BambuSource PRIVATE
+            PkgConfig::AVFORMAT
+            PkgConfig::AVCODEC
+            PkgConfig::AVUTIL
+            PkgConfig::SWSCALE
+        )
+    endif()
+endif()
 
 # --------------------------------------------------------------------------
-# liblive555.so  (stub; used by the real BambuSource internally)
+# live555.so / .dll  (stub; used by the real BambuSource internally)
 # --------------------------------------------------------------------------
 
 add_library(live555 SHARED stubs/live555.cpp)
-set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
+if(WIN32)
+    set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "")
+else()
+    set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
+endif()
 
 # --------------------------------------------------------------------------
 # install (copies into <prefix>/plugins/)
@@ -333,7 +526,24 @@ install(CODE "
 
 install(TARGETS bambu_networking BambuSource live555
     LIBRARY DESTINATION plugins
+    RUNTIME DESTINATION plugins
 )
+
+# On Windows the plugin DLLs carry transitive references to vcpkg runtime
+# DLLs (libcurl / openssl / zlib / libpng / libjpeg / ffmpeg / pthreadVC3)
+# and to mosquitto_common.dll (FetchContent-built above). None of those
+# ship with Bambu Studio, so stage them alongside the plugin. vcpkg's
+# X_VCPKG_APPLOCAL_DEPS_INSTALL option handles the first group when the
+# toolchain is active; for the FetchContent-built mosquitto_common we
+# invoke install(FILES) explicitly.
+if(WIN32)
+    set(VCPKG_APPLOCAL_DEPS ON CACHE BOOL "" FORCE)
+    set(X_VCPKG_APPLOCAL_DEPS_INSTALL ON CACHE BOOL "" FORCE)
+    if(TARGET mosquitto_common)
+        install(FILES $<TARGET_FILE:mosquitto_common>
+            DESTINATION plugins)
+    endif()
+endif()
 
 # Studio's PresetUpdater expects this JSON to declare the cached version in
 # <data_dir>/ota/plugins/; we ship the same file so the updater trusts our
@@ -349,6 +559,59 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json
 # install time, but only when installing to the default BambuStudio
 # data dir - otherwise the prefix is clearly a staging tree and we
 # should not touch the user's live config.
+if(OBN_PATCH_STUDIO_CONF AND WIN32)
+    install(CODE [[
+        set(_appdata "$ENV{APPDATA}")
+        if(_appdata STREQUAL "")
+            message(STATUS "obn: %APPDATA% is not set, skipping BambuStudio.conf patch")
+        else()
+            file(TO_CMAKE_PATH "${_appdata}/BambuStudio" _expected)
+            string(REPLACE "\\" "/" _prefix_norm "${CMAKE_INSTALL_PREFIX}")
+            if(NOT _prefix_norm STREQUAL _expected)
+                message(STATUS
+                    "obn: install prefix (${CMAKE_INSTALL_PREFIX}) is not ${_expected}; "
+                    "BambuStudio.conf is untouched. Edit it by hand if needed.")
+            else()
+                set(_conf "${_expected}/BambuStudio.conf")
+                if(NOT EXISTS "${_conf}")
+                    message(STATUS
+                        "obn: ${_conf} does not exist yet -- launch Bambu Studio once "
+                        "to create it, then re-run 'cmake --install'.")
+                else()
+                    file(READ "${_conf}" _orig)
+                    # Studio appends an MD5 checksum line at the bottom
+                    # (format "# <32-hex-digits>") which JSON parsers reject.
+                    # Strip it before we parse; it will be regenerated by
+                    # Studio on next startup.
+                    string(REGEX REPLACE "\r?\n#[ \t]*[0-9a-fA-F]+[ \t\r\n]*$" "\n" _body "${_orig}")
+                    string(JSON _app_type ERROR_VARIABLE _err TYPE "${_body}" app)
+                    if(_err OR NOT _app_type STREQUAL "OBJECT")
+                        message(WARNING
+                            "obn: ${_conf} has no top-level \"app\" object; "
+                            "skipping patch. Error: ${_err}")
+                    else()
+                        string(JSON _body SET "${_body}"
+                            app installed_networking "\"1\"")
+                        string(JSON _body SET "${_body}"
+                            app update_network_plugin "\"false\"")
+                        string(JSON _body SET "${_body}"
+                            app ignore_module_cert "\"1\"")
+                        if(NOT _body STREQUAL _orig)
+                            file(WRITE "${_conf}.obn-bak" "${_orig}")
+                            file(WRITE "${_conf}" "${_body}")
+                            message(STATUS
+                                "obn: patched ${_conf} "
+                                "(backup saved to ${_conf}.obn-bak)")
+                        else()
+                            message(STATUS "obn: ${_conf} already patched")
+                        endif()
+                    endif()
+                endif()
+            endif()
+        endif()
+    ]])
+endif()
+
 if(OBN_PATCH_STUDIO_CONF AND UNIX AND NOT APPLE)
     install(CODE [[
         set(_home "$ENV{HOME}")
@@ -409,7 +672,9 @@ if(OBN_BUILD_TESTS)
     enable_testing()
     add_executable(probe_plugin tests/probe_plugin.cpp)
     target_include_directories(probe_plugin PRIVATE include)
-    target_link_libraries(probe_plugin PRIVATE dl)
+    if(NOT WIN32)
+        target_link_libraries(probe_plugin PRIVATE dl)
+    endif()
     add_test(NAME plugin_symbols
         COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
 
@@ -418,21 +683,33 @@ if(OBN_BUILD_TESTS)
     # obn::Agent directly.
     add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
         src/log.cpp
+        src/platform.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
+    if(WIN32)
+        target_link_libraries(ssdp_listener_test PRIVATE ws2_32 iphlpapi)
+    endif()
 
     add_executable(ftps_live_test tests/ftps_live_test.cpp
         src/ftps.cpp
-        src/log.cpp)
+        src/log.cpp
+        src/platform.cpp)
     target_include_directories(ftps_live_test PRIVATE include)
     target_link_libraries(ftps_live_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(ftps_live_test PRIVATE ws2_32 iphlpapi crypt32)
+    endif()
 
     # Hermetic unit test for src/ftps_parse.hpp. Exercises the `ls -l`
     # parser that populates Entry::mtime -- a regression there causes
     # every file in Studio's storage tab to show up as 1970 (Bambu
     # firmware has no MLSD, so LIST is the only thing we have).
-    add_executable(ftps_parse_test tests/ftps_parse_test.cpp)
+    add_executable(ftps_parse_test tests/ftps_parse_test.cpp
+        src/platform.cpp)
     target_include_directories(ftps_parse_test PRIVATE include src)
+    if(WIN32)
+        target_link_libraries(ftps_parse_test PRIVATE ws2_32)
+    endif()
     add_test(NAME ftps_parse COMMAND ftps_parse_test)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
@@ -450,6 +727,7 @@ if(OBN_BUILD_TESTS)
         src/lan_session.cpp
         src/log.cpp
         src/mqtt_client.cpp
+        src/platform.cpp
         src/ssdp.cpp
         src/zip_reader.cpp)
     target_include_directories(lan_live_test PRIVATE include)
@@ -457,12 +735,23 @@ if(OBN_BUILD_TESTS)
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
-    target_link_libraries(lan_live_test PRIVATE
-        obn_mosquitto_iface
-        PkgConfig::CURL
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        ZLIB::ZLIB
-    )
+    if(WIN32)
+        target_link_libraries(lan_live_test PRIVATE
+            obn_mosquitto_iface
+            CURL::libcurl
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            ZLIB::ZLIB
+            ws2_32 iphlpapi crypt32 bcrypt
+        )
+    else()
+        target_link_libraries(lan_live_test PRIVATE
+            obn_mosquitto_iface
+            PkgConfig::CURL
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            ZLIB::ZLIB
+        )
+    endif()
     add_test(NAME lan_live COMMAND lan_live_test)
 endif()

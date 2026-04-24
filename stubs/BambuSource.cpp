@@ -62,20 +62,42 @@
 // tunnel; we only need to be safe against the logger callback being fired
 // from that same thread. No global locks are held.
 
+// Camera backend selection. Exactly one of these two must be defined at
+// build time. On Linux we default to GStreamer (fast, well-tested, shares
+// codec plugins with Studio's own gstbambusrc). On Windows we default to
+// ffmpeg/libav since GStreamer is a huge dependency on MSVC and vcpkg's
+// gst-plugins-bad packaging is historically fragile. Both paths produce
+// identical Bambu_Samples once frames reach Studio.
+#if !defined(OBN_CAMERA_GSTREAMER) && !defined(OBN_CAMERA_FFMPEG)
+#  if defined(_WIN32)
+#    define OBN_CAMERA_FFMPEG 1
+#  else
+#    define OBN_CAMERA_GSTREAMER 1
+#  endif
+#endif
+
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
+#if defined(OBN_CAMERA_GSTREAMER)
+#  include <gst/gst.h>
+#  include <gst/app/gstappsink.h>
+#  include <dlfcn.h>
+#endif
 
-#include <dlfcn.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#if defined(OBN_CAMERA_FFMPEG)
+extern "C" {
+#  include <libavformat/avformat.h>
+#  include <libavcodec/avcodec.h>
+#  include <libavutil/avutil.h>
+#  include <libavutil/imgutils.h>
+#  include <libavutil/dict.h>
+#  include <libswscale/swscale.h>
+}
+#endif
+
+#include "obn/platform.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -105,9 +127,9 @@
 #include "obn/zip_reader.hpp"
 
 #if defined(_WIN32)
-#    define OBN_EXPORT extern "C" __declspec(dllexport)
+#  define OBN_EXPORT extern "C" __declspec(dllexport)
 #else
-#    define OBN_EXPORT extern "C" __attribute__((visibility("default")))
+#  define OBN_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
 // -----------------------------------------------------------------------
@@ -214,7 +236,9 @@ FILE* mirror_log_fp()
 // Simple printf-style helper used by the tunnel internals. Writes to the
 // (optional) logger callback AND to the on-disk mirror so we don't need
 // GST_DEBUG set to diagnose handshake failures.
+#if defined(__GNUC__) || defined(__clang__)
 [[gnu::format(printf, 3, 4)]]
+#endif
 void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
 {
     char buf[512];
@@ -493,15 +517,37 @@ struct Tunnel {
     void*            log_ctx = nullptr;
 
     // ---- MJPG/TLS state (Scheme::Local) ----
-    int              fd      = -1;
-    SSL*             ssl     = nullptr;
+    obn::plat::socket_t fd  = obn::plat::kInvalidSocket;
+    SSL*                ssl = nullptr;
 
     // ---- RTSP(S) state (Scheme::Rtsps/Rtsp) ----
+#if defined(OBN_CAMERA_GSTREAMER)
     // Pipeline: rtspsrc ! rtph264depay ! h264parse ! appsink.
     // We keep only the pipeline element and the sink handle; the
     // internal elements are owned by the pipeline bin.
     GstElement*      pipeline = nullptr;
     GstAppSink*      appsink  = nullptr;
+#endif
+#if defined(OBN_CAMERA_FFMPEG)
+    // libav-based RTSPS -> MJPEG pipeline. Populated by Bambu_Open
+    // when the URL scheme is Rtsp/Rtsps. avformat_open_input drives
+    // SETUP/PLAY; av_read_frame yields H.264 access units that are
+    // decoded into YUV, rescaled to 1280x720, and re-encoded as MJPEG
+    // so Studio's existing JPEG-based camera widget keeps working.
+    AVFormatContext* fmt_ctx    = nullptr;
+    AVCodecContext*  dec_ctx    = nullptr;
+    AVCodecContext*  enc_ctx    = nullptr;
+    SwsContext*      sws        = nullptr;
+    int              video_idx  = -1;
+    // Monotonic PTS for the MJPEG encoder. We don't forward the
+    // decoder's PTS (see read_rtsp for the rationale).
+    std::int64_t     enc_frame_index = 0;
+    // Monotonic timestamp of av_read_frame's first packet, used to make
+    // sample decode_time start at 0 and tick in 100-ns units.
+    bool             ff_t0_set  = false;
+    std::int64_t     ff_t0_pts  = 0;
+    AVRational       ff_t0_tb{};
+#endif
     // Subtype of the video carried by this tunnel, filled in by
     // Bambu_GetStreamInfo. MJPG for local-scheme tunnels, AVC1 for RTSP.
     int              sub_type = MJPG;
@@ -581,11 +627,16 @@ void tunnel_close(Tunnel* t)
         SSL_free(t->ssl);
         t->ssl = nullptr;
     }
-    if (t->fd >= 0) {
+    if (obn::plat::is_valid_socket(t->fd)) {
+#if defined(_WIN32)
+        ::shutdown(t->fd, SD_BOTH);
+#else
         ::shutdown(t->fd, SHUT_RDWR);
-        ::close(t->fd);
-        t->fd = -1;
+#endif
+        obn::plat::close_socket(t->fd);
+        t->fd = obn::plat::kInvalidSocket;
     }
+#if defined(OBN_CAMERA_GSTREAMER)
     if (t->pipeline) {
         // NULL state tears down rtspsrc cleanly; then unref. Note we do
         // NOT unref t->appsink separately: the appsink lives inside the
@@ -596,11 +647,35 @@ void tunnel_close(Tunnel* t)
         gst_object_unref(t->pipeline);
         t->pipeline = nullptr;
     }
+#endif
+#if defined(OBN_CAMERA_FFMPEG)
+    if (t->enc_ctx) {
+        avcodec_free_context(&t->enc_ctx);
+        t->enc_ctx = nullptr;
+    }
+    if (t->dec_ctx) {
+        avcodec_free_context(&t->dec_ctx);
+        t->dec_ctx = nullptr;
+    }
+    if (t->sws) {
+        sws_freeContext(t->sws);
+        t->sws = nullptr;
+    }
+    if (t->fmt_ctx) {
+        avformat_close_input(&t->fmt_ctx);
+        t->fmt_ctx = nullptr;
+    }
+    t->video_idx        = -1;
+    t->enc_frame_index  = 0;
+    t->ff_t0_set        = false;
+#endif
 }
 
-// Resolve-and-connect with a total deadline. Returns -1 on error.
-int dial(const std::string& host, int port, int timeout_ms)
+// Resolve-and-connect with a total deadline. Returns invalid_socket on error.
+obn::plat::socket_t dial(const std::string& host, int port, int timeout_ms)
 {
+    obn::plat::ensure_sockets_initialised();
+
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -611,29 +686,36 @@ int dial(const std::string& host, int port, int timeout_ms)
     int gai = ::getaddrinfo(host.c_str(), port_s, &hints, &res);
     if (gai != 0 || !res) {
         set_last_error(gai_strerror(gai));
-        return -1;
+        return obn::plat::kInvalidSocket;
     }
 
-    int fd = -1;
+    obn::plat::socket_t fd = obn::plat::kInvalidSocket;
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeout_ms);
     for (auto* ai = res; ai; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
+        if (!obn::plat::is_valid_socket(fd)) continue;
         // Keep connect() from blocking forever; 5 s matches what the
         // stock plugin uses (observed via strace).
+#if defined(_WIN32)
+        DWORD tv = static_cast<DWORD>(timeout_ms);
+#else
         timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
         int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char*>(&one), sizeof(one));
+        if (::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) break;
+        obn::plat::close_socket(fd);
+        fd = obn::plat::kInvalidSocket;
         if (std::chrono::steady_clock::now() > deadline) break;
     }
     freeaddrinfo(res);
-    if (fd < 0) set_last_error("connect failed");
+    if (!obn::plat::is_valid_socket(fd)) set_last_error("connect failed");
     return fd;
 }
 
@@ -672,6 +754,43 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
     }
     return 0;
 }
+
+// -----------------------------------------------------------------------
+// Camera backend (RTSPS -> MJPEG). On Linux we lean on the system
+// GStreamer (it is what every Linux Studio setup already has); on
+// Windows we use ffmpeg/libav directly because GStreamer is not part
+// of the Studio distribution there. Exactly one of OBN_CAMERA_GSTREAMER
+// / OBN_CAMERA_FFMPEG is expected to be defined by the build system.
+// -----------------------------------------------------------------------
+
+// Formats the rtsp(s) URL the way both gst-rtsp-server and ffmpeg/libav
+// expect: "<scheme>://<host>:<port><path>". User/password are NOT
+// embedded in the URI - rtspsrc (and avformat under --rtsp_flags
+// prefer_tcp) percent-decode userinfo and silently mangle access codes
+// that contain '+', '/', or '&'. Shared by both camera backends.
+std::string build_rtsp_uri(const TunnelUrl& u)
+{
+    const char* scheme = (u.scheme == Scheme::Rtsps) ? "rtsps" : "rtsp";
+    return std::string(scheme) + "://" + u.host + ":" +
+           std::to_string(u.port) + u.path;
+}
+
+// Returns true if Tunnel `t` currently has an active video pipeline for
+// its RTSP(S) stream. Abstracts away which camera backend is compiled in
+// (GStreamer exposes `pipeline`, ffmpeg exposes `fmt_ctx`).
+bool has_video_pipeline(const Tunnel* t)
+{
+#if defined(OBN_CAMERA_GSTREAMER)
+    return t->pipeline != nullptr;
+#elif defined(OBN_CAMERA_FFMPEG)
+    return t->fmt_ctx != nullptr;
+#else
+    (void) t;
+    return false;
+#endif
+}
+
+#if defined(OBN_CAMERA_GSTREAMER)
 
 // -----------------------------------------------------------------------
 // GStreamer init (for RTSP(S) tunnels). Lazy so we only pay the cost if
@@ -757,18 +876,6 @@ void gst_init_once()
         gst_debug_add_log_function(gst_log_handler, nullptr, nullptr);
         silence_libav_warnings();
     });
-}
-
-// Formats the rtsp(s) URL the way gst-rtsp-server expects: "<scheme>://
-// <host>:<port><path>". User/password are passed through rtspsrc
-// properties (user-id / user-pw), NOT embedded in the URI, because
-// rtspsrc percent-decodes userinfo and silently mangles access codes
-// that contain '+', '/', or '&'.
-std::string build_rtsp_uri(const TunnelUrl& u)
-{
-    const char* scheme = (u.scheme == Scheme::Rtsps) ? "rtsps" : "rtsp";
-    return std::string(scheme) + "://" + u.host + ":" +
-           std::to_string(u.port) + u.path;
 }
 
 // Pad-added callback for rtspsrc. rtspsrc has "sometimes" src pads that
@@ -1287,6 +1394,386 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     return Bambu_success;
 }
 
+#elif defined(OBN_CAMERA_FFMPEG)
+
+// -----------------------------------------------------------------------
+// FFmpeg RTSPS -> MJPEG backend for Windows. We open the RTSPS URL
+// through libavformat (forcing TCP transport to match what rtspsrc does
+// on Linux), find the H.264 video stream, decode it with libavcodec,
+// rescale to 1280x720 YUVJ420P via libswscale, and finally re-encode
+// each frame to MJPEG so Studio's existing camera widget -- which is
+// wired to decode JPEG, not raw H.264 -- can keep using its A1/P1
+// rendering path.
+//
+// All three pieces are lazy: open_rtsp() builds the graph, read_rtsp()
+// pulls exactly one encoded MJPEG frame per call (or returns
+// Bambu_would_block if no new decoded frame is available yet).
+// -----------------------------------------------------------------------
+
+std::once_flag g_av_init_flag;
+
+void av_log_sink(void* /*ptr*/, int level, const char* fmt, va_list vl)
+{
+    if (level > av_log_get_level()) return;
+    FILE* fp = mirror_log_fp();
+    if (!fp) return;
+    char line[512];
+    std::vsnprintf(line, sizeof(line), fmt, vl);
+    std::fprintf(fp, "[av %d] %s", level, line);
+}
+
+void av_init_once()
+{
+    std::call_once(g_av_init_flag, []() {
+        // avformat_network_init() must be called once per process on
+        // Windows for Winsock to be ready for RTSP. libavformat guards
+        // it internally with a refcount, but we still own the first
+        // call ourselves because libav in the Studio directory might
+        // not be the one we linked against.
+        avformat_network_init();
+
+        int lvl = AV_LOG_WARNING;
+        if (const char* env = std::getenv("OBN_AV_DEBUG")) {
+            int n = std::atoi(env);
+            if (n > 0) lvl = n;
+            else if (std::strcmp(env, "INFO")  == 0) lvl = AV_LOG_INFO;
+            else if (std::strcmp(env, "DEBUG") == 0) lvl = AV_LOG_DEBUG;
+        }
+        av_log_set_level(lvl);
+        av_log_set_callback(av_log_sink);
+    });
+}
+
+[[maybe_unused]] int open_rtsp(Tunnel* t)
+{
+    av_init_once();
+
+    const std::string uri = build_rtsp_uri(t->url);
+    log_fmt(t->logger, t->log_ctx, "open_rtsp(ffmpeg): uri=%s user=%s",
+            uri.c_str(), t->url.user.c_str());
+
+    AVFormatContext* fmt = nullptr;
+    AVDictionary* opts = nullptr;
+    // Force TCP transport (matches rtspsrc protocols=4 on Linux) and
+    // disable peer cert validation because Bambu printers ship a
+    // self-signed chain. The TLS peer verification in libavformat's
+    // rtsp.c only looks at the "ca_file" option, so leaving it unset
+    // together with tls_verify=0 cleanly bypasses validation.
+    av_dict_set(&opts, "rtsp_transport",        "tcp",   0);
+    av_dict_set(&opts, "stimeout",              "5000000", 0); // 5s socket timeout (us)
+    av_dict_set(&opts, "rtsp_flags",            "prefer_tcp", 0);
+    av_dict_set(&opts, "tls_verify",            "0",     0);
+    av_dict_set(&opts, "allowed_media_types",   "video", 0);
+    av_dict_set(&opts, "max_delay",             "120000", 0); // 120 ms jitter
+
+    int rc = avformat_open_input(&fmt, uri.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: avformat_open_input failed: %s", ebuf);
+        set_last_error(ebuf);
+        return -1;
+    }
+    rc = avformat_find_stream_info(fmt, nullptr);
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: find_stream_info failed: %s", ebuf);
+        avformat_close_input(&fmt);
+        set_last_error(ebuf);
+        return -1;
+    }
+
+    int video_idx = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (video_idx < 0) {
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: no video stream found");
+        avformat_close_input(&fmt);
+        set_last_error("no video stream");
+        return -1;
+    }
+    AVStream* vs = fmt->streams[video_idx];
+    AVCodecParameters* par = vs->codecpar;
+
+    // Decoder: H.264 is what Bambu sends; we still look it up through
+    // avcodec_find_decoder() so if Studio's libav happens to ship a
+    // hardware-accelerated h264 we pick it up for free.
+    const AVCodec* dec = avcodec_find_decoder(par->codec_id);
+    if (!dec) {
+        log_fmt(t->logger, t->log_ctx,
+                "open_rtsp: no decoder for codec_id=%d", (int)par->codec_id);
+        avformat_close_input(&fmt);
+        set_last_error("no decoder");
+        return -1;
+    }
+    AVCodecContext* dec_ctx = avcodec_alloc_context3(dec);
+    if (!dec_ctx) {
+        avformat_close_input(&fmt);
+        set_last_error("avcodec_alloc_context3 failed");
+        return -1;
+    }
+    avcodec_parameters_to_context(dec_ctx, par);
+    dec_ctx->thread_count = 1;
+    rc = avcodec_open2(dec_ctx, dec, nullptr);
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: avcodec_open2(decoder) failed: %s", ebuf);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&fmt);
+        set_last_error(ebuf);
+        return -1;
+    }
+
+    // MJPEG encoder: produces JPEG bitstreams that Studio's existing
+    // A1/P1 camera path already knows how to render. Target resolution
+    // is 1280x720 to match the Linux GStreamer pipeline.
+    const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!enc) {
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: no MJPEG encoder");
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&fmt);
+        set_last_error("no mjpeg encoder");
+        return -1;
+    }
+    AVCodecContext* enc_ctx = avcodec_alloc_context3(enc);
+    if (!enc_ctx) {
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&fmt);
+        set_last_error("avcodec_alloc_context3(enc) failed");
+        return -1;
+    }
+    enc_ctx->pix_fmt      = AV_PIX_FMT_YUVJ420P;
+    enc_ctx->width        = 1280;
+    enc_ctx->height       = 720;
+    enc_ctx->time_base    = AVRational{1, 30};
+    enc_ctx->framerate    = AVRational{30, 1};
+    // quality ~3 (libjpeg Q~85-ish); good trade-off for LAN widget
+    enc_ctx->flags       |= AV_CODEC_FLAG_QSCALE;
+    enc_ctx->global_quality = FF_QP2LAMBDA * 3;
+
+    rc = avcodec_open2(enc_ctx, enc, nullptr);
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: avcodec_open2(encoder) failed: %s", ebuf);
+        avcodec_free_context(&enc_ctx);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&fmt);
+        set_last_error(ebuf);
+        return -1;
+    }
+
+    // Scaler: H.264 usually decodes to YUV420P; MJPEG wants YUVJ420P
+    // (full-range). Since we also resize to 720p, we always route
+    // through swscale.
+    SwsContext* sws = sws_getContext(
+        dec_ctx->width  > 0 ? dec_ctx->width  : 1920,
+        dec_ctx->height > 0 ? dec_ctx->height : 1080,
+        dec_ctx->pix_fmt != AV_PIX_FMT_NONE ? dec_ctx->pix_fmt : AV_PIX_FMT_YUV420P,
+        enc_ctx->width, enc_ctx->height, enc_ctx->pix_fmt,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws) {
+        log_fmt(t->logger, t->log_ctx, "open_rtsp: sws_getContext failed");
+        avcodec_free_context(&enc_ctx);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&fmt);
+        set_last_error("sws_getContext failed");
+        return -1;
+    }
+
+    t->fmt_ctx       = fmt;
+    t->dec_ctx       = dec_ctx;
+    t->enc_ctx       = enc_ctx;
+    t->sws           = sws;
+    t->video_idx     = video_idx;
+    t->ff_t0_set     = false;
+    t->width         = enc_ctx->width;
+    t->height        = enc_ctx->height;
+
+    log_fmt(t->logger, t->log_ctx,
+            "open_rtsp: pipeline ready (%dx%d -> MJPEG %dx%d)",
+            dec_ctx->width, dec_ctx->height,
+            enc_ctx->width, enc_ctx->height);
+    return 0;
+}
+
+int read_rtsp(Tunnel* t, Bambu_Sample* sample)
+{
+    if (!t->fmt_ctx || !t->dec_ctx || !t->enc_ctx || !t->sws)
+        return -1;
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame*  frm = av_frame_alloc();
+    AVFrame*  scaled = av_frame_alloc();
+    if (!pkt || !frm || !scaled) {
+        if (pkt)    av_packet_free(&pkt);
+        if (frm)    av_frame_free(&frm);
+        if (scaled) av_frame_free(&scaled);
+        set_last_error("av_frame_alloc failed");
+        return -1;
+    }
+
+    // Pull packets until we get a decoded frame for our video stream
+    // or the decoder asks for more. We cap the loop so a degenerate
+    // stream can't block us forever -- if we genuinely need more data,
+    // gstbambusrc will call us again after its 33 ms sleep.
+    int frame_ready = 0;
+    for (int guard = 0; guard < 8 && !frame_ready; ++guard) {
+        int rc = av_read_frame(t->fmt_ctx, pkt);
+        if (rc == AVERROR(EAGAIN)) {
+            av_packet_unref(pkt);
+            break;
+        }
+        if (rc < 0) {
+            if (rc == AVERROR_EOF) {
+                av_packet_free(&pkt);
+                av_frame_free(&frm);
+                av_frame_free(&scaled);
+                return Bambu_stream_end;
+            }
+            char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+            av_strerror(rc, ebuf, sizeof(ebuf));
+            log_fmt(t->logger, t->log_ctx, "read_rtsp: av_read_frame: %s", ebuf);
+            av_packet_free(&pkt);
+            av_frame_free(&frm);
+            av_frame_free(&scaled);
+            set_last_error(ebuf);
+            return -1;
+        }
+        if (pkt->stream_index != t->video_idx) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        rc = avcodec_send_packet(t->dec_ctx, pkt);
+        av_packet_unref(pkt);
+        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+            char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+            av_strerror(rc, ebuf, sizeof(ebuf));
+            log_fmt(t->logger, t->log_ctx, "read_rtsp: send_packet: %s", ebuf);
+            continue;
+        }
+        rc = avcodec_receive_frame(t->dec_ctx, frm);
+        if (rc == 0) {
+            frame_ready = 1;
+            break;
+        }
+        if (rc == AVERROR(EAGAIN)) continue;
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "read_rtsp: receive_frame: %s", ebuf);
+    }
+
+    if (!frame_ready) {
+        av_packet_free(&pkt);
+        av_frame_free(&frm);
+        av_frame_free(&scaled);
+        return Bambu_would_block;
+    }
+
+    // Scale + color-convert into the MJPEG input format
+    scaled->format = t->enc_ctx->pix_fmt;
+    scaled->width  = t->enc_ctx->width;
+    scaled->height = t->enc_ctx->height;
+    int rc = av_frame_get_buffer(scaled, 32);
+    if (rc < 0) {
+        av_packet_free(&pkt);
+        av_frame_free(&frm);
+        av_frame_free(&scaled);
+        set_last_error("av_frame_get_buffer failed");
+        return -1;
+    }
+    sws_scale(t->sws,
+              frm->data, frm->linesize, 0, frm->height,
+              scaled->data, scaled->linesize);
+    scaled->pts = t->enc_frame_index++;
+
+    rc = avcodec_send_frame(t->enc_ctx, scaled);
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "read_rtsp: enc send_frame: %s", ebuf);
+        av_packet_free(&pkt);
+        av_frame_free(&frm);
+        av_frame_free(&scaled);
+        set_last_error(ebuf);
+        return -1;
+    }
+    AVPacket* enc_pkt = av_packet_alloc();
+    rc = avcodec_receive_packet(t->enc_ctx, enc_pkt);
+    if (rc == AVERROR(EAGAIN)) {
+        av_packet_free(&enc_pkt);
+        av_packet_free(&pkt);
+        av_frame_free(&frm);
+        av_frame_free(&scaled);
+        return Bambu_would_block;
+    }
+    if (rc < 0) {
+        char ebuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(rc, ebuf, sizeof(ebuf));
+        log_fmt(t->logger, t->log_ctx, "read_rtsp: enc recv_packet: %s", ebuf);
+        av_packet_free(&enc_pkt);
+        av_packet_free(&pkt);
+        av_frame_free(&frm);
+        av_frame_free(&scaled);
+        set_last_error(ebuf);
+        return -1;
+    }
+
+    t->frame_buf.assign(enc_pkt->data, enc_pkt->data + enc_pkt->size);
+    av_packet_free(&enc_pkt);
+    av_packet_free(&pkt);
+    av_frame_free(&frm);
+    av_frame_free(&scaled);
+
+    // Wall-clock timestamp, same rationale as the Linux path: let
+    // Studio render each frame "now" instead of the pipeline-past
+    // coordinate we'd get from the decoder's PTS.
+    auto now = std::chrono::steady_clock::now();
+    auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   now - t->t0).count();
+    unsigned long long dt_100ns =
+        static_cast<unsigned long long>(ns / 100);
+
+    if (++t->frame_count == 1 || (t->frame_count % 60) == 0) {
+        log_fmt(t->logger, t->log_ctx,
+                "read_rtsp: frame #%llu size=%zu",
+                static_cast<unsigned long long>(t->frame_count),
+                t->frame_buf.size());
+    }
+
+    sample->itrack      = 0;
+    sample->size        = static_cast<int>(t->frame_buf.size());
+    sample->flags       = 0;
+    sample->buffer      = t->frame_buf.data();
+    sample->decode_time = dt_100ns;
+    return Bambu_success;
+}
+
+#else // no camera backend configured
+
+[[maybe_unused]] int open_rtsp(Tunnel* t)
+{
+    log_fmt(t->logger, t->log_ctx,
+            "open_rtsp: no camera backend built in (neither "
+            "OBN_CAMERA_GSTREAMER nor OBN_CAMERA_FFMPEG was defined)");
+    set_last_error("no camera backend");
+    return -1;
+}
+
+int read_rtsp(Tunnel* /*t*/, Bambu_Sample* /*sample*/)
+{
+    return -1;
+}
+
+#endif // camera backend selection
+
 // -----------------------------------------------------------------------
 // Build the 80-byte auth packet per OpenBambuAPI/video.md.
 // -----------------------------------------------------------------------
@@ -1781,9 +2268,11 @@ std::string format_time_studio(std::uint64_t epoch)
     if (epoch == 0) return "";
     std::time_t t = static_cast<std::time_t>(epoch);
     std::tm tm{};
-    gmtime_r(&t, &tm);
+    obn::plat::gmtime_safe(t, &tm);
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%F %T", &tm);
+    // MSVC does not support the C99 "%F %T" ISO-date shortcut in strftime;
+    // spell it out as "%Y-%m-%d %H:%M:%S" which is universally supported.
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     return buf;
 }
 
@@ -1897,7 +2386,7 @@ std::string download_blob(Tunnel* t, const std::string& full_path,
 {
     out->clear();
     constexpr std::size_t kMax = 64u * 1024u * 1024u;
-    return t->ftp->retr(full_path, [out](const void* data, std::size_t len) {
+    return t->ftp->retr(full_path, [out, kMax](const void* data, std::size_t len) {
         if (out->size() + len > kMax) return false;
         out->insert(out->end(),
                     static_cast<const std::uint8_t*>(data),
@@ -2535,10 +3024,14 @@ int start_ctrl_mode(Tunnel* t)
         SSL_free(t->ssl);
         t->ssl = nullptr;
     }
-    if (t->fd >= 0) {
+    if (obn::plat::is_valid_socket(t->fd)) {
+#if defined(_WIN32)
+        ::shutdown(t->fd, SD_BOTH);
+#else
         ::shutdown(t->fd, SHUT_RDWR);
-        ::close(t->fd);
-        t->fd = -1;
+#endif
+        obn::plat::close_socket(t->fd);
+        t->fd = obn::plat::kInvalidSocket;
     }
     t->ctrl_mode = true;
     t->ctrl_stop.store(false);
@@ -2644,12 +3137,13 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
             t->url.host.c_str(), t->url.port);
 
     t->fd = dial(t->url.host, t->url.port, /*timeout_ms=*/5000);
-    if (t->fd < 0) {
+    if (!obn::plat::is_valid_socket(t->fd)) {
         log_fmt(t->logger, t->log_ctx, "Bambu_Open: connect failed: %s",
                 g_last_error.c_str());
         return -1;
     }
-    log_fmt(t->logger, t->log_ctx, "Bambu_Open: TCP connected, fd=%d", t->fd);
+    log_fmt(t->logger, t->log_ctx, "Bambu_Open: TCP connected, fd=%lld",
+            static_cast<long long>(t->fd));
 
     if (!g_ssl_ctx) {
         set_last_error("SSL_CTX not ready");
@@ -2662,7 +3156,7 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         tunnel_close(t);
         return -1;
     }
-    SSL_set_fd(t->ssl, t->fd);
+    SSL_set_fd(t->ssl, static_cast<int>(t->fd));
     // SNI: some self-signed printer certs are issued for the device IP;
     // set it anyway so they can still inspect it server-side.
     SSL_set_tlsext_host_name(t->ssl, t->url.host.c_str());
@@ -2706,7 +3200,7 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
     if (!t) return -1;
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->pipeline) return -1;
+         t->url.scheme == Scheme::Rtsp) && !has_video_pipeline(t)) return -1;
     return Bambu_success;
 }
 
@@ -2741,7 +3235,7 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     if (!t) return 0;
     if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->pipeline) return 0;
+         t->url.scheme == Scheme::Rtsp) && !has_video_pipeline(t)) return 0;
     return 1; // one video track, either MJPG or H.264
 }
 

@@ -11,6 +11,8 @@
 
 #include "../src/ftps_parse.hpp"
 
+#include "obn/platform.hpp"
+
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -50,7 +52,7 @@ std::time_t utc(int y, int mo, int d, int h = 0, int mi = 0, int s = 0)
     tm.tm_hour = h;
     tm.tm_min  = mi;
     tm.tm_sec  = s;
-    return ::timegm(&tm);
+    return obn::plat::timegm_portable(&tm);
 }
 
 void test_ls_with_year(Result& r)

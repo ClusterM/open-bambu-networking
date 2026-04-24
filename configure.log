@@ -1,0 +1,231 @@
+
+==> Visual Studio / MSBuild
+configure: using Visual Studio Community 2026 (installation path: D:\Soft\Microsoft Visual Studio\18\Community)
+configure: CMake generator = Visual Studio 18 2026 (x64)
+
+==> vcpkg
+configure: using existing VCPKG_ROOT=D:\vp
+
+==> plugin version
+configure: detected Bambu Studio 02.06.00.51 at C:\Users\Cluster.FX\AppData\Roaming\BambuStudio\BambuStudio.conf
+configure: plugin version = 02.06.00.99 (override with -WithVersion)
+
+==> cmake configure
+configure: cmake -S . -B D:\b\obn -G Visual Studio 18 2026 -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=C:\Users\Cluster.FX\AppData\Roaming\BambuStudio -DCMAKE_TOOLCHAIN_FILE=D:\vp\scripts\buildsystems\vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows -DOBN_VERSION=02.06.00.99 -DOBN_CAMERA_BACKEND=ffmpeg -DOBN_ENABLE_WORKAROUNDS=ON -DOBN_FT_FTPS_FASTPATH=ON -DOBN_BUILD_TESTS=ON -DOBN_PATCH_STUDIO_CONF=ON
+-- Running vcpkg install
+Detecting compiler hash for triplet x64-windows...
+Compiler found: D:/Soft/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe
+The following packages will be built and installed:
+    cjson:x64-windows@1.7.19
+    curl[core,http2,non-http,openssl,ssl,sspi]:x64-windows@8.19.0
+    ffmpeg[avcodec,avformat,core,swscale]:x64-windows@8.1#3
+  * ffmpeg-bin2c:x64-windows@8.1
+    libjpeg-turbo:x64-windows@3.1.4.1
+    libpng:x64-windows@1.6.58
+  * nghttp2:x64-windows@1.69.0
+    openssl:x64-windows@3.6.2
+  * pkgconf:x64-windows@2.5.1#4
+    pthreads:x64-windows@3.0.0#14
+  * vcpkg-cmake:x64-windows@2024-04-23
+  * vcpkg-cmake-config:x64-windows@2024-05-23
+  * vcpkg-cmake-get-vars:x64-windows@2025-05-29
+  * vcpkg-pkgconfig-get-modules:x64-windows@2024-04-03
+  * vcpkg-tool-meson:x64-windows@1.9.0#4
+    zlib:x64-windows@1.3.2
+Additional packages (*) will be modified to complete this operation.
+Restored 16 package(s) from C:\Users\Cluster.FX\AppData\Local\vcpkg\archives in 7.7 s. Use --debug to see more details.
+Installing 1/16 vcpkg-cmake-config:x64-windows@2024-05-23...
+vcpkg-cmake-config:x64-windows@2024-05-23 package ABI: 46183768fb162f227ca8e4071c047b069c6198148856cc08a3ecbddafa0077a8
+Elapsed time to handle vcpkg-cmake-config:x64-windows: 4.39 ms
+Installing 2/16 vcpkg-cmake:x64-windows@2024-04-23...
+vcpkg-cmake:x64-windows@2024-04-23 package ABI: 307aa8c7dd9ae2a71fd6e6e4598c00093478d94dd76200cec89ff504f9f6c4df
+Elapsed time to handle vcpkg-cmake:x64-windows: 6.91 ms
+Installing 3/16 cjson:x64-windows@1.7.19...
+cjson:x64-windows@1.7.19 package ABI: 6db3dd32520d56b049755e491771538a01565dda657b402b84d40bf8865bbda7
+Elapsed time to handle cjson:x64-windows: 21.3 ms
+Installing 4/16 vcpkg-cmake-get-vars:x64-windows@2025-05-29...
+vcpkg-cmake-get-vars:x64-windows@2025-05-29 package ABI: 652cdbbc3b00b70ae86dae0c38f1e775868664735cd1b2a2711a9c43ebf9fea6
+Elapsed time to handle vcpkg-cmake-get-vars:x64-windows: 4.87 ms
+Installing 5/16 openssl:x64-windows@3.6.2...
+openssl:x64-windows@3.6.2 package ABI: b909f9cd3800a78b2bdde17b77630018ba7aed402c197ac0273a0c90b76a543a
+Elapsed time to handle openssl:x64-windows: 67.3 ms
+Installing 6/16 nghttp2:x64-windows@1.69.0...
+nghttp2:x64-windows@1.69.0 package ABI: 25f45bac600a24cdd87e5c9e16f746d96da59833fd9959379f660e57cca1e723
+Elapsed time to handle nghttp2:x64-windows: 21.9 ms
+Installing 7/16 zlib:x64-windows@1.3.2...
+zlib:x64-windows@1.3.2 package ABI: a87207f8ade2f0f455d2c9d6d9131e35ecb4152703ee555e25acd71856ff5cc3
+Elapsed time to handle zlib:x64-windows: 41.7 ms
+Installing 8/16 curl[core,http2,non-http,openssl,ssl,sspi]:x64-windows@8.19.0...
+curl[core,http2,non-http,openssl,ssl,sspi]:x64-windows@8.19.0 package ABI: f156e45912e6521f243467cbf52a27bacd451d350d3a536b44bea4e8e4cdc4c3
+Elapsed time to handle curl:x64-windows: 63.3 ms
+Installing 9/16 vcpkg-tool-meson:x64-windows@1.9.0#4...
+vcpkg-tool-meson:x64-windows@1.9.0#4 package ABI: baee533864470d1066e9ba746960fd2243047992afbdeeef16291a670336d042
+Elapsed time to handle vcpkg-tool-meson:x64-windows: 21.5 ms
+Installing 10/16 pkgconf:x64-windows@2.5.1#4...
+pkgconf:x64-windows@2.5.1#4 package ABI: 1506f511aa869c7bc1a9aafaf671e0835bc6608837e1cd77653c3daa17162793
+Elapsed time to handle pkgconf:x64-windows: 28.2 ms
+Installing 11/16 vcpkg-pkgconfig-get-modules:x64-windows@2024-04-03...
+vcpkg-pkgconfig-get-modules:x64-windows@2024-04-03 package ABI: ac1c9aede31a5ec6a9065180c709c84c1531fca4b035f84ece05b617d9c5f6d4
+Elapsed time to handle vcpkg-pkgconfig-get-modules:x64-windows: 17 ms
+Installing 12/16 ffmpeg-bin2c:x64-windows@8.1...
+ffmpeg-bin2c:x64-windows@8.1 package ABI: f94a1fb9004df42fd59b2e515dcdeb5af6ad7a7c596567306a4d239dbe070c6c
+Elapsed time to handle ffmpeg-bin2c:x64-windows: 12.8 ms
+Installing 13/16 ffmpeg[avcodec,avformat,core,swscale]:x64-windows@8.1#3...
+ffmpeg[avcodec,avformat,core,swscale]:x64-windows@8.1#3 package ABI: 3341551201dc5326181c73e3a0bfd5ea0d7a2600f6d0f1f78dafbc7d7c6afa88
+Elapsed time to handle ffmpeg:x64-windows: 68.9 ms
+Installing 14/16 libjpeg-turbo:x64-windows@3.1.4.1...
+libjpeg-turbo:x64-windows@3.1.4.1 package ABI: e007d090c6a5da7fd1de80543984a6c4ddd998223ea7ad76b904535a6519c8c3
+Elapsed time to handle libjpeg-turbo:x64-windows: 36.5 ms
+Installing 15/16 libpng:x64-windows@1.6.58...
+libpng:x64-windows@1.6.58 package ABI: 1dc2fc939529c732437484d5e14c811e09014be69aa67da3761654c781b2f8e9
+Elapsed time to handle libpng:x64-windows: 21.4 ms
+Installing 16/16 pthreads:x64-windows@3.0.0#14...
+pthreads:x64-windows@3.0.0#14 package ABI: 3bbd9aa2e7e39f4536f42b45b006d26bad3ac49b13560289baf15783bbcf5ab1
+Elapsed time to handle pthreads:x64-windows: 33 ms
+Installed contents are licensed to you by owners. Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
+Some packages did not declare an SPDX license. Check the `copyright` file for each package for more information about their licensing.
+Packages installed in this vcpkg installation declare the following licenses:
+Apache-2.0
+BSD-3-Clause
+ISC
+LGPL-2.1-or-later
+MIT
+Zlib
+curl
+libpng-2.0
+cjson provides CMake targets:
+
+  # this is heuristically generated, and may not be correct
+  find_package(cJSON CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE cjson)
+
+cjson provides pkg-config modules:
+
+  # Ultralightweight JSON parser in ANSI C
+  libcjson
+
+openssl is compatible with built-in CMake targets:
+
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(main PRIVATE OpenSSL::SSL)
+  target_link_libraries(main PRIVATE OpenSSL::Crypto)
+
+zlib is compatible with built-in CMake targets:
+
+  find_package(ZLIB REQUIRED)
+  target_link_libraries(main PRIVATE ZLIB::ZLIB)
+
+curl is compatible with built-in CMake targets:
+
+    find_package(CURL REQUIRED)
+    target_link_libraries(main PRIVATE CURL::libcurl)
+
+ffmpeg provides CMake integration:
+
+  find_package(FFMPEG REQUIRED)
+  target_include_directories(main PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_link_directories(main PRIVATE ${FFMPEG_LIBRARY_DIRS})
+  target_link_libraries(main PRIVATE ${FFMPEG_LIBRARIES})
+
+ffmpeg provides pkg-config modules:
+
+  # FFmpeg codec library
+  libavcodec
+
+  # FFmpeg device handling library
+  libavdevice
+
+  # FFmpeg audio/video filtering library
+  libavfilter
+
+  # FFmpeg container format library
+  libavformat
+
+  # FFmpeg utility library
+  libavutil
+
+  # FFmpeg audio resampling library
+  libswresample
+
+  # FFmpeg image rescaling library
+  libswscale
+
+libjpeg-turbo is compatible with built-in implementation-agnostic CMake targets:
+
+    find_package(JPEG REQUIRED)
+    target_link_libraries(main PRIVATE JPEG::JPEG)
+
+libjpeg-turbo provides CMake targets for the TurboJPEG C API:
+
+    find_package(libjpeg-turbo CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>)
+
+libpng provides CMake targets:
+
+  find_package(PNG REQUIRED)
+  target_link_libraries(main PRIVATE PNG::PNG)
+
+The package pthreads provides CMake targets:
+
+    find_package(PThreads4W REQUIRED)
+    target_link_libraries(main PRIVATE PThreads4W::PThreads4W)
+
+All requested installations completed successfully in: 504 ms
+-- Running vcpkg install - done
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- The CXX compiler identification is MSVC 19.50.35729.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: D:/Soft/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- obn: ABI_VERSION=0x020600 (from OBN_VERSION=02.06.00.99)
+-- Found OpenSSL: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/libcrypto.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/libcrypto.lib (found version "3.6.2")
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Failed
+-- Looking for pthread_create in pthreads
+-- Looking for pthread_create in pthreads - not found
+-- Looking for pthread_create in pthread
+-- Looking for pthread_create in pthread - not found
+-- Found Threads: TRUE
+-- The C compiler identification is MSVC 19.50.35729.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: D:/Soft/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Found PThreads4W: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/pthreadVC3.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/pthreadVC3d.lib
+-- PThreads4W_DLL_DIR: D:/b/obn/vcpkg_installed/x64-windows/include/../bin
+-- PThreads4W_DEBUG_DLL_DIR: D:/b/obn/vcpkg_installed/x64-windows/include/../debug/bin
+-- WITH_DLT = OFF
+-- Found cJSON: D:/b/obn/vcpkg_installed/x64-windows/include
+-- Could NOT find argon2 (missing: ARGON2_INCLUDE_DIR ARGON2_LIBRARY) 
+-- Could not find libedit or readline library (missing: LINEEDITING_LIBRARIES LINEEDITING_INCLUDE_DIRS) 
+-- obn: using vendored libmosquitto_static (v2.1.2)
+-- Found OpenSSL: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/libcrypto.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/libcrypto.lib (found suitable version "3.6.2", minimum required is "3")
+-- Found ZLIB: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/z.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/zd.lib (found suitable version "1.3.2", minimum required is "1")
+-- Found ZLIB: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/z.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/zd.lib (found version "1.3.2")
+-- Found PkgConfig: D:/b/obn/vcpkg_installed/x64-windows/share/ffmpeg/../../../x64-windows/tools/pkgconf/pkgconf.exe (found version "2.5.1")
+-- Checking for module 'libavcodec'
+--   Found libavcodec, version 62.28.100
+-- Checking for module 'libavformat'
+--   Found libavformat, version 62.12.100
+-- Checking for module 'libavcodec'
+--   Found libavcodec, version 62.28.100
+-- Checking for module 'libavutil'
+--   Found libavutil, version 60.26.100
+-- Checking for module 'libswscale'
+--   Found libswscale, version 9.5.100
+-- Found PNG: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/libpng16.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/libpng16d.lib (found version "1.6.58")
+-- Found JPEG: optimized;D:/b/obn/vcpkg_installed/x64-windows/lib/jpeg.lib;debug;D:/b/obn/vcpkg_installed/x64-windows/debug/lib/jpeg.lib (found version "62")
+-- Configuring done (43.0s)
+-- Generating done (0.3s)
+-- Build files have been written to: D:/b/obn
+
+configure: done.
+
+Next steps:
+  .\build.ps1             # cmake --build D:\b\obn --config Release
+  .\install.ps1           # cmake --install D:\b\obn --config Release
+
+Re-run '.\configure.ps1 -?' for the full list of options.

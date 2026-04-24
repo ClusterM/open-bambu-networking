@@ -1,5 +1,7 @@
 #include "obn/log.hpp"
 
+#include "obn/platform.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -9,10 +11,13 @@
 #include <ctime>
 #include <mutex>
 #include <string>
-#include <strings.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#if defined(_WIN32)
+// MSVC has _stricmp instead of strcasecmp.
+#  define strcasecmp _stricmp
+#else
+#  include <strings.h>
+#endif
 
 namespace obn::log {
 
@@ -101,7 +106,7 @@ void ensure_initialized_locked(State& s)
 
 long tid()
 {
-    return static_cast<long>(::syscall(SYS_gettid));
+    return obn::plat::current_thread_id();
 }
 
 void format_timestamp(char* buf, std::size_t n)
@@ -111,7 +116,7 @@ void format_timestamp(char* buf, std::size_t n)
     auto        tt   = system_clock::to_time_t(now);
     auto        us   = duration_cast<microseconds>(now.time_since_epoch()).count() % 1'000'000;
     std::tm     tm{};
-    ::localtime_r(&tt, &tm);
+    obn::plat::localtime_safe(tt, &tm);
     std::snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec,

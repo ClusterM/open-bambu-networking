@@ -1,0 +1,36 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "open-bambu-networking",
+    "version-string": "0.1.0",
+    "description": "Open-source replacement for Bambu Studio's bambu_networking plugin (Windows build dependencies resolved via vcpkg manifest)",
+    "dependencies": [
+        {
+            "name": "openssl",
+            "default-features": false
+        },
+        {
+            "name": "curl",
+            "default-features": false,
+            "features": [ "ssl", "openssl", "http2", "non-http" ]
+        },
+        "zlib",
+        "libpng",
+        {
+            "name": "libjpeg-turbo",
+            "default-features": false
+        },
+        {
+            "name": "ffmpeg",
+            "default-features": false,
+            "features": [ "avcodec", "avformat", "swscale" ]
+        },
+        {
+            "name": "pthreads",
+            "platform": "windows"
+        },
+        {
+            "name": "cjson",
+            "platform": "windows"
+        }
+    ]
+}

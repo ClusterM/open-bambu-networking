@@ -33,6 +33,7 @@ plugin.
   - [`./configure` options](#configure-options)
   - [First-time Studio configuration](#first-time-studio-configuration)
   - [Flatpak problems](#flatpak-problems)
+  - [Build on Windows](BUILD-WINDOWS.md)
 - [Logging](#logging)
 - [License](#license)
 - [Support the Developer and the Project](#support-the-developer-and-the-project)
@@ -96,12 +97,19 @@ Please note:
 
 - Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
 - Linux aarch64 (cross-compile-friendly, see `cmake/toolchains/`).
+- Windows x64 (MSVC 2019/2022, vcpkg-managed OpenSSL/libcurl/zlib/libpng/
+  libjpeg-turbo/ffmpeg; libmosquitto is vendored via FetchContent). Camera
+  stream is decoded/re-encoded by ffmpeg instead of GStreamer because
+  GStreamer is not part of the official Bambu Studio distribution on
+  Windows. See [BUILD-WINDOWS.md](BUILD-WINDOWS.md) for prerequisites,
+  commands, and troubleshooting.
 
-Windows and macOS are architected for but not yet built and tested: the ABI uses
-`std::string`/`std::map`/`std::function` across the boundary, which means we
-would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
-also enforces a matching code-signing publisher on those OSes unless the user
-sets `ignore_module_cert = 1`.
+macOS is architected for but not yet built and tested: the ABI uses
+`std::string`/`std::map`/`std::function` across the boundary, which means
+we would need to match Xcode/libc++ at the Studio side. Studio also
+enforces a matching code-signing publisher on macOS unless the user sets
+`ignore_module_cert = 1` in `BambuStudio.conf` (Windows/Linux honour the
+same switch).
 
 ## Supported Bambu Studio versions
 
@@ -258,7 +266,8 @@ except for the storage-root layout (see hardware matrix).
 | --- | :-: | --- |
 | Linux x86_64 | ✅ | Primary development and test target. |
 | Linux aarch64 | ✅ (not tested) | Cross-compile toolchain in `cmake/toolchains/`; not verified on-device yet. |
-| Windows / macOS | ❌ | Architected for but not built — ABI uses `std::string`/`std::map`/`std::function` across the `dlsym` boundary, which needs MSVC STL on Windows and Xcode libc++ on macOS. Plus Studio enforces code-signing publisher matches on those OSes. |
+| Windows x64 | ✅ | MSVC + vcpkg; see [BUILD-WINDOWS.md](BUILD-WINDOWS.md). Studio may require `ignore_module_cert` or a matching Authenticode signature. |
+| macOS | ❌ | Not built yet — ABI uses `std::string`/`std::map`/`std::function` across the boundary, which must match Xcode libc++ at the Studio side; code-signing rules apply. |
 
 ### Hardware reality (what each model actually does)
 
@@ -728,6 +737,14 @@ work.
 from your distribution or an **official AppImage**, or **build Studio from
 source** yourself so the plugin, wxWidgets, and multimedia stack all target the
 same environment.
+
+### Build on Windows
+
+Use **[BUILD-WINDOWS.md](BUILD-WINDOWS.md)** for the full guide: Visual Studio
+and CMake requirements, `.\configure.ps1` / `.\build.ps1` / `.\install.ps1`,
+vcpkg (`VCPKG_ROOT`, `.vcpkg`, shared-folder pitfalls), version detection from
+`BambuStudio.conf`, install layout, `ignore_module_cert`, and PATH / tooling
+gotchas.
 
 **AppImage compared to Flatpak.** They are not the same problem set. An
 AppImage typically carries Studio’s dependencies next to the binary and still

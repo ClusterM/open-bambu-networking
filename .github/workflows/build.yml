@@ -140,3 +140,82 @@ jobs:
           name: open-bambu-networking-linux-${{ matrix.arch }}-${{ steps.ver.outputs.plugin_version }}
           path: dist/
           if-no-files-found: error
+
+  # Windows build. Uses MSVC + vcpkg (manifest mode) to produce the
+  # three DLLs Studio loads on Windows: bambu_networking.dll,
+  # BambuSource.dll, live555.dll. Camera backend is ffmpeg (no
+  # GStreamer on Windows, see CMakeLists.txt).
+  build-windows:
+    name: windows-x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: ${{ github.workspace }}/.vcpkg
+          vcpkgJsonGlob: vcpkg.json
+
+      - name: Resolve plugin version from upstream Bambu Studio
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = (git ls-remote --tags --refs `
+                    https://github.com/bambulab/BambuStudio.git 'refs/tags/v*' `
+                    | ForEach-Object { ($_ -split '/')[-1] }
+                    | Sort-Object { [version]($_ -replace '^v','') }
+                    | Select-Object -Last 1)
+          if (-not $tag) { Write-Error "could not list tags"; exit 1 }
+          $upstream = $tag -replace '^v',''
+          $plugin = $upstream -replace '\.[0-9]+$','.99'
+          Write-Host "upstream tag    : $tag"
+          Write-Host "upstream version: $upstream"
+          Write-Host "plugin version  : $plugin"
+          "upstream_tag=$tag"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "upstream_version=$upstream" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "plugin_version=$plugin"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $env:VCPKG_ROOT = "${{ github.workspace }}/.vcpkg"
+          ./configure.ps1 `
+            -WithVersion '${{ steps.ver.outputs.plugin_version }}' `
+            -EnableTests `
+            -NoConfPatch `
+            -CMakeArg '-DOBN_VENDOR_MOSQUITTO=ON'
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Parallel
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          . ./config.ps1
+          ctest --test-dir $ObnBuildDir -C $ObnBuildType --output-on-failure
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          . ./config.ps1
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $cfg = $ObnBuildType
+          Copy-Item -Force "$ObnBuildDir/$cfg/bambu_networking.dll" dist/
+          Copy-Item -Force "$ObnBuildDir/$cfg/BambuSource.dll"      dist/
+          Copy-Item -Force "$ObnBuildDir/$cfg/live555.dll"          dist/
+          Copy-Item -Force "$ObnBuildDir/network_plugins.json"      dist/
+          Get-ChildItem dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: open-bambu-networking-windows-x64-${{ steps.ver.outputs.plugin_version }}
+          path: dist/
+          if-no-files-found: error

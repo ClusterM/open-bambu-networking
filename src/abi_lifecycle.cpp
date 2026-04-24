@@ -20,14 +20,13 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
     // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
 
-    OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
-             log_dir.c_str(),
 #ifdef OBN_VERSION_STRING
-             OBN_VERSION_STRING
+    const char* plugin_version = OBN_VERSION_STRING;
 #else
-             "unknown"
+    const char* plugin_version = "unknown";
 #endif
-             );
+    OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
+             log_dir.c_str(), plugin_version);
     try {
         return new Agent(std::move(log_dir));
     } catch (const std::exception& e) {
