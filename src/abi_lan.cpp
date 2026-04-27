@@ -66,10 +66,11 @@ OBN_ABI void bambu_network_install_device_cert(void* agent,
                                                std::string dev_id,
                                                bool        lan_only)
 {
-    // Demoted to DEBUG because Studio calls this ~1 Hz from its refresh
-    // timer; the agent internally dedups so real work only happens once per
-    // session and is logged there at INFO level.
-    OBN_DEBUG("install_device_cert dev=%s lan_only=%d", dev_id.c_str(), lan_only);
+    // Studio calls this ~1 Hz from its refresh timer; the agent
+    // internally dedups so real work only happens once per session
+    // (logged there at INFO level). Keep the per-tick trace at TRACE
+    // so the default log isn't drowned in identical lines.
+    OBN_TRACE("install_device_cert dev=%s lan_only=%d", dev_id.c_str(), lan_only);
     auto* a = as_agent(agent);
     if (!a) return;
     a->install_device_cert(dev_id, lan_only);

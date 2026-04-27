@@ -25,18 +25,23 @@ OBN_ABI int bambu_network_change_user(void* agent, std::string user_info)
 
 OBN_ABI bool bambu_network_is_user_login(void* agent)
 {
+    // Studio polls this ~5 ms apart from its main timer, so even DEBUG
+    // drowns the rest of the log. Demote to TRACE; flip OBN_LOG_LEVEL=
+    // trace to see it.
     if (auto* a = as_agent(agent)) {
         bool v = a->user_logged_in();
-        OBN_DEBUG("is_user_login -> %s", v ? "true" : "false");
+        OBN_TRACE("is_user_login -> %s", v ? "true" : "false");
         return v;
     }
-    OBN_DEBUG("is_user_login -> false (no agent)");
+    OBN_TRACE("is_user_login -> false (no agent)");
     return false;
 }
 
 OBN_ABI int bambu_network_user_logout(void* agent, bool request)
 {
-    OBN_DEBUG("user_logout request=%d", request);
+    // Polled by Studio every ~2 s as a safety-net even when the user
+    // isn't logged in. Keep this off the default log to avoid noise.
+    OBN_TRACE("user_logout request=%d", request);
     if (auto* a = as_agent(agent)) a->clear_session();
     return BAMBU_NETWORK_SUCCESS;
 }
@@ -136,8 +141,10 @@ OBN_ABI std::string bambu_network_build_login_cmd(void* agent)
 
 OBN_ABI std::string bambu_network_build_logout_cmd(void* agent)
 {
+    // Mirrors user_logout polling cadence (~2 s); demote to TRACE for
+    // the same reason.
     auto r = build_session_cmd(as_agent(agent), /*logout=*/true);
-    OBN_DEBUG("build_logout_cmd -> len=%zu", r.size());
+    OBN_TRACE("build_logout_cmd -> len=%zu", r.size());
     return r;
 }
 
