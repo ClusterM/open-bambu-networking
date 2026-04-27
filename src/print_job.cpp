@@ -97,6 +97,26 @@ std::string sanitize_remote_name(std::string name)
     return name;
 }
 
+// Strips a trailing `.gcode.3mf` or `.3mf` extension if present. Used
+// before re-adding `.gcode.3mf` in pick_remote_name so we don't end up
+// with names like `foo.gcode.3mf.gcode.3mf` when Studio hands us a
+// `project_name` that already includes the extension (which it does in
+// the Send-to-Printer flow - the dialog uses the source filename as
+// the task name verbatim).
+std::string strip_3mf_extension(std::string name)
+{
+    auto ends_with = [](const std::string& s, const char* suf) {
+        std::size_t n = std::strlen(suf);
+        return s.size() >= n &&
+               std::equal(suf, suf + n, s.end() - n);
+    };
+    if (ends_with(name, ".gcode.3mf"))
+        name.resize(name.size() - std::strlen(".gcode.3mf"));
+    else if (ends_with(name, ".3mf"))
+        name.resize(name.size() - std::strlen(".3mf"));
+    return name;
+}
+
 // Returns a millisecond-resolution epoch timestamp string suitable for
 // use as a sequence_id; matches the Bambu plugin's style.
 std::string now_seq_id()
@@ -147,6 +167,7 @@ std::string pick_remote_name(const BBL::PrintParams& p)
     std::string project = p.project_name;
     if (project.empty()) project = p.task_name;
     project = sanitize_remote_name(project);
+    project = strip_3mf_extension(project);
 
     if (!project.empty()) return project + ".gcode.3mf";
 
