@@ -718,11 +718,13 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
 
             std::uint64_t total = 0;
             std::string ca_file = bambu_ca_bundle_path();
+            std::string stored_path;
             if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
                                                update_fn, cancel_fn,
                                                BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
-                                               total);
+                                               total, &stored_path);
                 rc != 0) return rc;
+            if (!stored_path.empty()) lan_remote_path = stored_path;
             OBN_INFO("cloud_print: lan-ftps uploaded %llu bytes to %s",
                      static_cast<unsigned long long>(total), lan_remote_path.c_str());
         }

@@ -23,8 +23,10 @@
 #include "obn/log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -153,13 +155,75 @@ std::string pick_remote_name(const BBL::PrintParams& p)
     return "print.gcode.3mf";
 }
 
+namespace {
+
+// True when `path` starts with `prefix` followed by `/`. Used to detect
+// `/sdcard/...` and `/usb/...` paths that we want to auto-correct
+// against the printer's actual FTPS layout.
+bool path_under(const std::string& path, const char* prefix)
+{
+    std::size_t plen = std::strlen(prefix);
+    return path.size() > plen + 1 &&
+           std::equal(path.begin(), path.begin() + plen, prefix) &&
+           path[plen] == '/';
+}
+
+// Picks the actual storage prefix to STOR under by CWD-probing the
+// printer. Mirrors the auto-detection in `abi_ft.cpp` (Send-to-Printer
+// fastpath) and `BambuSource.cpp` (PrinterFileSystem CTRL bridge):
+// firmware on A1 / A1 mini / P2S exposes the storage mount either as
+// `/sdcard`, `/usb`, or as the FTPS root itself - we pick whichever
+// answers and rewrite the directory portion of `remote_path` to match.
+//
+// Probe order keeps the caller-supplied prefix first so X1 / P1 (where
+// `/sdcard` really exists) take the fast path with no extra round-trip
+// cost beyond the CWD itself. If every probe 550s we leave the path
+// untouched so the original STOR error reaches the upper layer with
+// the path the caller asked for.
+std::string adjust_storage_path(obn::ftps::Client& cli,
+                                const std::string& remote_path)
+{
+    const bool under_sdcard = path_under(remote_path, "/sdcard");
+    const bool under_usb    = path_under(remote_path, "/usb");
+    if (!under_sdcard && !under_usb) return remote_path;
+
+    auto slash = remote_path.find('/', 1);
+    std::string filename = (slash == std::string::npos)
+                               ? std::string{}
+                               : remote_path.substr(slash + 1);
+    if (filename.empty()) return remote_path;
+
+    static const std::array<const char*, 3> kCandidatesSdcard = {"/sdcard", "/usb", "/"};
+    static const std::array<const char*, 3> kCandidatesUsb    = {"/usb", "/sdcard", "/"};
+    const auto& candidates = under_sdcard ? kCandidatesSdcard : kCandidatesUsb;
+
+    for (const char* cand : candidates) {
+        if (!cli.cwd(cand).empty()) continue;
+        std::string adjusted =
+            (std::strcmp(cand, "/") == 0) ? ("/" + filename)
+                                          : (std::string{cand} + "/" + filename);
+        if (adjusted != remote_path) {
+            OBN_DEBUG("print_job: storage probe rewrote '%s' -> '%s'",
+                     remote_path.c_str(), adjusted.c_str());
+        }
+        return adjusted;
+    }
+    OBN_WARN("print_job: storage probe found neither /sdcard, /usb nor /; "
+             "falling back to the caller-supplied path '%s'",
+             remote_path.c_str());
+    return remote_path;
+}
+
+} // namespace
+
 int ftp_upload(const BBL::PrintParams&    p,
                const std::string&         remote_path,
                const std::string&         ca_file,
                BBL::OnUpdateStatusFn      update_fn,
                BBL::WasCancelledFn        cancel_fn,
                int                        err_code_on_failure,
-               std::uint64_t&             total_bytes_out)
+               std::uint64_t&             total_bytes_out,
+               std::string*               selected_remote_path)
 {
     std::error_code ec;
     auto sz = std::filesystem::file_size(p.filename, ec);
@@ -192,6 +256,9 @@ int ftp_upload(const BBL::PrintParams&    p,
         return err_code_on_failure;
     }
 
+    std::string effective_path = adjust_storage_path(cli, remote_path);
+    if (selected_remote_path) *selected_remote_path = effective_path;
+
     auto progress = [&](std::uint64_t sent, std::uint64_t total) {
         if (cancel_fn && cancel_fn()) return false;
         if (update_fn) {
@@ -203,10 +270,10 @@ int ftp_upload(const BBL::PrintParams&    p,
         return true;
     };
 
-    std::string err = cli.stor(p.filename, remote_path, progress);
+    std::string err = cli.stor(p.filename, effective_path, progress);
     cli.quit();
     if (!err.empty()) {
-        OBN_ERROR("print_job: STOR %s failed: %s", remote_path.c_str(), err.c_str());
+        OBN_ERROR("print_job: STOR %s failed: %s", effective_path.c_str(), err.c_str());
         int code = err == "upload cancelled" ? BAMBU_NETWORK_ERR_CANCELED
                                              : err_code_on_failure;
         if (update_fn) update_fn(BBL::PrintingStageERROR, code, err);
@@ -293,8 +360,10 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     std::string ca_file = bambu_ca_bundle_path();
 
     std::uint64_t total = 0;
+    std::string   stored_path;
     int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
-                                   BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total);
+                                   BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total,
+                                   &stored_path);
     if (rc != 0) return rc;
 
     if (cancel_fn && cancel_fn()) {
@@ -305,8 +374,8 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
 
     print_job::ProjectFileOpts opts;
-    opts.file_path = remote_path;
-    opts.url       = "ftp://" + remote_path; // printer fetches from its own FTPS
+    opts.file_path = stored_path;
+    opts.url       = "ftp://" + stored_path; // printer fetches from its own FTPS
     opts.md5       = params.ftp_file_md5;
     std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());

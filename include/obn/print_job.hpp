@@ -26,13 +26,23 @@ std::string pick_remote_name(const BBL::PrintParams& p);
 // cancel_fn. Returns 0 on success or a BAMBU_NETWORK_ERR_* code
 // (err_code_on_failure is used for generic transport/upload errors; a
 // cancellation is always reported as BAMBU_NETWORK_ERR_CANCELED).
+//
+// When `remote_path` starts with `/sdcard/` or `/usb/`, we transparently
+// probe the printer with CWD across `{sdcard, usb, root}` and rewrite
+// the directory portion to whichever mount actually answers - the same
+// auto-detection logic `abi_ft.cpp` and the BambuSource CTRL bridge
+// already apply (matters on A1 / A1 mini / P2S firmware variants where
+// the FTPS root is the storage mount and `/sdcard` / `/usb` 550s). The
+// caller can read the final path via `*selected_remote_path` (when
+// non-null) to keep its `project_file` MQTT payload in sync.
 int ftp_upload(const BBL::PrintParams& p,
                const std::string&      remote_path,
                const std::string&      ca_file,
                BBL::OnUpdateStatusFn   update_fn,
                BBL::WasCancelledFn     cancel_fn,
                int                     err_code_on_failure,
-               std::uint64_t&          total_bytes_out);
+               std::uint64_t&          total_bytes_out,
+               std::string*            selected_remote_path = nullptr);
 
 // Options controlling the project_file payload we publish over MQTT.
 // Cloud print fills in the real ids/url; LAN print uses "0" for ids
