@@ -148,7 +148,7 @@ add_compile_options(
 # --------------------------------------------------------------------------
 
 find_package(PkgConfig REQUIRED)
-find_package(OpenSSL REQUIRED)
+find_package(OpenSSL COMPONENTS SSL REQUIRED)
 
 if(OBN_VENDOR_MOSQUITTO AND OBN_STATIC_MOSQUITTO)
     message(WARNING
