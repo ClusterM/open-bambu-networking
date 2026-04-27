@@ -526,6 +526,14 @@ struct Tunnel {
     // Cancellation flag set from a different thread by Bambu_Close.
     std::atomic<bool> closing{false};
 
+    // Serialises access to `ssl` / `fd` against tunnel_close. Held by
+    // every SSL_read iteration on the streaming thread, and acquired
+    // by tunnel_close after it has shut the socket down (which wakes
+    // any blocked SSL_read so the lock can actually be obtained).
+    // Without this Studio's reconnect-on-stall path used to free SSL
+    // out from under the reader and segfault.
+    std::mutex mjpg_io_mu;
+
     // Diagnostic counter; we log a line every Nth frame so the mirror
     // file tells us "stream is alive" without drowning in per-frame spam.
     std::uint64_t frame_count = 0;
@@ -573,19 +581,33 @@ void tunnel_close(Tunnel* t)
 {
     if (!t) return;
     t->closing.store(true, std::memory_order_release);
-    if (t->ssl) {
-        // Best-effort shutdown; the printer doesn't care about clean
-        // close_notify, and we'd rather exit fast than block on a
-        // dying TLS connection.
-        SSL_shutdown(t->ssl);
-        SSL_free(t->ssl);
-        t->ssl = nullptr;
+
+    // Step 1 (no lock): wake the reader. SSL_read on the streaming
+    // thread sits in recv() up to SO_RCVTIMEO (5 s); shutting down
+    // the socket from under it makes recv() return immediately so it
+    // can drop mjpg_io_mu and let us free the SSL object below. This
+    // is intentionally done WITHOUT mjpg_io_mu — we'd deadlock against
+    // the in-flight SSL_read otherwise.
+    if (t->fd >= 0) ::shutdown(t->fd, SHUT_RDWR);
+
+    // Step 2: serialise with the reader. Once we hold mjpg_io_mu nobody
+    // can be inside SSL_read on this tunnel, so SSL_free is safe.
+    {
+        std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+        if (t->ssl) {
+            // Best-effort close_notify; the printer doesn't care and
+            // the socket is already half-shut so SSL_shutdown will
+            // return quickly even if the write fails.
+            SSL_shutdown(t->ssl);
+            SSL_free(t->ssl);
+            t->ssl = nullptr;
+        }
+        if (t->fd >= 0) {
+            ::close(t->fd);
+            t->fd = -1;
+        }
     }
-    if (t->fd >= 0) {
-        ::shutdown(t->fd, SHUT_RDWR);
-        ::close(t->fd);
-        t->fd = -1;
-    }
+
     if (t->pipeline) {
         // NULL state tears down rtspsrc cleanly; then unref. Note we do
         // NOT unref t->appsink separately: the appsink lives inside the
@@ -655,15 +677,28 @@ int ssl_write_all(SSL* ssl, const void* buf, size_t len)
 }
 
 // Reads exactly `len` bytes. Returns 0 on OK, 1 on EOF, -1 on error.
+//
+// The SSL object and SSL_get_error access are taken under
+// `t->mjpg_io_mu` so a concurrent tunnel_close() cannot pull SSL out
+// from under us. tunnel_close() shuts the socket down first, which
+// causes the in-flight SSL_read to return promptly with an error so
+// we drop the lock and let the closer make progress.
 int ssl_read_all(Tunnel* t, void* buf, size_t len)
 {
     auto* p = static_cast<uint8_t*>(buf);
     size_t got = 0;
     while (got < len) {
         if (t->closing.load(std::memory_order_acquire)) return -1;
-        int n = SSL_read(t->ssl, p + got, static_cast<int>(len - got));
+        int n;
+        int err = SSL_ERROR_NONE;
+        {
+            std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+            if (!t->ssl || t->closing.load(std::memory_order_acquire))
+                return -1;
+            n = SSL_read(t->ssl, p + got, static_cast<int>(len - got));
+            if (n <= 0) err = SSL_get_error(t->ssl, n);
+        }
         if (n <= 0) {
-            int err = SSL_get_error(t->ssl, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
             if (err == SSL_ERROR_ZERO_RETURN) return 1;
             return -1;
