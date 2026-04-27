@@ -27,8 +27,6 @@ OBN_ABI bool bambu_network_is_user_login(void* agent)
 {
     if (auto* a = as_agent(agent)) {
         bool v = a->user_logged_in();
-        // Studio polls this on every paint of the sidebar avatar widget;
-        // at INFO it drowns out every other line, so demote to DEBUG.
         OBN_DEBUG("is_user_login -> %s", v ? "true" : "false");
         return v;
     }
@@ -38,7 +36,7 @@ OBN_ABI bool bambu_network_is_user_login(void* agent)
 
 OBN_ABI int bambu_network_user_logout(void* agent, bool request)
 {
-    OBN_INFO("user_logout request=%d", request);
+    OBN_DEBUG("user_logout request=%d", request);
     if (auto* a = as_agent(agent)) a->clear_session();
     return BAMBU_NETWORK_SUCCESS;
 }
