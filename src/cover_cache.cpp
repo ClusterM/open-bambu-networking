@@ -1,6 +1,7 @@
 #include "obn/cover_cache.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,13 +59,34 @@ void release_inflight(const std::string& key)
     g_inflight.erase(key);
 }
 
+// Tries the given remote paths over a single FTPS session and returns
+// the bytes of whichever one answered. We need to fan out because the
+// .3mf file can live in any of:
+//   * `/cache/<name>` - default landing for `run_local_print_job`
+//     uploads (most printers).
+//   * `/sdcard/<name>` - X1 / P1 / first-gen A1 mini with the SD-card
+//     mount, when the file came in via `run_send_gcode_to_sdcard`
+//     (Send-to-Printer flow).
+//   * `/usb/<name>` - same as above but the printer has a USB stick
+//     instead of an SD card.
+//   * `/<name>` - A1 mini / P2S firmware that exposes the storage
+//     mount AS the FTPS root (no `/sdcard` subtree at all). Both our
+//     `ftp_upload` storage probe and the BambuSource CTRL bridge
+//     handle this; we mirror it here.
+// Reusing the same Client across attempts keeps the FTPS handshake
+// cost (TLS + AUTH + PROT) to one round even when the first few paths
+// 550. `retr` leaves the control channel valid after a 550, so this is
+// safe.
 bool download_ftps_file(const std::string& host,
                         const std::string& user,
                         const std::string& password,
                         const std::string& ca_file,
-                        const std::string& remote_path,
-                        std::vector<std::uint8_t>* out)
+                        const std::vector<std::string>& remote_paths,
+                        std::vector<std::uint8_t>* out,
+                        std::string* picked_path)
 {
+    if (remote_paths.empty()) return false;
+
     obn::ftps::ConnectConfig cfg;
     cfg.host     = host;
     cfg.username = user.empty() ? std::string{"bblp"} : user;
@@ -77,22 +99,31 @@ bool download_ftps_file(const std::string& host,
                   host.c_str(), err.c_str());
         return false;
     }
-    out->clear();
-    out->reserve(4 * 1024 * 1024);
-    std::string err = c.retr(remote_path,
-        [&](const void* data, std::size_t len) {
-            const auto* p = static_cast<const std::uint8_t*>(data);
-            out->insert(out->end(), p, p + len);
-            // Hard cap: .3mf shouldn't exceed 200 MB; if it does we
-            // stop and log, since any cover is better than OOM.
-            return out->size() < static_cast<std::size_t>(200) << 20;
-        });
-    c.quit();
-    if (!err.empty()) {
-        OBN_DEBUG("cover_cache: retr %s: %s", remote_path.c_str(), err.c_str());
-        return false;
+
+    bool fetched = false;
+    for (const auto& remote_path : remote_paths) {
+        out->clear();
+        out->reserve(4 * 1024 * 1024);
+        std::string err = c.retr(remote_path,
+            [&](const void* data, std::size_t len) {
+                const auto* p = static_cast<const std::uint8_t*>(data);
+                out->insert(out->end(), p, p + len);
+                // Hard cap: .3mf shouldn't exceed 200 MB; if it does we
+                // stop and log, since any cover is better than OOM.
+                return out->size() < static_cast<std::size_t>(200) << 20;
+            });
+        if (err.empty() && !out->empty()) {
+            if (picked_path) *picked_path = remote_path;
+            fetched = true;
+            break;
+        }
+        if (!err.empty()) {
+            OBN_DEBUG("cover_cache: retr %s: %s", remote_path.c_str(), err.c_str());
+        }
     }
-    return !out->empty();
+    c.quit();
+    if (!fetched) out->clear();
+    return fetched;
 }
 
 // Writes `bytes` to `final_path` atomically via a .tmp sibling + rename.
@@ -141,30 +172,45 @@ void fetch_worker(std::string host,
     //     SelectMachineDialog / "Send to Printer" flow.
     //   * Old/export: "<subtask_name>.3mf".
     // HA (ha_bambu_lab/.../models.py ~line 1296) does the same fan-out.
-    std::vector<std::string> candidates;
-    auto push_candidate = [&](std::string name) {
-        if (!name.empty()) candidates.push_back("/cache/" + name);
-    };
-    // If subtask_name already ends in an extension, trust it.
     auto ends_with = [](const std::string& s, const std::string& suf) {
         return s.size() >= suf.size() &&
                std::equal(suf.rbegin(), suf.rend(), s.rbegin());
     };
+    std::vector<std::string> names;
     if (ends_with(subtask_name, ".3mf")) {
-        push_candidate(subtask_name);
+        names.push_back(subtask_name);
     } else {
-        push_candidate(subtask_name + ".gcode.3mf");
-        push_candidate(subtask_name + ".3mf");
+        names.push_back(subtask_name + ".gcode.3mf");
+        names.push_back(subtask_name + ".3mf");
+    }
+
+    // For each candidate name, fan out across the storage mounts the
+    // file might live in. Order matters - the most likely location for
+    // each printer family is tried first to minimise 550-spam:
+    //   /cache/    : where `run_local_print_job` lands print files on
+    //                most printers (X1/P1/H2D/X2D/...).
+    //   /sdcard/   : Send-to-Printer flow on X1/P1/A1 with SD card.
+    //   /usb/      : same flow on printers with a USB stick.
+    //   /          : A1 mini / P2S firmware where the FTPS root itself
+    //                is the storage mount; the same logic our
+    //                `ftp_upload` storage probe implements for STOR.
+    static constexpr std::array<const char*, 4> kPrefixes = {
+        "/cache/", "/sdcard/", "/usb/", "/"};
+    std::vector<std::string> candidates;
+    candidates.reserve(names.size() * kPrefixes.size());
+    for (const auto& n : names) {
+        if (n.empty()) continue;
+        for (const char* prefix : kPrefixes) {
+            candidates.push_back(std::string{prefix} + n);
+        }
     }
 
     std::vector<std::uint8_t> zipbuf;
-    for (const auto& c : candidates) {
-        zipbuf.clear();
-        if (download_ftps_file(host, user, password, ca_file, c, &zipbuf)) {
-            OBN_DEBUG("cover_cache: fetched %s (%zu bytes)",
-                      c.c_str(), zipbuf.size());
-            break;
-        }
+    std::string picked;
+    if (download_ftps_file(host, user, password, ca_file, candidates,
+                           &zipbuf, &picked)) {
+        OBN_DEBUG("cover_cache: fetched %s (%zu bytes)",
+                  picked.c_str(), zipbuf.size());
     }
     if (zipbuf.empty()) {
         OBN_DEBUG("cover_cache: no .3mf found for subtask '%s'",
