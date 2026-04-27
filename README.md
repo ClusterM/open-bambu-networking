@@ -807,15 +807,59 @@ The file sink (if any) omits the `[obn] ` prefix — the file is plugin-only.
 where `tid` is the OS thread id — useful to correlate MQTT
 background-thread activity with Studio main-thread ABI calls.
 
-**Secrets — be careful before sharing a log.** The plugin does *not*
-currently auto-redact secrets. At `debug` and `trace` levels the log
-can contain: printer access codes (MQTT password), session bearer /
-refresh tokens from `obn.auth.json`, raw MQTT `push_status` payloads
-(which include serial numbers and filament metadata), FTPS file
-paths, and device IPs. Before pasting a log into a bug report, grep
-out `access_code`, `Bearer`, `accessToken`, `refreshToken`,
-`password`, and your printer's serial / WAN IP. (Tightening this up
-into a proper redacting logger is on the TODO list.)
+### `libBambuSource` (camera / file browser) logging
+
+The optional `libBambuSource` shared library — used by Studio for
+camera live view and the printer file browser — keeps a separate
+log of its own. By default it mirrors every message into
+`$XDG_STATE_HOME/bambu-studio/obn-bambusource.log`
+(falling back to `$HOME/.local/state/bambu-studio/obn-bambusource.log`
+or `/tmp/obn-bambusource.log`), so you can diagnose RTSPS / MJPG /
+FTPS-CTRL issues even when Studio's own log capture is silent.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OBN_BAMBUSOURCE_LOG_FILE` | *(autodetect)* | Absolute path for the mirror log. Use `off` / `none` / `0` / empty to disable the file mirror; `stderr` or `-` routes to stderr. |
+| `OBN_BAMBUSOURCE_LOG_LEVEL` | `info` | Threshold: `trace`, `debug`, `info`, `warn`, `error`, `off`. Filters both the file mirror and the callback Studio receives, so `debug` adds extra detail (e.g. `tunnel_close` / `ssl_read_all` diagnostics) without needing `GST_DEBUG=bambusrc:5`. |
+| `OBN_GST_DEBUG` | `WARNING` | Routes GStreamer's internal log into the same mirror file. Raise to `INFO`/`DEBUG`/`LOG` when investigating RTSPS handshake failures. |
+
+Example — capture only the camera/file-browser side at debug level
+into a fixed path while keeping the main plugin log at info:
+
+```sh
+OBN_BAMBUSOURCE_LOG_FILE=/tmp/obn-bambusource.log \
+OBN_BAMBUSOURCE_LOG_LEVEL=debug \
+OBN_LOG_TO_FILE=1 \
+bambu-studio
+```
+
+Example — silence the camera mirror entirely (Studio's own log
+capture, e.g. `OrcaSlicer.log` on macOS, still receives the
+messages because the callback is independent of the file mirror):
+
+```sh
+OBN_BAMBUSOURCE_LOG_FILE=off bambu-studio
+```
+
+Note that `libBambuSource` is loaded by Studio via `dlopen`, in the
+same process, so its messages also reach Studio's own log via the
+logger callback Studio registers. The mirror file is just a
+convenience that survives crashes and works without setting
+`GST_DEBUG`.
+
+**Secrets — be careful before sharing a log.** Neither
+`obn.log` nor `obn-bambusource.log` currently auto-redacts
+secrets. At `debug` and `trace` levels the main plugin log can
+contain: printer access codes (MQTT password), session bearer /
+refresh tokens from `obn.auth.json`, raw MQTT `push_status`
+payloads (which include serial numbers and filament metadata),
+FTPS file paths, and device IPs. The `libBambuSource` mirror is
+narrower (it does not see MQTT or auth tokens), but it still logs
+FTPS paths, file names, and printer IPs. Before pasting either
+log into a bug report, grep out `access_code`, `Bearer`,
+`accessToken`, `refreshToken`, `password`, and your printer's
+serial / WAN IP. (Tightening this up into a proper redacting
+logger is on the TODO list.)
 
 ## License
 
