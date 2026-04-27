@@ -176,18 +176,80 @@ namespace {
 
 void noop_logger(void*, int, tchar const*) {}
 
+// -----------------------------------------------------------------------
+// Log levels. Used both to tag log_at() call sites and to filter via
+// OBN_BAMBUSOURCE_LOG_LEVEL (default INFO). Existing log_fmt() callers
+// are treated as INFO so behaviour is unchanged unless the user opts in.
+// -----------------------------------------------------------------------
+enum LogLevel {
+    LL_TRACE = 0,
+    LL_DEBUG = 1,
+    LL_INFO  = 2,
+    LL_WARN  = 3,
+    LL_ERROR = 4,
+    LL_OFF   = 5,
+};
+
+LogLevel parse_log_level(const char* s, LogLevel fallback)
+{
+    if (!s || !*s) return fallback;
+    auto eq = [&](const char* a) {
+        for (size_t i = 0;; ++i) {
+            char x = s[i];
+            char y = a[i];
+            if (x >= 'A' && x <= 'Z') x = static_cast<char>(x - 'A' + 'a');
+            if (x != y) return false;
+            if (!x) return true;
+        }
+    };
+    if (eq("trace")) return LL_TRACE;
+    if (eq("debug")) return LL_DEBUG;
+    if (eq("info"))  return LL_INFO;
+    if (eq("warn") || eq("warning")) return LL_WARN;
+    if (eq("error") || eq("err"))    return LL_ERROR;
+    if (eq("off") || eq("none") || eq("silent") || eq("0")) return LL_OFF;
+    return fallback;
+}
+
+LogLevel current_log_level()
+{
+    static const LogLevel lvl = []() {
+        return parse_log_level(std::getenv("OBN_BAMBUSOURCE_LOG_LEVEL"),
+                               LL_INFO);
+    }();
+    return lvl;
+}
+
 // A file-backed mirror of every log line. Studio's gstbambusrc routes
 // our log callback through GST_DEBUG, which is invisible without
 // GST_DEBUG=bambusrc:5 in the environment. Duplicating into a stable
 // on-disk path lets us debug the camera pipeline regardless of how the
 // user launched Bambu Studio.
 //
-// Path: $XDG_STATE_HOME/bambu-studio/obn-bambusource.log, or
-//       $HOME/.local/state/bambu-studio/obn-bambusource.log,
-//       or /tmp/obn-bambusource.log as last resort.
+// Resolution order:
+//   1. $OBN_BAMBUSOURCE_LOG_FILE (set to "off"/"none"/empty to disable
+//      the file mirror entirely; "stderr" routes to stderr).
+//   2. $XDG_STATE_HOME/bambu-studio/obn-bambusource.log
+//   3. $HOME/.local/state/bambu-studio/obn-bambusource.log
+//   4. /tmp/obn-bambusource.log (last resort)
 FILE* mirror_log_fp()
 {
     static FILE* fp = []() -> FILE* {
+        if (const char* env = std::getenv("OBN_BAMBUSOURCE_LOG_FILE")) {
+            if (!*env || !std::strcmp(env, "off") ||
+                !std::strcmp(env, "none") || !std::strcmp(env, "0"))
+                return nullptr;
+            if (!std::strcmp(env, "stderr") || !std::strcmp(env, "-"))
+                return stderr;
+            if (FILE* f = std::fopen(env, "a")) {
+                std::setvbuf(f, nullptr, _IOLBF, 0);
+                std::fprintf(f, "--- obn libBambuSource opened ---\n");
+                return f;
+            }
+            // Fall through to the default search if the user-supplied
+            // path could not be opened — better than dropping logs.
+        }
+
         const char* paths[3] = {nullptr, nullptr, "/tmp/obn-bambusource.log"};
         static std::string p0, p1;
         if (const char* xdg = std::getenv("XDG_STATE_HOME")) {
@@ -211,12 +273,27 @@ FILE* mirror_log_fp()
     return fp;
 }
 
-// Simple printf-style helper used by the tunnel internals. Writes to the
-// (optional) logger callback AND to the on-disk mirror so we don't need
-// GST_DEBUG set to diagnose handshake failures.
-[[gnu::format(printf, 3, 4)]]
-void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
+const char* level_tag(LogLevel lvl)
 {
+    switch (lvl) {
+        case LL_TRACE: return "TRACE";
+        case LL_DEBUG: return "DEBUG";
+        case LL_INFO:  return "INFO";
+        case LL_WARN:  return "WARN";
+        case LL_ERROR: return "ERROR";
+        case LL_OFF:   return "OFF";
+    }
+    return "?";
+}
+
+// Core sink. Honors the configured log level both for the file mirror
+// and the Studio callback (so OBN_BAMBUSOURCE_LOG_LEVEL=debug enables
+// extra detail without spamming Studio's own log when set higher).
+[[gnu::format(printf, 4, 5)]]
+void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...)
+{
+    if (lvl < current_log_level()) return;
+
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -229,13 +306,41 @@ void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
         char ts[32];
         std::strftime(ts, sizeof(ts), "%F %T",
                       std::localtime(&tt));
-        std::fprintf(fp, "%s %s\n", ts, buf);
+        std::fprintf(fp, "%s [%s] %s\n", ts, level_tag(lvl), buf);
     }
 
     if (logger) {
         // Studio expects a heap-allocated buffer that it will free via
         // Bambu_FreeLogMsg. strdup() is the idiomatic way.
-        logger(ctx, /*level=*/0, strdup(buf));
+        logger(ctx, /*level=*/static_cast<int>(lvl), strdup(buf));
+    }
+}
+
+// Backwards-compatible default (INFO) so existing call sites keep
+// working unchanged. New code should prefer log_at() with an explicit
+// level when the message is debug/warn/error in nature.
+[[gnu::format(printf, 3, 4)]]
+void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
+{
+    if (LL_INFO < current_log_level()) return;
+
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (FILE* fp = mirror_log_fp()) {
+        auto now = std::chrono::system_clock::now();
+        auto tt  = std::chrono::system_clock::to_time_t(now);
+        char ts[32];
+        std::strftime(ts, sizeof(ts), "%F %T",
+                      std::localtime(&tt));
+        std::fprintf(fp, "%s [INFO] %s\n", ts, buf);
+    }
+
+    if (logger) {
+        logger(ctx, /*level=*/static_cast<int>(LL_INFO), strdup(buf));
     }
 }
 
@@ -581,6 +686,10 @@ void tunnel_close(Tunnel* t)
 {
     if (!t) return;
     t->closing.store(true, std::memory_order_release);
+    log_at(LL_DEBUG, t->logger, t->log_ctx,
+           "tunnel_close: shutting down (fd=%d ssl=%p frames=%llu)",
+           t->fd, static_cast<void*>(t->ssl),
+           static_cast<unsigned long long>(t->frame_count));
 
     // Step 1 (no lock): wake the reader. SSL_read on the streaming
     // thread sits in recv() up to SO_RCVTIMEO (5 s); shutting down
@@ -700,7 +809,16 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
         }
         if (n <= 0) {
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
-            if (err == SSL_ERROR_ZERO_RETURN) return 1;
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                log_at(LL_DEBUG, t->logger, t->log_ctx,
+                       "ssl_read_all: clean EOF after %zu/%zu bytes",
+                       got, len);
+                return 1;
+            }
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
+                   "ssl_read_all: SSL_read failed n=%d err=%d errno=%d "
+                   "after %zu/%zu bytes",
+                   n, err, errno, got, len);
             return -1;
         }
         got += static_cast<size_t>(n);
