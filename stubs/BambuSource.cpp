@@ -1891,6 +1891,25 @@ std::string ensure_ftp(Tunnel* t)
     return {};
 }
 
+// Tears down the current FTPS client and reconnects from scratch.
+//
+// Bambu firmware closes idle control connections after roughly five
+// minutes (we've seen "221 Service closing" come back on a PASV that
+// followed a long UI pause). Without recovery the next CTRL request
+// reports an empty directory / file-not-found and the user has to
+// reopen the file panel. Reconnect-once on first error masks the
+// timeout transparently.
+std::string reconnect_ftp(Tunnel* t)
+{
+    if (t->ftp) {
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: dropping stale FTPS session");
+        t->ftp->quit();
+        t->ftp.reset();
+    }
+    return ensure_ftp(t);
+}
+
 // Subtree on the printer where Studio's `type` argument routes.
 // Studio asks for { "timelapse" | "video" | "model" }:
 //   * timelapse -> <prefix>/timelapse/ (mp4 + matching .jpg thumb)
@@ -1995,6 +2014,22 @@ void handle_list_info(Tunnel* t, int sequence, const obn::json::Value& req)
     std::vector<obn::ftps::Entry> entries;
     err = t->ftp->list_entries(path, &entries);
     if (!err.empty()) {
+        // Could be a real "directory missing" or a stale control
+        // connection (Bambu firmware drops idle FTPS after ~5 min).
+        // Try once with a fresh session to disambiguate before
+        // surfacing an empty list to Studio.
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: LIST_INFO type=%s path=%s: %s — reconnecting once",
+               type.c_str(), path.c_str(), err.c_str());
+        if (reconnect_ftp(t).empty()) {
+            // Storage prefix may have changed across the reconnect;
+            // re-resolve to be safe.
+            path = resolve_subtree(t, type);
+            entries.clear();
+            err = t->ftp->list_entries(path, &entries);
+        }
+    }
+    if (!err.empty()) {
         // Directory missing on this printer (e.g. no timelapses yet).
         // Return an empty list rather than an error - Studio treats
         // that as "nothing to show".
@@ -2045,18 +2080,31 @@ void handle_list_info(Tunnel* t, int sequence, const obn::json::Value& req)
 // Downloads a file over FTPS into memory (for SUB_FILE thumbnails or
 // small 3mf previews). Caller decides if it's worth doing based on
 // size - we cap at 64 MB to avoid OOM on a pathological input.
+//
+// Retries once after a stale-session reconnect: the printer drops idle
+// FTPS control after ~5 minutes, and thumbnail fetches hit that window
+// often when the user is browsing the file panel.
 std::string download_blob(Tunnel* t, const std::string& full_path,
                           std::vector<std::uint8_t>* out)
 {
-    out->clear();
     constexpr std::size_t kMax = 64u * 1024u * 1024u;
-    return t->ftp->retr(full_path, [out](const void* data, std::size_t len) {
-        if (out->size() + len > kMax) return false;
-        out->insert(out->end(),
-                    static_cast<const std::uint8_t*>(data),
-                    static_cast<const std::uint8_t*>(data) + len);
-        return true;
-    });
+    auto do_retr = [&]() {
+        out->clear();
+        return t->ftp->retr(full_path, [out](const void* data, std::size_t len) {
+            if (out->size() + len > kMax) return false;
+            out->insert(out->end(),
+                        static_cast<const std::uint8_t*>(data),
+                        static_cast<const std::uint8_t*>(data) + len);
+            return true;
+        });
+    };
+    std::string err = do_retr();
+    if (err.empty()) return {};
+    log_at(LL_DEBUG, t->logger, t->log_ctx,
+           "ctrl: download_blob %s failed (%s) — reconnecting once",
+           full_path.c_str(), err.c_str());
+    if (!reconnect_ftp(t).empty()) return err;
+    return do_retr();
 }
 
 // SUB_FILE covers several unrelated Studio operations; the only
@@ -2163,12 +2211,29 @@ void handle_sub_file(Tunnel* t, int sequence, const obn::json::Value& req)
             std::vector<std::uint8_t> archive;
             archive.reserve(static_cast<std::size_t>(total_size ? total_size : kChunkSize));
             bool cancelled = false;
-            std::string err = t->ftp->retr(full, [&](const void* data, std::size_t len) {
-                if (is_cancelled(t, sequence)) { cancelled = true; return false; }
-                const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
-                archive.insert(archive.end(), p, p + len);
-                return true;
-            });
+            auto retr_into_archive = [&]() {
+                archive.clear();
+                cancelled = false;
+                return t->ftp->retr(full, [&](const void* data, std::size_t len) {
+                    if (is_cancelled(t, sequence)) { cancelled = true; return false; }
+                    const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
+                    archive.insert(archive.end(), p, p + len);
+                    return true;
+                });
+            };
+            std::string err = retr_into_archive();
+            if (!err.empty() && !cancelled) {
+                // Stale control connection? Reconnect once and retry.
+                // Safe because we haven't pushed any chunk to Studio
+                // for this base file yet.
+                log_at(LL_DEBUG, t->logger, t->log_ctx,
+                       "ctrl: SUB_FILE(zip) %s failed (%s) — reconnecting once",
+                       full.c_str(), err.c_str());
+                if (reconnect_ftp(t).empty()) {
+                    t->ftp->size(full, &total_size);
+                    err = retr_into_archive();
+                }
+            }
             if (cancelled) {
                 push_chunk(kResErrCancel, {}, nullptr, 0);
                 return;
@@ -2472,9 +2537,21 @@ void handle_file_download(Tunnel* t, int sequence, const obn::json::Value& req)
     }
 
     // Need total size up front so Studio's progress bar can render;
-    // SIZE is cheap on vsftpd.
+    // SIZE is cheap on vsftpd. SIZE also doubles as a probe of the
+    // control connection — if it failed, reconnect once and retry,
+    // because the printer closes idle FTPS after ~5 min.
     std::uint64_t total = 0;
-    t->ftp->size(path, &total);
+    {
+        std::string size_err = t->ftp->size(path, &total);
+        if (!size_err.empty()) {
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
+                   "ctrl: FILE_DOWNLOAD SIZE %s failed (%s) — reconnecting once",
+                   path.c_str(), size_err.c_str());
+            if (reconnect_ftp(t).empty()) {
+                t->ftp->size(path, &total);
+            }
+        }
+    }
 
     // Studio's download callback unconditionally reads `resp["file_md5"]`
     // once `offset + size == total`. If the field is missing nlohmann
@@ -2530,21 +2607,40 @@ void handle_file_download(Tunnel* t, int sequence, const obn::json::Value& req)
     };
 
     bool cancelled = false;
-    err = t->ftp->retr(path, [&](const void* data, std::size_t len) {
-        if (is_cancelled(t, sequence)) { cancelled = true; return false; }
-        // Hash the whole stream (Studio MD5s the bytes it wrote, which
-        // match what FTPS handed us modulo the chunk-size boundary).
-        EVP_DigestUpdate(md_ctx.get(), data, len);
-        const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
-        while (len > 0) {
-            std::size_t take = std::min(len, kChunkSize - buf.size());
-            buf.insert(buf.end(), p, p + take);
-            p   += take;
-            len -= take;
-            if (buf.size() == kChunkSize) flush_chunk(/*last=*/false);
+    auto run_retr = [&]() {
+        return t->ftp->retr(path, [&](const void* data, std::size_t len) {
+            if (is_cancelled(t, sequence)) { cancelled = true; return false; }
+            // Hash the whole stream (Studio MD5s the bytes it wrote,
+            // which match what FTPS handed us modulo the chunk-size
+            // boundary).
+            EVP_DigestUpdate(md_ctx.get(), data, len);
+            const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
+            while (len > 0) {
+                std::size_t take = std::min(len, kChunkSize - buf.size());
+                buf.insert(buf.end(), p, p + take);
+                p   += take;
+                len -= take;
+                if (buf.size() == kChunkSize) flush_chunk(/*last=*/false);
+            }
+            return true;
+        });
+    };
+    err = run_retr();
+    if (!err.empty() && !cancelled && sent == 0 && buf.empty()) {
+        // No chunks pushed yet — safe to drop and reconnect. Studio
+        // hasn't started accumulating offsets so a clean restart is
+        // transparent.
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: FILE_DOWNLOAD %s failed (%s) — reconnecting once",
+               path.c_str(), err.c_str());
+        if (reconnect_ftp(t).empty()) {
+            // MD5 context already accumulated nothing; reset anyway so
+            // a partial RETR can't poison the digest.
+            EVP_MD_CTX_reset(md_ctx.get());
+            EVP_DigestInit_ex(md_ctx.get(), EVP_md5(), nullptr);
+            err = run_retr();
         }
-        return true;
-    });
+    }
 
     if (cancelled) {
         auto env = make_reply_envelope(kCmdFileDownload, sequence, kResErrCancel,
@@ -2580,10 +2676,24 @@ void handle_file_del(Tunnel* t, int sequence, const obn::json::Value& req)
     const auto& paths = paths_v.as_array();
     obn::json::Array ok_names;
     int result = kResOK;
+    bool reconnected = false;
     for (const auto& v : paths) {
         std::string p = v.as_string();
         if (p.empty()) continue;
         std::string e = t->ftp->dele(p);
+        if (!e.empty() && !reconnected) {
+            // Stale control connection? Try once with a fresh session.
+            // We only reconnect on the first error to avoid storming
+            // the printer with retries when the file is genuinely
+            // gone.
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
+                   "ctrl: DELE %s failed (%s) — reconnecting once",
+                   p.c_str(), e.c_str());
+            reconnected = true;
+            if (reconnect_ftp(t).empty()) {
+                e = t->ftp->dele(p);
+            }
+        }
         if (!e.empty()) {
             log_fmt(t->logger, t->log_ctx,
                     "ctrl: DELE %s failed: %s", p.c_str(), e.c_str());
