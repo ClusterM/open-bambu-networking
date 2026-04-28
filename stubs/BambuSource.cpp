@@ -92,8 +92,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <jpeglib.h>
-#include <png.h>
+#include "image_io.hpp"
 #include <zlib.h>
 
 #include "obn/ftps.hpp"
@@ -795,142 +794,23 @@ static inline const ZipEntry* zip_find(const std::vector<ZipEntry>& d,
 // Studio then ends up with hs==vs, the content stays undistorted, and
 // the padding is invisible.
 //
-// Decoder accepts PNG or JPEG (libpng + libjpeg-turbo). Output is
-// always PNG so we only need one encoder and we get a clean alpha
-// channel for the padding. Caller updates its `mime` accordingly.
+// Decoder accepts PNG or JPEG (vendored stb_image; see image_io.hpp).
+// Output is always PNG so we only need one encoder and we get a clean
+// alpha channel for the padding. Caller updates its `mime` accordingly.
+//
+// We deliberately do not link against libpng / libjpeg-turbo here:
+// libBambuSource is dlopen'd inside Bambu Studio's process where
+// versions of those libraries are routinely mismatched with what
+// Studio's own GStreamer plugins (gstjpeg, etc.) and wxWidgets pull
+// in. The libjpeg-turbo ABI tag check ("Wrong JPEG library version:
+// library is 80, caller expects 62") would then abort() the whole
+// process the moment any party touches libjpeg through our globally
+// loaded copy. stb_image side-steps that entire family of bugs.
 //
 // Never fails destructively: any decode/encode error just returns the
 // original bytes unchanged and the caller keeps its original mime.
 
-struct DecodedRGBA {
-    std::vector<std::uint8_t> pixels;
-    std::uint32_t             w = 0;
-    std::uint32_t             h = 0;
-};
-
-bool decode_png_rgba(const std::vector<std::uint8_t>& in, DecodedRGBA* out)
-{
-    png_image img{};
-    img.version = PNG_IMAGE_VERSION;
-    if (png_image_begin_read_from_memory(&img, in.data(), in.size()) == 0) {
-        png_image_free(&img);
-        return false;
-    }
-    img.format = PNG_FORMAT_RGBA;
-    if (img.width == 0 || img.height == 0 ||
-        img.width > 8192 || img.height > 8192) {
-        png_image_free(&img);
-        return false;
-    }
-    out->w = img.width;
-    out->h = img.height;
-    out->pixels.assign(PNG_IMAGE_SIZE(img), 0);
-    if (png_image_finish_read(&img, nullptr, out->pixels.data(), 0, nullptr) == 0) {
-        png_image_free(&img);
-        out->pixels.clear();
-        return false;
-    }
-    png_image_free(&img);
-    return true;
-}
-
-// libjpeg error handler that longjmps out instead of calling exit().
-struct JpegErr { jpeg_error_mgr mgr; jmp_buf env; };
-void jpeg_error_exit_throw(j_common_ptr cinfo)
-{
-    auto* err = reinterpret_cast<JpegErr*>(cinfo->err);
-    longjmp(err->env, 1);
-}
-
-bool decode_jpeg_rgba(const std::vector<std::uint8_t>& in, DecodedRGBA* out)
-{
-    jpeg_decompress_struct cinfo{};
-    JpegErr err{};
-    cinfo.err = jpeg_std_error(&err.mgr);
-    err.mgr.error_exit = jpeg_error_exit_throw;
-    if (setjmp(err.env)) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-    jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, const_cast<unsigned char*>(in.data()), in.size());
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-    cinfo.out_color_space = JCS_RGB;
-    if (!jpeg_start_decompress(&cinfo)) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-    const std::uint32_t w = cinfo.output_width;
-    const std::uint32_t h = cinfo.output_height;
-    if (w == 0 || h == 0 || w > 8192 || h > 8192 ||
-        cinfo.output_components != 3) {
-        jpeg_destroy_decompress(&cinfo);
-        return false;
-    }
-    std::vector<std::uint8_t> row(static_cast<std::size_t>(w) * 3);
-    out->w = w;
-    out->h = h;
-    out->pixels.assign(static_cast<std::size_t>(w) * h * 4, 0);
-    while (cinfo.output_scanline < h) {
-        JSAMPROW rowptr = row.data();
-        if (jpeg_read_scanlines(&cinfo, &rowptr, 1) != 1) {
-            jpeg_destroy_decompress(&cinfo);
-            out->pixels.clear();
-            return false;
-        }
-        std::size_t y = cinfo.output_scanline - 1;
-        std::uint8_t* dst = out->pixels.data() + y * w * 4;
-        for (std::uint32_t x = 0; x < w; ++x) {
-            dst[x * 4 + 0] = row[x * 3 + 0];
-            dst[x * 4 + 1] = row[x * 3 + 1];
-            dst[x * 4 + 2] = row[x * 3 + 2];
-            dst[x * 4 + 3] = 255;
-        }
-    }
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    return true;
-}
-
-bool decode_image_rgba(const std::vector<std::uint8_t>& in, DecodedRGBA* out)
-{
-    if (in.size() < 4) return false;
-    // PNG: 89 50 4E 47 ...
-    if (in[0] == 0x89 && in[1] == 0x50 && in[2] == 0x4E && in[3] == 0x47) {
-        return decode_png_rgba(in, out);
-    }
-    // JPEG: FF D8 FF ...
-    if (in[0] == 0xFF && in[1] == 0xD8 && in[2] == 0xFF) {
-        return decode_jpeg_rgba(in, out);
-    }
-    return false;
-}
-
-bool encode_png_rgba(const DecodedRGBA& src, std::vector<std::uint8_t>* out)
-{
-    png_image dst{};
-    dst.version = PNG_IMAGE_VERSION;
-    dst.width   = src.w;
-    dst.height  = src.h;
-    dst.format  = PNG_FORMAT_RGBA;
-    png_alloc_size_t mem_bytes = 0;
-    if (png_image_write_to_memory(&dst, nullptr, &mem_bytes, 0,
-                                  src.pixels.data(), 0, nullptr) == 0 ||
-        mem_bytes == 0) {
-        return false;
-    }
-    out->assign(mem_bytes, 0);
-    if (png_image_write_to_memory(&dst, out->data(), &mem_bytes, 0,
-                                  src.pixels.data(), 0, nullptr) == 0) {
-        out->clear();
-        return false;
-    }
-    out->resize(mem_bytes);
-    return true;
-}
+using DecodedRGBA = obn::image::DecodedRGBA;
 
 // Fit modes for reshape_image_to_aspect:
 //
@@ -965,7 +845,7 @@ reshape_image_to_aspect(const std::vector<std::uint8_t>& in,
     if (in.empty() || !(target_aspect > 0.0)) return in;
 
     DecodedRGBA img;
-    if (!decode_image_rgba(in, &img)) return in;
+    if (!obn::image::decode_rgba(in, &img)) return in;
 
     const double src_aspect = static_cast<double>(img.w) /
                               static_cast<double>(img.h);
@@ -1076,7 +956,7 @@ reshape_image_to_aspect(const std::vector<std::uint8_t>& in,
     }
 
     std::vector<std::uint8_t> out;
-    if (!encode_png_rgba(canvas, &out)) return in;
+    if (!obn::image::encode_png(canvas, &out)) return in;
     if (mime) *mime = "image/png";
     return out;
 }

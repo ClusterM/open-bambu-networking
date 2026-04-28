@@ -296,12 +296,14 @@ message(STATUS "obn: video backend = ${OBN_VIDEO_BACKEND}")
 # zlib is pulled in for the Metadata/plate_*.png unpacker used by
 # PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
 find_package(ZLIB REQUIRED)
-# libpng is used to letterbox 3mf Metadata/plate_*.png and libjpeg to
-# decode the /timelapse/thumbnail/*.jpg sidecars - both get padded to
-# the aspect of the Studio tile they're shown in (see
-# letterbox_image_to_aspect in stubs/BambuSource.cpp).
-pkg_check_modules(PNG      REQUIRED IMPORTED_TARGET libpng)
-pkg_check_modules(JPEG     REQUIRED IMPORTED_TARGET libjpeg)
+
+# Image decode/encode for the thumbnail letterbox path is handled by
+# the vendored stb_image / stb_image_write headers under
+# stubs/third_party/. We deliberately do *not* link libpng / libjpeg
+# into BambuSource: see stubs/image_io.hpp for why (libjpeg-turbo ABI
+# tag mismatch with Studio's bundled GStreamer plugins inside the
+# same process), and the comment block in stubs/BambuSource.cpp around
+# `using DecodedRGBA = obn::image::DecodedRGBA;`.
 
 # BambuSource ships the PrinterFileSystem CTRL bridge (FTPS-backed file
 # browser for X1/P1S/P2S/A-series in LAN mode), so it needs ftps + json +
@@ -310,12 +312,20 @@ pkg_check_modules(JPEG     REQUIRED IMPORTED_TARGET libjpeg)
 # (Studio dlopens BambuSource *before* it loads the network plugin).
 set(_obn_bambusource_sources
     stubs/BambuSource.cpp
+    stubs/image_io.cpp
     stubs/source_log.cpp
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
     src/zip_reader.cpp
 )
+
+# stb_image_write triggers -Wmissing-field-initializers on the
+# stbi__write_context partial brace initialiser. It is upstream code
+# we do not want to patch; isolate the warning suppression to the
+# translation unit that includes the stb implementations.
+set_source_files_properties(stubs/image_io.cpp PROPERTIES
+    COMPILE_FLAGS "-Wno-missing-field-initializers")
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
     # ffmpeg_dyn.cpp dlopen+dlsym's libav* lazily so libBambuSource has
     # no hard NEEDED dependency on a specific FFmpeg soname major. See
@@ -353,8 +363,6 @@ set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "l
 target_link_libraries(BambuSource PRIVATE
     OpenSSL::SSL OpenSSL::Crypto
     ZLIB::ZLIB
-    PkgConfig::PNG
-    PkgConfig::JPEG
 )
 
 if(APPLE)

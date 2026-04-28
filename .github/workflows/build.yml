@@ -77,8 +77,7 @@ jobs:
             build-essential cmake pkg-config ca-certificates git \
             libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
             libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libpng-dev libjpeg-dev
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Resolve plugin version from upstream Bambu Studio
         id: ver

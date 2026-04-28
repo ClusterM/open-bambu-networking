@@ -620,7 +620,6 @@ headers for everything the project links against:
 | MQTT / JSON / HTTP / TLS / zlib     | `libmosquitto-dev`, `libcjson-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
 | FFmpeg (default RTSPS camera path)  | `libavformat-dev`, `libavcodec-dev`, `libavutil-dev`, `libswscale-dev`                               | `ffmpeg-free-devel` (or `ffmpeg-devel` from RPM Fusion)                            |
 | GStreamer (legacy RTSPS path)       | `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`                                            | `gstreamer1-devel`, `gstreamer1-plugins-base-devel`                               |
-| Images (BambuSource)                | `libpng-dev`, `libjpeg-dev`                                                                          | `libpng-devel`, `libjpeg-turbo-devel`                                             |
 
 
 > Note  
@@ -628,6 +627,15 @@ headers for everything the project links against:
 >
 > Only one RTSPS backend is needed at build time — pick FFmpeg (default) or
 > GStreamer (legacy fallback) via `-DOBN_VIDEO_BACKEND=…` (see [Video backend](#video-backend)).
+>
+> Image decode/encode for the thumbnail letterbox path is handled by the
+> vendored stb_image / stb_image_write headers under `stubs/third_party/`,
+> so **no `libpng-dev` / `libjpeg-dev` is required**. We deliberately do
+> not link those libraries into `libBambuSource.so` — see the comment
+> block at the top of `stubs/image_io.hpp` for the rationale (mostly:
+> avoiding the `Wrong JPEG library version: library is 80, caller
+> expects 62` `abort()` from libjpeg-turbo when Studio's own GStreamer
+> plugin loads under our globally-mapped libjpeg).
 
 One-shot install examples:
 
@@ -635,8 +643,7 @@ One-shot install examples:
 # Debian / Ubuntu (default ffmpeg backend)
 sudo apt install build-essential cmake pkg-config \
   libmosquitto-dev libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
-  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
-  libpng-dev libjpeg-dev
+  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
 ```sh
@@ -644,8 +651,7 @@ sudo apt install build-essential cmake pkg-config \
 # the full ffmpeg-devel comes from RPM Fusion)
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
   mosquitto-devel cjson-devel uthash-devel libcurl-devel openssl-devel zlib-devel \
-  ffmpeg-free-devel \
-  libpng-devel libjpeg-turbo-devel
+  ffmpeg-free-devel
 ```
 
 If you opt into the legacy GStreamer backend (`-DOBN_VIDEO_BACKEND=gstreamer`),
