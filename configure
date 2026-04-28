@@ -16,6 +16,7 @@ TESTS=OFF
 PATCH_CONF=ON
 STATIC_MOSQUITTO=OFF
 VENDOR_MOSQUITTO=OFF
+VIDEO_BACKEND=""
 EXTRA_CMAKE_ARGS=""
 
 usage() {
@@ -71,6 +72,13 @@ Optional features:
                              cJSON development headers, and utlist.h
                              (usually from uthash-dev / uthash-devel).
   --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
+  --video-backend=BACKEND    RTSPS camera backend baked into
+                             libBambuSource: 'ffmpeg' (default; libav*),
+                             'gstreamer' (legacy fallback), or 'none' (no
+                             RTSPS support, smaller build). MJPG-on-port
+                             6000 keeps working under every option. See
+                             "Video backend" in README.md for the build
+                             dependencies each option needs.
 
 Other:
   --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
@@ -102,6 +110,7 @@ for arg in "$@"; do
         --disable-static-mosquitto) STATIC_MOSQUITTO=OFF ;;
         --vendor-mosquitto)        VENDOR_MOSQUITTO=ON ;;
         --no-vendor-mosquitto)     VENDOR_MOSQUITTO=OFF ;;
+        --video-backend=*)         VIDEO_BACKEND="${arg#*=}" ;;
         --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
         -h|--help)                 usage; exit 0 ;;
         *)
@@ -116,6 +125,19 @@ if [ "$VENDOR_MOSQUITTO" = ON ] && [ "$STATIC_MOSQUITTO" = ON ]; then
     printf '%s\n' \
         'configure: warning: --vendor-mosquitto and --enable-static-mosquitto are both set;' \
         '               the bundled mosquitto build is used (pkg-config static path ignored).' >&2
+fi
+
+# Catch typos here so the user gets a friendly message instead of a
+# 50-line CMake configure-time error stack.
+if [ -n "$VIDEO_BACKEND" ]; then
+    case "$VIDEO_BACKEND" in
+        ffmpeg|gstreamer|none) ;;
+        *)
+            printf 'configure: --video-backend must be ffmpeg, gstreamer, or none (got "%s")\n' \
+                "$VIDEO_BACKEND" >&2
+            exit 2
+            ;;
+    esac
 fi
 
 if ! command -v cmake >/dev/null 2>&1; then
@@ -252,6 +274,10 @@ set -- "$@" \
     -DOBN_PATCH_STUDIO_CONF="$PATCH_CONF" \
     -DOBN_STATIC_MOSQUITTO="$STATIC_MOSQUITTO" \
     -DOBN_VENDOR_MOSQUITTO="$VENDOR_MOSQUITTO"
+# Only pass -DOBN_VIDEO_BACKEND if the user asked for a specific value.
+# Omitting it lets the CMakeLists.txt default (ffmpeg) win, which keeps
+# behaviour stable for anyone running ./configure without flags.
+[ -n "$VIDEO_BACKEND" ] && set -- "$@" -DOBN_VIDEO_BACKEND="$VIDEO_BACKEND"
 # shellcheck disable=SC2086
 [ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
 
