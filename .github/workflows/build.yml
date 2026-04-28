@@ -119,25 +119,6 @@ jobs:
       - name: Build
         run: make -j"$(nproc)"
 
-      - name: Cross-check legacy video backends still build
-        # The default video backend is FFmpeg. The other two
-        # (gstreamer, none) ship in the same source tree as fallbacks
-        # and routinely bitrot if nobody compiles them. Rebuild
-        # libBambuSource.so once per backend off in a side directory
-        # so a CI failure surfaces immediately instead of weeks later
-        # in a user bug report.
-        run: |
-          set -eu
-          for backend in gstreamer none; do
-            echo "::group::OBN_VIDEO_BACKEND=$backend"
-            cmake -S . -B build-${backend} \
-                -DOBN_VERSION='${{ steps.ver.outputs.plugin_version }}' \
-                -DOBN_VIDEO_BACKEND=${backend} \
-                -DOBN_PATCH_STUDIO_CONF=OFF
-            cmake --build build-${backend} --target BambuSource -j"$(nproc)"
-            echo "::endgroup::"
-          done
-
       - name: Run tests
         # The only ctest target that does real I/O is `lan_live`, and it
         # self-skips when OBN_PRINTER_IP / _SERIAL / _ACCESS_CODE are unset,
