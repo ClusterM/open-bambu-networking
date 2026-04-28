@@ -40,9 +40,10 @@ void av_init_once(const AvApi* av)
 // Annex-B start code we prepend to every NAL fed into the decoder.
 constexpr std::uint8_t kStartCode[4] = {0x00, 0x00, 0x00, 0x01};
 
-// JPEG quality knob; mirrors the q=80 baseline GStreamer's jpegenc
-// produced for the legacy pipeline. Tweakable via OBN_JPEG_QUALITY
-// for diagnostic captures (1..100).
+// JPEG quality knob; q=80 mirrors what the legacy GStreamer-backed
+// pipeline produced (jpegenc default), and turns out to be a fine
+// trade-off for live camera at 720p. Override via OBN_JPEG_QUALITY
+// (1..100) for diagnostic captures.
 int read_jpeg_quality()
 {
     int q = 80;

@@ -17,23 +17,25 @@
 // decode, transcode to MJPEG, deliver one JPEG frame at a time. The
 // interface deliberately speaks JPEG rather than raw YUV so the
 // existing BambuSource.cpp -> gstbambusrc -> Studio chain keeps
-// working byte-for-byte the way it did with our GStreamer-only
-// implementation.
+// working byte-for-byte regardless of how we got the JPEG bytes.
 //
-// Two implementations live behind this header:
+// Exactly one implementation lives behind this header:
 //
-//   * GstreamerPipeline  -- legacy, uses rtspsrc + decodebin + jpegenc.
-//                            Selected when -DOBN_VIDEO_BACKEND=gstreamer.
-//                            Bare-Linux only (libjpeg ABI clash inside
-//                            Studio's AppImage); kept for completeness.
-//   * LibavPipeline      -- default. Custom RTSP / RTSPS client (no
-//                            libavformat) + libavcodec H.264 decode +
-//                            libswscale + stb_image_write JPEG encode.
-//                            Selected when -DOBN_VIDEO_BACKEND=ffmpeg.
+//   * LibavPipeline -- default. Custom RTSP / RTSPS client (no
+//                      libavformat) + libavcodec H.264 decode +
+//                      libswscale + stb_image_write JPEG encode.
+//                      Selected when -DOBN_VIDEO_BACKEND=ffmpeg.
 //
-// `make_video_pipeline` is provided by exactly one of those translation
-// units depending on what was compiled in. A "none" build selects no
-// backend and simply lets RTSPS Open() fail with a clear message.
+// `make_video_pipeline` is provided by that translation unit. A
+// "none" build (-DOBN_VIDEO_BACKEND=none) selects video_pipeline_none.cpp
+// instead, which returns nullptr from make_video_pipeline so RTSPS
+// Open() fails with a clear message; the MJPG path on port 6000
+// (A1/P1) and the file browser keep working.
+//
+// (A GStreamer backend used to live here too -- rtspsrc + decodebin
+// + jpegenc -- but it always aborted inside Studio's AppImage with
+// a libjpeg ABI clash we could not fix from outside Studio's bundle,
+// so it was dropped once the FFmpeg one stabilised.)
 #pragma once
 
 #include <cstdint>
@@ -121,8 +123,7 @@ public:
 };
 
 // Backend factory. Implemented by exactly one of:
-//   stubs/video_pipeline_gstreamer.cpp
-//   stubs/video_pipeline_libav.cpp
+//   stubs/video_pipeline_libav.cpp  (default)
 //   stubs/video_pipeline_none.cpp   (returns nullptr, RTSPS unsupported)
 //
 // `logger`/`log_ctx` are forwarded to the per-tunnel Logger that

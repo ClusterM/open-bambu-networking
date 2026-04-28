@@ -274,28 +274,31 @@ set_target_properties(bambu_networking PROPERTIES
 # --------------------------------------------------------------------------
 
 # Picks the RTSPS backend used to demux H.264 + transcode to MJPEG:
-#   ffmpeg     - in-process RTSP/RTSPS client (custom, stubs/rtsp_client.cpp)
-#                + libavcodec H.264 decode + libswscale + stb_image_write
-#                baseline JPEG encode. NO libavformat dependency, and no
-#                libavcodec encoder dependency (Studio's bundled
-#                libavcodec ships decoder-only, so avcodec_find_encoder
-#                returns NULL in-process). libav* symbols are resolved
-#                via dlsym(RTLD_DEFAULT, ...) against whatever Studio's
-#                bundle has already loaded -- guaranteed ABI match
-#                against the AppImage's bundled libav minor.
-#                Default; smallest runtime footprint; works on macOS too.
-#   gstreamer  - legacy rtspsrc -> jpegenc pipeline. Bare-Linux only;
-#                aborts inside Studio's AppImage with a libjpeg ABI
-#                clash that we cannot fix from outside Studio's bundle.
-#   none       - no RTSPS support; only the MJPG path (port 6000) and
-#                the file-browser CTRL bridge work. Useful for small
-#                builds that don't ship live view.
+#   ffmpeg - in-process RTSP/RTSPS client (custom, stubs/rtsp_client.cpp)
+#            + libavcodec H.264 decode + libswscale + stb_image_write
+#            baseline JPEG encode. NO libavformat dependency, and no
+#            libavcodec encoder dependency (Studio's bundled libavcodec
+#            ships decoder-only, so avcodec_find_encoder returns NULL
+#            in-process). libav* symbols are resolved via
+#            dlsym(RTLD_DEFAULT, ...) against whatever Studio's bundle
+#            has already loaded -- guaranteed ABI match against the
+#            AppImage's bundled libav minor. Default; smallest runtime
+#            footprint; works on macOS too.
+#   none   - no RTSPS support; only the MJPG path (port 6000) and the
+#            file-browser CTRL bridge work. Useful for small builds
+#            that don't ship live view.
+#
+# A GStreamer backend used to live here (rtspsrc -> jpegenc pipeline)
+# but was removed once the FFmpeg one stabilised: it always aborted
+# inside Studio's AppImage with a libjpeg ABI clash we could not fix
+# from outside Studio's bundle, and the FFmpeg path turned out to work
+# everywhere we tried it.
 set(OBN_VIDEO_BACKEND "ffmpeg" CACHE STRING
-    "RTSPS video backend for libBambuSource (ffmpeg | gstreamer | none)")
-set_property(CACHE OBN_VIDEO_BACKEND PROPERTY STRINGS ffmpeg gstreamer none)
-if(NOT OBN_VIDEO_BACKEND MATCHES "^(ffmpeg|gstreamer|none)$")
+    "RTSPS video backend for libBambuSource (ffmpeg | none)")
+set_property(CACHE OBN_VIDEO_BACKEND PROPERTY STRINGS ffmpeg none)
+if(NOT OBN_VIDEO_BACKEND MATCHES "^(ffmpeg|none)$")
     message(FATAL_ERROR
-        "OBN_VIDEO_BACKEND must be 'ffmpeg', 'gstreamer', or 'none' "
+        "OBN_VIDEO_BACKEND must be 'ffmpeg' or 'none' "
         "(got '${OBN_VIDEO_BACKEND}').")
 endif()
 message(STATUS "obn: video backend = ${OBN_VIDEO_BACKEND}")
@@ -304,12 +307,15 @@ message(STATUS "obn: video backend = ${OBN_VIDEO_BACKEND}")
 # PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
 find_package(ZLIB REQUIRED)
 
-# Image decode/encode for the thumbnail letterbox path is handled by
-# the vendored stb_image / stb_image_write headers under
-# stubs/third_party/. We deliberately do *not* link libpng / libjpeg
-# into BambuSource: see stubs/image_io.hpp for why (libjpeg-turbo ABI
-# tag mismatch with Studio's bundled GStreamer plugins inside the
-# same process), and the comment block in stubs/BambuSource.cpp around
+# Image decode/encode for the thumbnail letterbox path AND for the
+# RTSPS pipeline's JPEG re-encode are both handled by the vendored
+# stb_image / stb_image_write headers under stubs/third_party/. We
+# deliberately do *not* link libpng / libjpeg into BambuSource: see
+# stubs/image_io.hpp for why (libjpeg-turbo ABI tag mismatch with
+# Studio's bundled GStreamer plugins inside the same process; even
+# though we no longer use GStreamer ourselves, Studio still loads
+# its own copy and aborts if its libjpeg sees ours), and the comment
+# block in stubs/BambuSource.cpp around
 # `using DecodedRGBA = obn::image::DecodedRGBA;`.
 
 # BambuSource ships the PrinterFileSystem CTRL bridge (FTPS-backed file
@@ -355,8 +361,6 @@ if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
         stubs/rtsp_client.cpp
         stubs/h264_decoder.cpp
         stubs/ffmpeg_dyn.cpp)
-elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
-    list(APPEND _obn_bambusource_sources stubs/video_pipeline_gstreamer.cpp)
 else()
     list(APPEND _obn_bambusource_sources stubs/video_pipeline_none.cpp)
 endif()
@@ -434,12 +438,6 @@ if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
         ${SWSCALE_INCLUDE_DIRS}
     )
     target_link_libraries(BambuSource PRIVATE ${CMAKE_DL_LIBS})
-elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
-    pkg_check_modules(GST     REQUIRED IMPORTED_TARGET gstreamer-1.0)
-    pkg_check_modules(GST_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
-    target_link_libraries(BambuSource PRIVATE
-        PkgConfig::GST PkgConfig::GST_APP
-    )
 endif()
 
 # --------------------------------------------------------------------------

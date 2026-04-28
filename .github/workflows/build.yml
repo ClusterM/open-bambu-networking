@@ -67,21 +67,19 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install build dependencies
-        # libavcodec / libavutil / libswscale headers cover the default
-        # OBN_VIDEO_BACKEND=ffmpeg path (libavformat is intentionally
-        # absent: we wrote our own RTSP client to dodge the libavformat
-        # vs. AppImage-bundled libavutil ABI clash described in
-        # stubs/ffmpeg_dyn.hpp). The gstreamer packages stay in for
-        # the legacy =gstreamer build variant that runs as a sanity
-        # check below. Drop them once the GStreamer fallback is
-        # removed for good.
+        # libavcodec / libavutil / libswscale headers cover the only
+        # supported OBN_VIDEO_BACKEND=ffmpeg path (libavformat is
+        # intentionally absent: we wrote our own RTSP client to dodge
+        # the libavformat vs. AppImage-bundled libavutil ABI clash
+        # described in stubs/ffmpeg_dyn.hpp). No GStreamer packages:
+        # the legacy GStreamer backend was removed once FFmpeg
+        # stabilised everywhere.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config ca-certificates git \
             libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
-            libavcodec-dev libavutil-dev libswscale-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+            libavcodec-dev libavutil-dev libswscale-dev
 
       - name: Resolve plugin version from upstream Bambu Studio
         id: ver

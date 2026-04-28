@@ -25,9 +25,9 @@
 // straight into a tightly-packed RGB24 buffer at the requested target
 // dimensions, then handed to stb_image_write's baseline JPEG encoder
 // at q=80 (override via OBN_JPEG_QUALITY). The C-ABI consumer ships
-// those JPEG bytes straight to Studio's gstbambusrc without further
-// decoding -- exactly the contract the legacy GStreamer pipeline used
-// to honour with libavcodec's mjpeg encoder.
+// those JPEG bytes straight to Studio's gstbambusrc / wxMediaCtrl2
+// consumer without further decoding -- the same byte-level contract
+// the legacy GStreamer-backed pipeline implemented before this one.
 //
 // Threading: a single decode() call may loop receive_frame internally
 // until the decoder is empty, but only the *latest* JPEG is returned
