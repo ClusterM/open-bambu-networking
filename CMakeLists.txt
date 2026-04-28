@@ -268,12 +268,31 @@ set_target_properties(bambu_networking PROPERTIES
 )
 
 # --------------------------------------------------------------------------
-# libBambuSource.so  (camera MJPG tunnel for P1/A1; consumed by Studio's
-# gstbambusrc element).
+# libBambuSource.so  (camera tunnel + PrinterFileSystem CTRL bridge;
+# consumed by Studio's gstbambusrc element on Linux/Windows and by
+# wxMediaCtrl2.mm on macOS).
 # --------------------------------------------------------------------------
 
-pkg_check_modules(GST      REQUIRED IMPORTED_TARGET gstreamer-1.0)
-pkg_check_modules(GST_APP  REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+# Picks the RTSPS backend used to demux H.264 + transcode to MJPEG:
+#   ffmpeg     - libavformat / libavcodec / libswscale (default, smaller
+#                runtime footprint, no GStreamer.framework dependency on
+#                macOS).
+#   gstreamer  - legacy rtspsrc -> jpegenc pipeline. Kept for one
+#                release as a fallback in case ffmpeg regresses on a
+#                user's setup; will be removed afterwards.
+#   none       - no RTSPS support; only the MJPG path (port 6000) and
+#                the file-browser CTRL bridge work. Useful for small
+#                builds that don't ship live view.
+set(OBN_VIDEO_BACKEND "ffmpeg" CACHE STRING
+    "RTSPS video backend for libBambuSource (ffmpeg | gstreamer | none)")
+set_property(CACHE OBN_VIDEO_BACKEND PROPERTY STRINGS ffmpeg gstreamer none)
+if(NOT OBN_VIDEO_BACKEND MATCHES "^(ffmpeg|gstreamer|none)$")
+    message(FATAL_ERROR
+        "OBN_VIDEO_BACKEND must be 'ffmpeg', 'gstreamer', or 'none' "
+        "(got '${OBN_VIDEO_BACKEND}').")
+endif()
+message(STATUS "obn: video backend = ${OBN_VIDEO_BACKEND}")
+
 # zlib is pulled in for the Metadata/plate_*.png unpacker used by
 # PrinterFileSystem to serve 3mf thumbnails directly from FTPS.
 find_package(ZLIB REQUIRED)
@@ -289,25 +308,91 @@ pkg_check_modules(JPEG     REQUIRED IMPORTED_TARGET libjpeg)
 # log from the core tree. Compile them in directly instead of linking
 # against libbambu_networking to keep the shared-object self-contained
 # (Studio dlopens BambuSource *before* it loads the network plugin).
-add_library(BambuSource SHARED
+set(_obn_bambusource_sources
     stubs/BambuSource.cpp
+    stubs/source_log.cpp
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
     src/zip_reader.cpp
 )
-target_include_directories(BambuSource PRIVATE include)
+if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
+    list(APPEND _obn_bambusource_sources stubs/video_pipeline_ffmpeg.cpp)
+elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
+    list(APPEND _obn_bambusource_sources stubs/video_pipeline_gstreamer.cpp)
+else()
+    list(APPEND _obn_bambusource_sources stubs/video_pipeline_none.cpp)
+endif()
+
+# macOS specifically: Studio's wxMediaCtrl2.mm dlsym's an Objective-C
+# class `BambuPlayer` out of libBambuSource.dylib for the camera
+# widget. Without it the camera widget sits in MEDIASTATE_LOADING
+# forever (see stubs/BambuPlayer.mm for the full story). The
+# Objective-C class also pulls in a small MJPG reader (port-6000
+# protocol, see stubs/mjpg_reader.cpp) so the BambuPlayer doesn't
+# have to share the C-ABI tunnel state inside BambuSource.cpp.
+if(APPLE)
+    enable_language(OBJCXX)
+    list(APPEND _obn_bambusource_sources
+        stubs/BambuPlayer.mm
+        stubs/mjpg_reader.cpp
+    )
+endif()
+
+add_library(BambuSource SHARED ${_obn_bambusource_sources})
+target_include_directories(BambuSource PRIVATE include stubs)
 target_compile_definitions(BambuSource PRIVATE
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
 target_link_libraries(BambuSource PRIVATE
     OpenSSL::SSL OpenSSL::Crypto
-    PkgConfig::GST PkgConfig::GST_APP
     ZLIB::ZLIB
     PkgConfig::PNG
     PkgConfig::JPEG
 )
+
+if(APPLE)
+    # ARC for the Objective-C class so we don't have to track retains
+    # by hand. The OrcaSlicer caller is non-ARC and explicitly invokes
+    # -dealloc; that interplay is documented in stubs/BambuPlayer.mm.
+    set_source_files_properties(stubs/BambuPlayer.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc")
+    # Cocoa view + AVSampleBufferDisplayLayer + CGImage / ImageIO are
+    # the bare-minimum frameworks for the rendering path.
+    target_link_libraries(BambuSource PRIVATE
+        "-framework Foundation"
+        "-framework AppKit"
+        "-framework AVFoundation"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreGraphics"
+        "-framework ImageIO")
+    # On macOS the dylib's filename Studio looks for is
+    # libBambuSource.dylib; CMake already picks .dylib on Apple but
+    # be explicit so a future BUILD_SHARED_LIBS=NO override doesn't
+    # accidentally produce a static archive.
+    set_target_properties(BambuSource PROPERTIES SUFFIX ".dylib")
+endif()
+
+if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
+    pkg_check_modules(AVFORMAT  REQUIRED IMPORTED_TARGET libavformat)
+    pkg_check_modules(AVCODEC   REQUIRED IMPORTED_TARGET libavcodec)
+    pkg_check_modules(AVUTIL    REQUIRED IMPORTED_TARGET libavutil)
+    pkg_check_modules(SWSCALE   REQUIRED IMPORTED_TARGET libswscale)
+    target_link_libraries(BambuSource PRIVATE
+        PkgConfig::AVFORMAT
+        PkgConfig::AVCODEC
+        PkgConfig::AVUTIL
+        PkgConfig::SWSCALE
+    )
+elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
+    pkg_check_modules(GST     REQUIRED IMPORTED_TARGET gstreamer-1.0)
+    pkg_check_modules(GST_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+    target_link_libraries(BambuSource PRIVATE
+        PkgConfig::GST PkgConfig::GST_APP
+    )
+endif()
 
 # --------------------------------------------------------------------------
 # liblive555.so  (stub; used by the real BambuSource internally)

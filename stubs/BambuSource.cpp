@@ -9,11 +9,11 @@
 //     Protocol is the 80-byte auth packet + 16-byte frame headers
 //     documented in OpenBambuAPI/video.md and implemented below.
 //
-//   * RTSPS on port 322 - used by X1 / P1S / P2S. We delegate the
-//     heavy lifting to the system's GStreamer rtspsrc element, parse
-//     out H.264 access units via appsink, and hand them back to
-//     gstbambusrc as Bambu_Samples. That gives us TLS, auth, and
-//     robust TCP framing "for free".
+//   * RTSPS on port 322 - used by X1 / P1S / P2S. The RTSP demux,
+//     H.264 decode, and MJPEG transcode happens behind the
+//     IVideoPipeline interface (see stubs/video_pipeline.hpp). The
+//     concrete backend is selected at compile time by
+//     -DOBN_VIDEO_BACKEND=ffmpeg (default) or =gstreamer.
 //
 // URL formats we accept (all three appear in Studio's source):
 //
@@ -23,8 +23,8 @@
 //
 //   bambu:///rtsps___<user>:<passwd>@<ip>/streaming/live/1?proto=rtsps
 //   bambu:///rtsp___<user>:<passwd>@<ip>/streaming/live/1?proto=rtsp
-//       -> RTSP(S) on port 322 (X1/P1S/P2S firmware protocol); we use the
-//          system's GStreamer rtspsrc element to pull H.264.
+//       -> RTSP(S) on port 322 (X1/P1S/P2S firmware protocol); routed
+//          through IVideoPipeline (FFmpeg or GStreamer backend).
 //
 // Any extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...)
 // are ignored. The printer only cares about the auth packet (MJPG) or
@@ -66,10 +66,6 @@
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
-
-#include <dlfcn.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -103,6 +99,9 @@
 #include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/zip_reader.hpp"
+
+#include "source_log.hpp"
+#include "video_pipeline.hpp"
 
 #if defined(_WIN32)
 #    define OBN_EXPORT extern "C" __declspec(dllexport)
@@ -162,196 +161,34 @@ struct Bambu_Sample {
     unsigned long long    decode_time; // 100ns units, per gstbambusrc expectations
 };
 
+// Studio's Logger typedef. We keep the C-visible alias so the
+// exported Bambu_SetLogger / Bambu_FreeLogMsg signatures stay
+// byte-identical with what gstbambusrc and wxMediaCtrl2 expect.
 using Logger = void (*)(void* context, int level, tchar const* msg);
 
 } // extern "C"
 
 // -----------------------------------------------------------------------
-// Logger plumbing. gstbambusrc's `_log` helper calls `Bambu_FreeLogMsg(msg)`
-// after printing each message, so we MUST pass messages through malloc'd
-// storage and free them there. Use strdup/free to keep that contract.
+// All log/last-error helpers live in stubs/source_log.{hpp,cpp} so the
+// video backends and the macOS BambuPlayer wrapper can share them. We
+// pull the names into the anonymous namespace below so existing call
+// sites (`log_fmt`, `log_at`, `mirror_log_fp`, `set_last_error`,
+// `LL_DEBUG`, ...) keep compiling unchanged.
 // -----------------------------------------------------------------------
 
 namespace {
 
-void noop_logger(void*, int, tchar const*) {}
-
-// -----------------------------------------------------------------------
-// Log levels. Used both to tag log_at() call sites and to filter via
-// OBN_BAMBUSOURCE_LOG_LEVEL (default INFO). Existing log_fmt() callers
-// are treated as INFO so behaviour is unchanged unless the user opts in.
-// -----------------------------------------------------------------------
-enum LogLevel {
-    LL_TRACE = 0,
-    LL_DEBUG = 1,
-    LL_INFO  = 2,
-    LL_WARN  = 3,
-    LL_ERROR = 4,
-    LL_OFF   = 5,
-};
-
-LogLevel parse_log_level(const char* s, LogLevel fallback)
-{
-    if (!s || !*s) return fallback;
-    auto eq = [&](const char* a) {
-        for (size_t i = 0;; ++i) {
-            char x = s[i];
-            char y = a[i];
-            if (x >= 'A' && x <= 'Z') x = static_cast<char>(x - 'A' + 'a');
-            if (x != y) return false;
-            if (!x) return true;
-        }
-    };
-    if (eq("trace")) return LL_TRACE;
-    if (eq("debug")) return LL_DEBUG;
-    if (eq("info"))  return LL_INFO;
-    if (eq("warn") || eq("warning")) return LL_WARN;
-    if (eq("error") || eq("err"))    return LL_ERROR;
-    if (eq("off") || eq("none") || eq("silent") || eq("0")) return LL_OFF;
-    return fallback;
-}
-
-LogLevel current_log_level()
-{
-    static const LogLevel lvl = []() {
-        return parse_log_level(std::getenv("OBN_BAMBUSOURCE_LOG_LEVEL"),
-                               LL_INFO);
-    }();
-    return lvl;
-}
-
-// A file-backed mirror of every log line. Studio's gstbambusrc routes
-// our log callback through GST_DEBUG, which is invisible without
-// GST_DEBUG=bambusrc:5 in the environment. Duplicating into a stable
-// on-disk path lets us debug the camera pipeline regardless of how the
-// user launched Bambu Studio.
-//
-// Resolution order:
-//   1. $OBN_BAMBUSOURCE_LOG_FILE (set to "off"/"none"/empty to disable
-//      the file mirror entirely; "stderr" routes to stderr).
-//   2. $XDG_STATE_HOME/bambu-studio/obn-bambusource.log
-//   3. $HOME/.local/state/bambu-studio/obn-bambusource.log
-//   4. /tmp/obn-bambusource.log (last resort)
-FILE* mirror_log_fp()
-{
-    static FILE* fp = []() -> FILE* {
-        if (const char* env = std::getenv("OBN_BAMBUSOURCE_LOG_FILE")) {
-            if (!*env || !std::strcmp(env, "off") ||
-                !std::strcmp(env, "none") || !std::strcmp(env, "0"))
-                return nullptr;
-            if (!std::strcmp(env, "stderr") || !std::strcmp(env, "-"))
-                return stderr;
-            if (FILE* f = std::fopen(env, "a")) {
-                std::setvbuf(f, nullptr, _IOLBF, 0);
-                std::fprintf(f, "--- obn libBambuSource opened ---\n");
-                return f;
-            }
-            // Fall through to the default search if the user-supplied
-            // path could not be opened — better than dropping logs.
-        }
-
-        const char* paths[3] = {nullptr, nullptr, "/tmp/obn-bambusource.log"};
-        static std::string p0, p1;
-        if (const char* xdg = std::getenv("XDG_STATE_HOME")) {
-            p0 = std::string(xdg) + "/bambu-studio/obn-bambusource.log";
-            paths[0] = p0.c_str();
-        }
-        if (const char* home = std::getenv("HOME")) {
-            p1 = std::string(home) + "/.local/state/bambu-studio/obn-bambusource.log";
-            paths[1] = p1.c_str();
-        }
-        for (const char* path : paths) {
-            if (!path) continue;
-            if (FILE* f = std::fopen(path, "a")) {
-                std::setvbuf(f, nullptr, _IOLBF, 0);
-                std::fprintf(f, "--- obn libBambuSource opened ---\n");
-                return f;
-            }
-        }
-        return nullptr;
-    }();
-    return fp;
-}
-
-const char* level_tag(LogLevel lvl)
-{
-    switch (lvl) {
-        case LL_TRACE: return "TRACE";
-        case LL_DEBUG: return "DEBUG";
-        case LL_INFO:  return "INFO";
-        case LL_WARN:  return "WARN";
-        case LL_ERROR: return "ERROR";
-        case LL_OFF:   return "OFF";
-    }
-    return "?";
-}
-
-// Core sink. Honors the configured log level both for the file mirror
-// and the Studio callback (so OBN_BAMBUSOURCE_LOG_LEVEL=debug enables
-// extra detail without spamming Studio's own log when set higher).
-[[gnu::format(printf, 4, 5)]]
-void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...)
-{
-    if (lvl < current_log_level()) return;
-
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    if (FILE* fp = mirror_log_fp()) {
-        auto now = std::chrono::system_clock::now();
-        auto tt  = std::chrono::system_clock::to_time_t(now);
-        char ts[32];
-        std::strftime(ts, sizeof(ts), "%F %T",
-                      std::localtime(&tt));
-        std::fprintf(fp, "%s [%s] %s\n", ts, level_tag(lvl), buf);
-    }
-
-    if (logger) {
-        // Studio expects a heap-allocated buffer that it will free via
-        // Bambu_FreeLogMsg. strdup() is the idiomatic way.
-        logger(ctx, /*level=*/static_cast<int>(lvl), strdup(buf));
-    }
-}
-
-// Backwards-compatible default (INFO) so existing call sites keep
-// working unchanged. New code should prefer log_at() with an explicit
-// level when the message is debug/warn/error in nature.
-[[gnu::format(printf, 3, 4)]]
-void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
-{
-    if (LL_INFO < current_log_level()) return;
-
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    if (FILE* fp = mirror_log_fp()) {
-        auto now = std::chrono::system_clock::now();
-        auto tt  = std::chrono::system_clock::to_time_t(now);
-        char ts[32];
-        std::strftime(ts, sizeof(ts), "%F %T",
-                      std::localtime(&tt));
-        std::fprintf(fp, "%s [INFO] %s\n", ts, buf);
-    }
-
-    if (logger) {
-        logger(ctx, /*level=*/static_cast<int>(LL_INFO), strdup(buf));
-    }
-}
-
-// Last error message kept in a tiny thread-local buffer so
-// Bambu_GetLastErrorMsg() has something to return.
-thread_local std::string g_last_error;
-
-void set_last_error(const char* msg)
-{
-    g_last_error.assign(msg ? msg : "");
-}
+using obn::source::log_at;
+using obn::source::log_fmt;
+using obn::source::mirror_log_fp;
+using obn::source::noop_logger;
+using obn::source::set_last_error;
+using obn::source::LL_TRACE;
+using obn::source::LL_DEBUG;
+using obn::source::LL_INFO;
+using obn::source::LL_WARN;
+using obn::source::LL_ERROR;
+using obn::source::LL_OFF;
 
 // -----------------------------------------------------------------------
 // URL parser. Bambu URLs:
@@ -602,13 +439,14 @@ struct Tunnel {
     SSL*             ssl     = nullptr;
 
     // ---- RTSP(S) state (Scheme::Rtsps/Rtsp) ----
-    // Pipeline: rtspsrc ! rtph264depay ! h264parse ! appsink.
-    // We keep only the pipeline element and the sink handle; the
-    // internal elements are owned by the pipeline bin.
-    GstElement*      pipeline = nullptr;
-    GstAppSink*      appsink  = nullptr;
+    // Owned video pipeline (FFmpeg or GStreamer; see video_pipeline.hpp).
+    // Built lazily by open_rtsp(); destroyed by tunnel_close().
+    std::unique_ptr<obn::video::IVideoPipeline> video_pipe;
+
     // Subtype of the video carried by this tunnel, filled in by
-    // Bambu_GetStreamInfo. MJPG for local-scheme tunnels, AVC1 for RTSP.
+    // Bambu_GetStreamInfo. MJPG for local-scheme tunnels (and for
+    // RTSPS too because the backend transcodes H.264 -> MJPEG so
+    // gstbambusrc keeps using its lightweight jpegdec path).
     int              sub_type = MJPG;
 
     // Bookkeeping for GetStreamInfo. We don't know the real frame rate
@@ -717,15 +555,14 @@ void tunnel_close(Tunnel* t)
         }
     }
 
-    if (t->pipeline) {
-        // NULL state tears down rtspsrc cleanly; then unref. Note we do
-        // NOT unref t->appsink separately: the appsink lives inside the
-        // pipeline bin and owning a ref on it would leak until process
-        // exit.
-        gst_element_set_state(t->pipeline, GST_STATE_NULL);
-        t->appsink = nullptr;
-        gst_object_unref(t->pipeline);
-        t->pipeline = nullptr;
+    if (t->video_pipe) {
+        // The backend's stop() releases its own resources (rtspsrc
+        // child elements for the gst backend, demuxer/decoder context
+        // for the ffmpeg backend). Reset the unique_ptr after stop()
+        // so a misbehaving backend can't reach a half-destroyed
+        // tunnel.
+        t->video_pipe->stop();
+        t->video_pipe.reset();
     }
 }
 
@@ -827,618 +664,85 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
 }
 
 // -----------------------------------------------------------------------
-// GStreamer init (for RTSP(S) tunnels). Lazy so we only pay the cost if
-// the user actually plays video on an X1/P2S-class printer.
+// RTSP(S) video. The actual pipeline build / decode / transcode lives
+// in stubs/video_pipeline_<backend>.cpp -- this file only knows how to
+// translate StartConfig / Frame to/from the C-ABI shape Bambu_Sample
+// expects. Backends are selected at compile time via OBN_VIDEO_BACKEND
+// (see CMakeLists.txt); make_video_pipeline() is the single seam.
 // -----------------------------------------------------------------------
 
-std::once_flag g_gst_init_flag;
-
-// Reroutes GStreamer's default debug output into obn-bambusource.log so
-// we can diagnose rtspsrc handshake failures without having to set
-// GST_DEBUG in Studio's environment. We keep the threshold low by
-// default (WARNING + ERROR only); OBN_GST_DEBUG=<level> raises it.
-void gst_log_handler(GstDebugCategory* cat, GstDebugLevel level,
-                     const gchar* file, const gchar* function, gint line,
-                     GObject* /*object*/, GstDebugMessage* message,
-                     gpointer /*user_data*/)
-{
-    if (level > gst_debug_category_get_threshold(cat)) return;
-    FILE* fp = mirror_log_fp();
-    if (!fp) return;
-    auto now = std::chrono::system_clock::now();
-    auto tt  = std::chrono::system_clock::to_time_t(now);
-    char ts[32];
-    std::strftime(ts, sizeof(ts), "%F %T", std::localtime(&tt));
-    std::fprintf(fp, "%s [gst %s] %s:%d:%s: %s\n",
-                 ts, gst_debug_level_get_name(level),
-                 file ? file : "?",
-                 line, function ? function : "?",
-                 gst_debug_message_get(message));
-}
-
-// avdec_h264 decodes Bambu's stream into AV_PIX_FMT_YUVJ420P (JPEG
-// full-range YUV), whose handling is deprecated in modern ffmpeg.
-// gst_videoconvert's internal swscale prints one "deprecated pixel
-// format used, make sure you did set range correctly" per frame to
-// stderr - at 30 fps that's 1800 lines/minute spamming Studio's
-// console. We don't link libav directly (it's pulled in by gst-libav),
-// so we reach av_log_set_level through dlsym after gst_init has
-// already loaded libavutil into the process. AV_LOG_ERROR (16) is
-// loud enough to still surface real decoder failures.
-void silence_libav_warnings()
-{
-    constexpr int kAvLogError = 16;
-    using SetLevelFn = void (*)(int);
-    auto try_hush = [&](const char* soname) -> bool {
-        void* h = dlopen(soname, RTLD_NOW | RTLD_NOLOAD);
-        if (!h) return false;
-        if (auto fn = reinterpret_cast<SetLevelFn>(dlsym(h, "av_log_set_level"))) {
-            fn(kAvLogError);
-            dlclose(h);
-            return true;
-        }
-        dlclose(h);
-        return false;
-    };
-    if (try_hush("libavutil.so.59")) return;
-    if (try_hush("libavutil.so.58")) return;
-    if (try_hush("libavutil.so.57")) return;
-    if (try_hush("libavutil.so.56")) return;
-    if (try_hush("libavutil.so")) return;
-    (void)try_hush("libavutil.so.55");
-}
-
-void gst_init_once()
-{
-    std::call_once(g_gst_init_flag, []() {
-        gst_init(nullptr, nullptr);
-        // Default to WARNING so we only pick up real failures; raise
-        // it selectively via OBN_GST_DEBUG=INFO (or 4) if needed.
-        GstDebugLevel lvl = GST_LEVEL_WARNING;
-        if (const char* env = std::getenv("OBN_GST_DEBUG")) {
-            int n = std::atoi(env);
-            if (n > 0 && n <= GST_LEVEL_MEMDUMP) {
-                lvl = static_cast<GstDebugLevel>(n);
-            } else if (std::strcmp(env, "INFO") == 0) {
-                lvl = GST_LEVEL_INFO;
-            } else if (std::strcmp(env, "DEBUG") == 0) {
-                lvl = GST_LEVEL_DEBUG;
-            }
-        }
-        gst_debug_set_default_threshold(lvl);
-        gst_debug_remove_log_function(gst_debug_log_default);
-        gst_debug_add_log_function(gst_log_handler, nullptr, nullptr);
-        silence_libav_warnings();
-    });
-}
-
-// Formats the rtsp(s) URL the way gst-rtsp-server expects: "<scheme>://
-// <host>:<port><path>". User/password are passed through rtspsrc
-// properties (user-id / user-pw), NOT embedded in the URI, because
-// rtspsrc percent-decodes userinfo and silently mangles access codes
-// that contain '+', '/', or '&'.
-std::string build_rtsp_uri(const TunnelUrl& u)
-{
-    const char* scheme = (u.scheme == Scheme::Rtsps) ? "rtsps" : "rtsp";
-    return std::string(scheme) + "://" + u.host + ":" +
-           std::to_string(u.port) + u.path;
-}
-
-// Pad-added callback for rtspsrc. rtspsrc has "sometimes" src pads that
-// only exist after SDP negotiation; gst_parse_launch's auto-linking
-// handles this in simple cases, but we've seen the link silently fail
-// and surface as "streaming stopped, reason not-linked" in Studio. Doing
-// the link by hand here removes that ambiguity.
-// Holds the pad-added closure arguments. Allocated with `new`, freed
-// through g_signal_connect_data's destroy notify so it doesn't leak
-// across repeated Bambu_Open calls.
-struct PadCtx { GstElement* depay; Tunnel* t; };
-
-// Tunnel passed as user_data so we can log through the same mirror file.
-extern "C" void rtsp_pad_added(GstElement* /*src*/, GstPad* new_pad,
-                               gpointer user_data)
-{
-    auto* ctx = static_cast<PadCtx*>(user_data);
-    GstElement* depay = ctx->depay;
-    Tunnel*     t     = ctx->t;
-
-    gchar* pad_name = gst_pad_get_name(new_pad);
-    GstCaps* caps = gst_pad_get_current_caps(new_pad);
-    if (!caps) caps = gst_pad_query_caps(new_pad, nullptr);
-    gchar* caps_str = caps ? gst_caps_to_string(caps) : g_strdup("(null)");
-    log_fmt(t->logger, t->log_ctx,
-            "rtsp_pad_added: pad=%s caps=%.400s linked=%d",
-            pad_name ? pad_name : "?",
-            caps_str ? caps_str : "?",
-            (int)GST_PAD_IS_LINKED(new_pad));
-
-    if (GST_PAD_IS_LINKED(new_pad)) {
-        if (pad_name) g_free(pad_name);
-        if (caps_str) g_free(caps_str);
-        if (caps)     gst_caps_unref(caps);
-        return;
-    }
-
-    GstPad* sink_pad = gst_element_get_static_pad(depay, "sink");
-    if (!sink_pad || GST_PAD_IS_LINKED(sink_pad)) {
-        log_fmt(t->logger, t->log_ctx,
-                "rtsp_pad_added: depay sink unavailable (pad=%p linked=%d)",
-                sink_pad, sink_pad ? (int)GST_PAD_IS_LINKED(sink_pad) : -1);
-        if (sink_pad) gst_object_unref(sink_pad);
-        if (pad_name) g_free(pad_name);
-        if (caps_str) g_free(caps_str);
-        if (caps)     gst_caps_unref(caps);
-        return;
-    }
-
-    // Accept the first video/H264 pad we see. We pick it up from
-    // either caps["media"]=="video" + caps["encoding-name"]=="H264"
-    // (the interesting one) OR from pad name prefix "recv_rtp_src_"
-    // (which rtspsrc always uses for its RTP source pads). Being
-    // lenient on the criteria matters because some gst versions lie
-    // about current_caps at pad_added time.
-    gboolean is_video = FALSE;
-    if (caps) {
-        guint n = gst_caps_get_size(caps);
-        for (guint i = 0; i < n && !is_video; ++i) {
-            const GstStructure* s = gst_caps_get_structure(caps, i);
-            const gchar* media = gst_structure_get_string(s, "media");
-            const gchar* enc   = gst_structure_get_string(s, "encoding-name");
-            if (media && g_ascii_strcasecmp(media, "video") == 0) is_video = TRUE;
-            if (enc   && g_ascii_strcasecmp(enc,   "H264")  == 0) is_video = TRUE;
-        }
-    }
-    gboolean name_looks_rtp = pad_name && g_str_has_prefix(pad_name, "recv_rtp_src_");
-
-    GstPadLinkReturn r = GST_PAD_LINK_NOFORMAT;
-    if (is_video || name_looks_rtp) {
-        r = gst_pad_link(new_pad, sink_pad);
-        log_fmt(t->logger, t->log_ctx,
-                "rtsp_pad_added: link pad=%s -> depay.sink = %d",
-                pad_name ? pad_name : "?", (int)r);
-    } else {
-        log_fmt(t->logger, t->log_ctx,
-                "rtsp_pad_added: skipping non-video pad=%s",
-                pad_name ? pad_name : "?");
-    }
-
-    gst_object_unref(sink_pad);
-    if (pad_name) g_free(pad_name);
-    if (caps_str) g_free(caps_str);
-    if (caps)     gst_caps_unref(caps);
-}
-
-
-// Builds the pipeline, wires authentication, and starts PLAYING. Blocks
-// until the first preroll (ASYNC_DONE on the bus) or until rtspsrc
-// fails -- returns Bambu_success or -1 accordingly.
-//
-// Pipeline layout (built by hand, not gst_parse_launch, because the
-// auto-link from rtspsrc's sometimes-pad into rtph264depay fires a
-// race in Studio's long-lived GStreamer context that manifests as
-// "streaming stopped, reason not-linked" on the second play):
-//
-//   rtspsrc [location, user-id, user-pw, protocols=tcp, latency=120,
-//            drop-on-latency=true, tls-validation-flags=0,
-//            do-retransmission=false]
-//      --(pad-added, H264)--> rtph264depay
-//      --> h264parse --> <h264-decoder>
-//      --> queue [leaky=downstream, max-size-buffers=2] (decouples
-//                 decoder from jpegenc: a short Studio-side stall can
-//                 drop at most one stale frame instead of back-
-//                 pressuring the decoder/rtspsrc and triggering a
-//                 "fast-forward" burst when the stall ends)
-//      --> videoconvert --> videoscale
-//      --> capsfilter [video/x-raw,width=1280,height=720]
-//      --> jpegenc [quality=80, idct-method=ifast]
-//      --> appsink name=sink [emit-signals=false, drop=true,
-//                             max-buffers=2, sync=false]
-//
-// See comments inside for why each property has the value it does.
 [[maybe_unused]] int open_rtsp(Tunnel* t)
 {
-    gst_init_once();
-
-    const std::string uri = build_rtsp_uri(t->url);
-    log_fmt(t->logger, t->log_ctx, "open_rtsp: uri=%s user=%s",
-            uri.c_str(), t->url.user.c_str());
-
-    // Element factory lookup. We pick the H.264 decoder at runtime
-    // because Bambu Studio ships its own libav* in <install>/bin and
-    // those symbol-conflict with the system's gst-libav plugin
-    // (`module_open failed: libavformat.so.61: undefined symbol
-    // av_mastering_display_metadata_alloc_size, version LIBAVUTIL_59`).
-    // Preferred order: openh264dec (pure userspace, no ffmpeg ABI tie),
-    // then vah264dec (Intel VA-API), then vulkanh264device1dec,
-    // then avdec_h264 as last resort (mostly for systems that don't
-    // ship Studio's bundled libav*).
-    static const char* const kH264Decoders[] = {
-        "openh264dec", "vah264dec", "vulkanh264device1dec", "avdec_h264",
-    };
-    GstElement* pipeline = gst_pipeline_new("obn-rtsp");
-    GstElement* src       = gst_element_factory_make("rtspsrc",      "src");
-    GstElement* depay     = gst_element_factory_make("rtph264depay", "depay");
-    GstElement* parse     = gst_element_factory_make("h264parse",    "parse");
-    GstElement* dec       = nullptr;
-    const char* dec_name  = nullptr;
-    for (const char* name : kH264Decoders) {
-        dec = gst_element_factory_make(name, "dec");
-        if (dec) { dec_name = name; break; }
-    }
-    GstElement* dec_queue = gst_element_factory_make("queue",        "decq");
-    GstElement* conv      = gst_element_factory_make("videoconvert", "conv");
-    GstElement* scale     = gst_element_factory_make("videoscale",   "scale");
-    GstElement* capsf     = gst_element_factory_make("capsfilter",   "capsf");
-    GstElement* enc       = gst_element_factory_make("jpegenc",      "enc");
-    GstElement* sink      = gst_element_factory_make("appsink",      "sink");
-    if (!pipeline || !src || !depay || !parse || !dec || !dec_queue ||
-        !conv || !scale || !capsf || !enc || !sink) {
+    auto pipeline = obn::video::make_video_pipeline(t->logger, t->log_ctx);
+    if (!pipeline) {
         log_fmt(t->logger, t->log_ctx,
-                "open_rtsp: missing GStreamer element(s): "
-                "pipeline=%p src=%p depay=%p parse=%p dec=%p decq=%p "
-                "conv=%p scale=%p capsf=%p enc=%p sink=%p",
-                pipeline, src, depay, parse, dec, dec_queue,
-                conv, scale, capsf, enc, sink);
-        if (pipeline) gst_object_unref(pipeline);
-        else {
-            if (src)       gst_object_unref(src);
-            if (depay)     gst_object_unref(depay);
-            if (parse)     gst_object_unref(parse);
-            if (dec)       gst_object_unref(dec);
-            if (dec_queue) gst_object_unref(dec_queue);
-            if (conv)      gst_object_unref(conv);
-            if (scale)     gst_object_unref(scale);
-            if (capsf)     gst_object_unref(capsf);
-            if (enc)       gst_object_unref(enc);
-            if (sink)      gst_object_unref(sink);
-        }
-        set_last_error("missing gst element");
+                "open_rtsp: no video backend compiled in (build with "
+                "-DOBN_VIDEO_BACKEND=ffmpeg or =gstreamer)");
+        set_last_error("no video backend");
         return -1;
     }
 
-    // rtspsrc: latency=120 ms is a compromise between end-to-end
-    // delay and jitter tolerance. At 50 ms we sporadically dropped
-    // entire RTP packets on LAN (visible as a half-green frame /
-    // missing frame), at 200 ms the stock plugin value we inherited
-    // single-frame stalls in Studio cascaded into multi-frame catch-
-    // up bursts. 120 ms holds the jitterbuffer window at roughly
-    // three 30 fps frame-times, which is still comfortably below
-    // what a person sees as "delayed".
-    // drop-on-latency=true turns the jitterbuffer into a leaky one:
-    // packets that arrive past the window are dropped instead of
-    // back-pressuring the transport, which on TCP would cascade into
-    // visible "freeze for 200 ms, then catch up" hiccups.
-    // tls-validation-flags=0 matches the stock plugin which accepts
-    // the printer's self-signed cert.
-    g_object_set(src,
-                 "location",             uri.c_str(),
-                 "user-id",              t->url.user.c_str(),
-                 "user-pw",              t->url.passwd.c_str(),
-                 "protocols",            4 /* GST_RTSP_LOWER_TRANS_TCP */,
-                 "latency",              120,
-                 "drop-on-latency",      TRUE,
-                 "tls-validation-flags", 0,
-                 "do-retransmission",    FALSE,
-                 nullptr);
-
+    obn::video::StartConfig cfg;
+    cfg.scheme = (t->url.scheme == Scheme::Rtsps)
+                     ? obn::video::Scheme::Rtsps
+                     : obn::video::Scheme::Rtsp;
+    cfg.host    = t->url.host;
+    cfg.port    = t->url.port;
+    cfg.user    = t->url.user;
+    cfg.passwd  = t->url.passwd;
+    cfg.path    = t->url.path;
+    cfg.target_width  = 1280;
+    cfg.target_height = 720;
+    cfg.target_fps    = 30;
     log_fmt(t->logger, t->log_ctx,
-            "open_rtsp: using H.264 decoder '%s'",
-            dec_name ? dec_name : "(none!)");
+            "open_rtsp: backend=%s host=%s:%d user=%s",
+            obn::video::backend_name(),
+            cfg.host.c_str(), cfg.port, cfg.user.c_str());
 
-    // h264parse config-interval=-1: insert SPS/PPS before every keyframe
-    // so the decoder can always lock on, even if we join mid-stream.
-    g_object_set(parse, "config-interval", -1, nullptr);
+    if (pipeline->start(cfg) != 0) return -1;
 
-    // We transcode to 720p MJPG. Studio's camera widget is typically
-    // much smaller than 1080p, and MJPG lets Studio use the same
-    // lightweight path it has for A1/P1 cameras (one jpegdec per frame,
-    // no H.264 decoder bin) -- which is what makes 30 fps actually
-    // reach the screen without the "half speed" symptom.
-    GstCaps* scaled_caps = gst_caps_from_string(
-        "video/x-raw,width=1280,height=720");
-    g_object_set(capsf, "caps", scaled_caps, nullptr);
-    gst_caps_unref(scaled_caps);
-
-    // jpegenc: quality=80 + ifast IDCT is the sweet spot for a
-    // live-camera feed: ~4-5% of one core for 720p30 vs ~8% at
-    // quality=90/islow, and the faint ringing on sharp edges that
-    // ifast produces is below the printer camera's own sensor noise.
-    g_object_set(enc, "quality", 80, "idct-method", 1 /* ifast */, nullptr);
-
-    // dec_queue: small leaky queue between the H.264 decoder and the
-    // conv/scale/jpegenc chain. If Studio's consumer stalls even
-    // briefly (UI thread blocked, window minimised, etc.) the jpegenc
-    // chain slows down; without this queue that back-pressures the
-    // decoder, which back-pressures rtspsrc, which on TCP buffers
-    // until the stall ends and then dumps all the accumulated frames
-    // as fast as the CPU can chew them - the visible "fast-forward
-    // hiccup" symptom. Leaking the oldest decoded frame keeps the
-    // producer side of the pipeline ticking at real time.
-    //
-    // Why 2 buffers instead of 1: the 1-buffer version dropped
-    // *every* frame that was produced while jpegenc was still
-    // encoding the previous one, which in practice capped us well
-    // below 30 fps on machines where jpegenc takes 15-20 ms per
-    // 720p frame. A 2-buffer slot means we only drop when Studio
-    // is actively behind on pulling, not on normal encoder latency.
-    g_object_set(dec_queue,
-                 "leaky",            2 /* GST_QUEUE_LEAKY_DOWNSTREAM */,
-                 "max-size-buffers", 2,
-                 "max-size-bytes",   0,
-                 "max-size-time",    G_GUINT64_CONSTANT(0),
-                 nullptr);
-
-    // appsink: no callbacks (we poll from Bambu_ReadSample), drop the
-    // oldest queued frame if a new one arrives before we've pulled,
-    // and sync=false so we dispatch as soon as a frame is ready --
-    // clocking happens on Studio's side of the tunnel.
-    //
-    // drop=true/max-buffers=2 is the consumer-side counterpart to
-    // the dec_queue above: we keep at most one in-flight frame plus
-    // one "on-deck" so Studio's Bambu_ReadSample poll (which isn't
-    // strictly locked to the producer's 30 fps clock) can always
-    // grab something fresh without starving. After a transient
-    // stall the liveview snaps back to "now" instead of replaying
-    // a long backlog.
-    g_object_set(sink,
-                 "emit-signals", FALSE,
-                 "drop",         TRUE,
-                 "max-buffers",  2,
-                 "sync",         FALSE,
-                 nullptr);
-
-    gst_bin_add_many(GST_BIN(pipeline), src, depay, parse, dec,
-                     dec_queue, conv, scale, capsf, enc, sink, nullptr);
-
-    // Static portion: depay -> parse -> dec -> dec_queue -> conv ->
-    //                 scale -> capsf -> enc -> appsink. rtspsrc ->
-    //                 depay is wired in the pad-added handler below.
-    if (!gst_element_link_many(depay, parse, dec, dec_queue, conv,
-                               scale, capsf, enc, sink, nullptr)) {
-        log_fmt(t->logger, t->log_ctx,
-                "open_rtsp: gst_element_link_many failed");
-        gst_object_unref(pipeline);
-        set_last_error("link failed");
-        return -1;
-    }
-
-    // Hook up rtspsrc's dynamic pad. The handler keeps a borrowed
-    // reference on `depay` (kept alive by the pipeline bin) and a
-    // borrowed pointer to our Tunnel (kept alive as long as the
-    // pipeline exists, since we tear both down together in
-    // tunnel_close). The closure itself is heap-allocated and freed
-    // by glib when the signal handler is disconnected.
-    auto* pad_ctx = new PadCtx{depay, t};
-    gulong handler_id = g_signal_connect_data(
-        src, "pad-added",
-        G_CALLBACK(rtsp_pad_added),
-        pad_ctx,
-        /*destroy_notify=*/[](gpointer data, GClosure*) {
-            delete static_cast<PadCtx*>(data);
-        },
-        GConnectFlags(0));
+    t->video_pipe = std::move(pipeline);
+    // The transcoder always emits MJPEG so Studio's consumer side
+    // treats this tunnel like an A1/P1 camera. width/height/frame_rate
+    // are advisory until the first frame updates them.
+    t->sub_type   = MJPG;
+    t->width      = cfg.target_width;
+    t->height     = cfg.target_height;
+    t->frame_rate = cfg.target_fps;
+    t->t0         = std::chrono::steady_clock::now();
+    t->started    = true;
     log_fmt(t->logger, t->log_ctx,
-            "open_rtsp: pad-added connected handler_id=%lu", handler_id);
-
-    t->pipeline = pipeline;
-    t->appsink  = GST_APP_SINK(sink);
-    // gst_bin_add_many took ownership of `sink` -- but appsink is a
-    // borrowed pointer from the pipeline's child list, so we don't
-    // retain an extra ref here and we don't unref it in tunnel_close
-    // either (the pipeline unref handles it).
-
-    // Kick the pipeline. PLAYING is asynchronous; we wait up to 10 s for
-    // ASYNC_DONE so we can surface a clean auth/handshake error instead
-    // of the user seeing nothing until the first ReadSample times out.
-    log_fmt(t->logger, t->log_ctx, "open_rtsp: set_state -> PLAYING");
-    GstStateChangeReturn ret = gst_element_set_state(t->pipeline, GST_STATE_PLAYING);
-    log_fmt(t->logger, t->log_ctx, "open_rtsp: set_state returned %d", (int)ret);
-    if (ret == GST_STATE_CHANGE_FAILURE) {
-        log_fmt(t->logger, t->log_ctx, "open_rtsp: set_state PLAYING failed");
-        set_last_error("gst PLAYING failed");
-        return -1;
-    }
-
-    // gst-libav only loads libavutil/libavcodec when the first
-    // avdec_h264 instance goes to PAUSED/PLAYING, so our gst_init_once
-    // call happened too early to see the library in-process. Retry
-    // now, which is the path that actually silences the per-frame
-    // "deprecated pixel format used" spam swscale prints when the
-    // YUVJ420P decoder output feeds into videoconvert.
-    silence_libav_warnings();
-
-    GstBus* bus = gst_element_get_bus(t->pipeline);
-    const GstClockTime kWaitNs = 10ULL * GST_SECOND;
-    bool ok = false;
-    while (true) {
-        GstMessage* msg = gst_bus_timed_pop_filtered(
-            bus, kWaitNs,
-            static_cast<GstMessageType>(GST_MESSAGE_ASYNC_DONE |
-                                        GST_MESSAGE_ERROR |
-                                        GST_MESSAGE_EOS));
-        if (!msg) {
-            log_fmt(t->logger, t->log_ctx, "open_rtsp: timeout waiting ASYNC_DONE");
-            set_last_error("rtsp timeout");
-            break;
-        }
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ASYNC_DONE) {
-            ok = true;
-            gst_message_unref(msg);
-            break;
-        }
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-            GError* err  = nullptr;
-            gchar*  dbg  = nullptr;
-            gst_message_parse_error(msg, &err, &dbg);
-            log_fmt(t->logger, t->log_ctx,
-                    "open_rtsp: gst error: %s (%s)",
-                    err  ? err->message  : "?",
-                    dbg  ? dbg           : "");
-            set_last_error(err ? err->message : "rtsp error");
-            if (err) g_error_free(err);
-            if (dbg) g_free(dbg);
-            gst_message_unref(msg);
-            break;
-        }
-        // EOS pre-play: something is very wrong (printer refused).
-        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
-            log_fmt(t->logger, t->log_ctx, "open_rtsp: EOS before playback");
-            set_last_error("rtsp EOS at open");
-            gst_message_unref(msg);
-            break;
-        }
-        gst_message_unref(msg);
-    }
-    gst_object_unref(bus);
-
-    if (!ok) return -1;
-
-    // We transcode to MJPG inside the pipeline above. Studio's
-    // consumer side treats this tunnel like an A1/P1 camera.
-    t->sub_type  = MJPG;
-    t->width     = 1280;
-    t->height    = 720;
-    t->frame_rate = 30;
-    t->t0        = std::chrono::steady_clock::now();
-    t->started   = true;
-    log_fmt(t->logger, t->log_ctx, "open_rtsp: pipeline PLAYING (mjpg 1280x720)");
+            "open_rtsp: pipeline ready (mjpg %dx%d)", t->width, t->height);
     return Bambu_success;
 }
 
-// Pulls the next H.264 access unit from the appsink. Returns
-// Bambu_would_block if nothing is queued yet (gstbambusrc handles that
-// by sleeping 33 ms and polling again). On error returns -1. EOS from
-// the server maps to Bambu_stream_end.
 int read_rtsp(Tunnel* t, Bambu_Sample* sample)
 {
-    if (!t->appsink) return -1;
-
-    // Drain any pending bus messages so the mirror log actually names
-    // the culprit when something dies mid-stream. Skip state-change /
-    // ASYNC_DONE noise.
-    if (t->pipeline) {
-        GstBus* bus = gst_element_get_bus(t->pipeline);
-        while (GstMessage* m = gst_bus_pop_filtered(
-                   bus, static_cast<GstMessageType>(
-                            GST_MESSAGE_ERROR | GST_MESSAGE_WARNING |
-                            GST_MESSAGE_EOS | GST_MESSAGE_STREAM_STATUS))) {
-            switch (GST_MESSAGE_TYPE(m)) {
-            case GST_MESSAGE_ERROR: {
-                GError* e = nullptr; gchar* d = nullptr;
-                gst_message_parse_error(m, &e, &d);
-                log_fmt(t->logger, t->log_ctx,
-                        "read_rtsp: [%s] ERROR %s (%s)",
-                        GST_OBJECT_NAME(GST_MESSAGE_SRC(m)),
-                        e ? e->message : "?", d ? d : "");
-                if (e) g_error_free(e);
-                if (d) g_free(d);
-                break;
-            }
-            case GST_MESSAGE_WARNING: {
-                GError* e = nullptr; gchar* d = nullptr;
-                gst_message_parse_warning(m, &e, &d);
-                log_fmt(t->logger, t->log_ctx,
-                        "read_rtsp: [%s] WARN %s (%s)",
-                        GST_OBJECT_NAME(GST_MESSAGE_SRC(m)),
-                        e ? e->message : "?", d ? d : "");
-                if (e) g_error_free(e);
-                if (d) g_free(d);
-                break;
-            }
-            case GST_MESSAGE_EOS:
-                log_fmt(t->logger, t->log_ctx,
-                        "read_rtsp: [%s] EOS",
-                        GST_OBJECT_NAME(GST_MESSAGE_SRC(m)));
-                break;
-            default: break;
-            }
-            gst_message_unref(m);
-        }
-        gst_object_unref(bus);
+    if (!t->video_pipe) return -1;
+    obn::video::Frame f;
+    auto rc = t->video_pipe->try_pull(&f);
+    switch (rc) {
+        case obn::video::Pull_Ok:
+            break;
+        case obn::video::Pull_WouldBlock:
+            return Bambu_would_block;
+        case obn::video::Pull_StreamEnd:
+            return Bambu_stream_end;
+        case obn::video::Pull_Error:
+        default:
+            return -1;
     }
 
-    // Non-blocking pull: if we blocked here (e.g. 50 ms) we'd cap our
-    // effective frame rate to 1 / timeout regardless of what the
-    // camera sends. gstbambusrc already sleeps 33 ms when we return
-    // Bambu_would_block, so returning immediately is strictly better.
-    //
-    // Note: we deliberately never call gst_app_sink_is_eos() here.
-    // In gst 1.26 it returns true transiently whenever the queue is
-    // drained between frames, which made Bambu_ReadSample claim
-    // Bambu_stream_end between every successful sample. gstbambusrc
-    // interprets that as "tunnel dead" and tears it down. Real EOS
-    // is extremely rare on a live camera (only happens on manual
-    // unblock / Bambu_Close), and the next Bambu_Open will re-establish
-    // the pipeline anyway -- so returning Bambu_would_block until
-    // samples come back is strictly safer.
-    GstSample* gsample = gst_app_sink_try_pull_sample(t->appsink, 0);
-    if (!gsample) return Bambu_would_block;
-
-    GstBuffer* buf = gst_sample_get_buffer(gsample);
-    if (!buf) {
-        gst_sample_unref(gsample);
-        return Bambu_would_block;
-    }
-    GstMapInfo info;
-    if (!gst_buffer_map(buf, &info, GST_MAP_READ)) {
-        gst_sample_unref(gsample);
-        set_last_error("gst_buffer_map failed");
-        return -1;
-    }
-
-    t->frame_buf.assign(info.data, info.data + info.size);
-    gst_buffer_unmap(buf, &info);
-
-    // Deliberately ignore GstBuffer's own DTS/PTS here. They are
-    // running-time coordinates of *our* rtspsrc pipeline, which
-    // includes the 200 ms jitter latency and any backpressure caused
-    // by Studio's decoder. Studio runs its own pipeline with its own
-    // clock, and gstbambusrc re-baselines to the first DTS we hand it
-    // -- so if we forwarded those "pipeline-past" timestamps, Studio's
-    // sink would keep trying to replay at that slower cadence,
-    // producing the "video plays at half speed" symptom.
-    //
-    // Instead, stamp each frame with the wall-clock moment we pulled
-    // it out of the appsink. That makes gstbambusrc say "this frame is
-    // now", Studio's decoder renders it immediately, and the end-to-end
-    // frame rate tracks whatever the camera is actually producing.
-    auto now = std::chrono::steady_clock::now();
-    auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   now - t->t0).count();
-    unsigned long long dt_100ns =
-        static_cast<unsigned long long>(ns / 100);
-
-    // Video dimensions, picked off the first sample's caps if possible.
-    if (t->frame_count == 0) {
-        GstCaps* caps = gst_sample_get_caps(gsample);
-        if (caps) {
-            GstStructure* s = gst_caps_get_structure(caps, 0);
-            gint w = 0, h = 0;
-            if (s && gst_structure_get_int(s, "width", &w) &&
-                    gst_structure_get_int(s, "height", &h) &&
-                    w > 0 && h > 0) {
-                t->width  = w;
-                t->height = h;
-            }
-        }
-    }
-
-    gst_sample_unref(gsample);
-
-    if (++t->frame_count == 1 || (t->frame_count % 60) == 0) {
-        log_fmt(t->logger, t->log_ctx,
-                "read_rtsp: frame #%llu size=%zu",
-                static_cast<unsigned long long>(t->frame_count),
-                t->frame_buf.size());
-    }
-
+    if (f.width  > 0) t->width  = f.width;
+    if (f.height > 0) t->height = f.height;
     sample->itrack      = 0;
-    sample->size        = static_cast<int>(t->frame_buf.size());
-    sample->flags       = 0;
-    sample->buffer      = t->frame_buf.data();
-    sample->decode_time = dt_100ns;
+    sample->size        = static_cast<int>(f.size);
+    sample->flags       = f.flags;
+    sample->buffer      = f.jpeg;
+    sample->decode_time = static_cast<unsigned long long>(f.dt_100ns);
     return Bambu_success;
 }
+
 
 // -----------------------------------------------------------------------
 // Build the 80-byte auth packet per OpenBambuAPI/video.md.
@@ -2909,7 +2213,7 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     t->fd = dial(t->url.host, t->url.port, /*timeout_ms=*/5000);
     if (t->fd < 0) {
         log_fmt(t->logger, t->log_ctx, "Bambu_Open: connect failed: %s",
-                g_last_error.c_str());
+                obn::source::get_last_error());
         return -1;
     }
     log_fmt(t->logger, t->log_ctx, "Bambu_Open: TCP connected, fd=%d", t->fd);
@@ -2964,12 +2268,12 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
 {
     // Both protocols start streaming implicitly:
     //   * MJPG: printer begins pushing frames right after auth.
-    //   * RTSP: Bambu_Open already set the pipeline to PLAYING.
+    //   * RTSP: Bambu_Open already started the IVideoPipeline.
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->pipeline) return -1;
+         t->url.scheme == Scheme::Rtsp) && !t->video_pipe) return -1;
     return Bambu_success;
 }
 
@@ -3004,8 +2308,8 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     if (!t) return 0;
     if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
     if ((t->url.scheme == Scheme::Rtsps ||
-         t->url.scheme == Scheme::Rtsp) && !t->pipeline) return 0;
-    return 1; // one video track, either MJPG or H.264
+         t->url.scheme == Scheme::Rtsp) && !t->video_pipe) return 0;
+    return 1; // one video track, MJPEG (transcoded for RTSP).
 }
 
 OBN_EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index,
@@ -3068,7 +2372,7 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
         return Bambu_success;
     }
 
-    // RTSP: pull from appsink. MJPG path continues below.
+    // RTSP: pull from the IVideoPipeline. MJPG path continues below.
     if (t->url.scheme == Scheme::Rtsps || t->url.scheme == Scheme::Rtsp) {
         return read_rtsp(t, sample);
     }
@@ -3199,7 +2503,7 @@ OBN_EXPORT char const* Bambu_GetLastErrorMsg()
     // pointer that remains valid until the next set_last_error on
     // the same thread. That matches how Studio actually uses it
     // (printed immediately, not stored).
-    return g_last_error.c_str();
+    return obn::source::get_last_error();
 }
 
 OBN_EXPORT void Bambu_FreeLogMsg(tchar const* msg)
