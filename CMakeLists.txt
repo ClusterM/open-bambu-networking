@@ -221,6 +221,7 @@ add_library(bambu_networking SHARED
     src/abi_print.cpp
     src/abi_presets.cpp
     src/abi_http.cpp
+    src/abi_filament.cpp
     src/abi_camera.cpp
     src/abi_makerworld.cpp
     src/abi_track.cpp
