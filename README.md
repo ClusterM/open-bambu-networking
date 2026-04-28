@@ -355,7 +355,7 @@ to open, etc.), but nothing half-done runs at runtime.
 | `ipcam.file` block injection                                   | Firmware with a file browser advertises `ipcam.file = {"local":"local",…}`; Studio keys the MediaFilePanel off that.                                                                                                                                                                                                                                                                                                                                 | When the printer omits the block we inject `{"local":"local","remote":"none","model_download":"enabled"}` into the ipcam object. Present blocks pass through unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Without this Studio short-circuits MediaFilePanel with "Browsing file in storage is not supported in current firmware" and never calls `Bambu_StartStreamEx(CTRL_TYPE)` on us.                                                                                                                                                                                                                                    | The plugin advertises file-browser capability even for firmware revisions where it doesn't exist natively; the opposite side (our CTRL bridge) is all FTPS so it still works.                                                                                                                                                            |
 | PrinterFileSystem CTRL bridge                                  | Port-6000 proprietary CTRL protocol served by the stock `libBambuSource.so`: Bambu-framed binary JSON and per-command media blobs.                                                                                                                                                                                                                                                                                                                   | In our `libBambuSource.so` a worker thread per tunnel answers `LIST_INFO` / `SUB_FILE` / `FILE_DOWNLOAD` / `FILE_DEL` / `REQUEST_MEDIA_ABILITY` / `TASK_CANCEL` by translating each into FTPS (`LIST`, `RETR`, `DELE`) on the same TLS endpoint we use for LAN print uploads.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | FTPS is universal across Bambu LAN firmware and survives Developer Mode. The CTRL protocol isn't documented anywhere we've found.                                                                                                                                                                                                                                                                                 | `FILE_UPLOAD` is not implemented (Studio uses `ft_`* for uploads anyway). `SUB_FILE` re-downloads the whole `.3mf` for every thumbnail / metadata request: OK on LAN, wasteful vs. a native CTRL channel that could stream entries.                                                                                                      |
 | 3MF thumbnail extraction                                       | Stock CTRL protocol likely streams just the requested entry out of the `.3mf` on the printer.                                                                                                                                                                                                                                                                                                                                                        | We fetch the whole archive into memory, parse the central directory, and `inflate` the target PNG (`Metadata/plate_1.png` / `plate_no_light_1.png`) or a requested entry with zlib raw-deflate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | No external ZIP dependency; archives fit in RAM for any reasonable print job.                                                                                                                                                                                                                                                                                                                                     | Large models (~10+ MB) hit the wire once per thumbnail tile. Parser is minimal — compressed entries only via DEFLATE; we don't handle stored-with-encryption or ZIP64.                                                                                                                                                                   |
-| Camera liveview (RTSPS)                                        | X1/P1S stock `libBambuSource.so` exposes the H.264 RTSPS stream directly; Studio's `gstbambusrc` element decodes it.                                                                                                                                                                                                                                                                                                                                 | Our `libBambuSource.so` terminates RTSPS internally and re-encodes each frame as MJPEG so Studio sees the same wire format the port-6000 MJPEG path uses for P1/A1. The pipeline lives behind an `IVideoPipeline` interface; the default backend is FFmpeg (`libavformat` + `libavcodec` H.264 decode + MJPEG encode + `libswscale` for the scale step) and the legacy GStreamer pipeline (`rtspsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → videoscale → jpegenc → appsink`) is still selectable via `-DOBN_VIDEO_BACKEND=gstreamer`. See [Video backend](#video-backend).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | We can lean on the MJPEG reader Studio already ships instead of matching the stock H.264 frame metadata and GStreamer plumbing byte-for-byte. FFmpeg is also a much smaller dependency than GStreamer on macOS, where Studio doesn't link GStreamer at all.                                                                                                                                                       | Extra decode + re-encode on the host CPU; 720p @ 30 fps consumes ~~15 % of a mid-tier desktop. Higher end-to-end latency (~~100–300 ms more) than passing H.264 through untouched.                                                                                                                                                       |
+| Camera liveview (RTSPS)                                        | X1/P1S stock `libBambuSource.so` exposes the H.264 RTSPS stream directly; Studio's `gstbambusrc` element decodes it.                                                                                                                                                                                                                                                                                                                                 | Our `libBambuSource.so` terminates RTSPS internally and re-encodes each frame as MJPEG so Studio sees the same wire format the port-6000 MJPEG path uses for P1/A1. The pipeline lives behind an `IVideoPipeline` interface; the default backend is FFmpeg -- a custom in-process RTSP / RTSPS client (`stubs/rtsp_client.cpp`) that demuxes H.264 NAL units, hands them to `libavcodec` for decode, `libswscale` for scale to RGB, and `stb_image_write` for baseline JPEG encode (Studio's bundled libavcodec is decoder-only and would have made `avcodec_find_encoder(MJPEG)` return `NULL`). The legacy GStreamer pipeline (`rtspsrc → rtph264depay → h264parse → avdec_h264 → videoconvert → videoscale → jpegenc → appsink`) is still selectable via `-DOBN_VIDEO_BACKEND=gstreamer` for bare-Linux builds. See [Video backend](#video-backend).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | We can lean on the MJPEG reader Studio already ships instead of matching the stock H.264 frame metadata and GStreamer plumbing byte-for-byte. FFmpeg is also a much smaller dependency than GStreamer on macOS, where Studio doesn't link GStreamer at all.                                                                                                                                                       | Extra decode + re-encode on the host CPU; 720p @ 30 fps consumes ~~15 % of a mid-tier desktop. Higher end-to-end latency (~~100–300 ms more) than passing H.264 through untouched.                                                                                                                                                       |
 | `start_sdcard_print` over LAN MQTT                             | Stock plugin hits a cloud REST endpoint (`start_sdcard_print`) that signs and relays the command via the cloud tunnel.                                                                                                                                                                                                                                                                                                                               | We publish `{"print":{"command":"project_file", "url":"ftp://<path>", …}}` directly on the active LAN MQTT session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | The cloud endpoint requires MakerWorld signing we don't reproduce, and Developer Mode printers have no cloud route to receive it on anyway. LAN MQTT is what the firmware actually consumes.                                                                                                                                                                                                                      | No cloud task record. `task_id` / `subtask_id` / `project_id` are all `0`, which a very old firmware could refuse if it ever validates them (none observed).                                                                                                                                                                             |
 | Cross-device user preset sync                                  | Stock plugin's `get_setting_list2` only fetches metadata (`setting_id`, `name`, `update_time`, …) from `GET /v1/iot-service/api/slicer/setting`, assuming the matching preset body is already present on disk under `<config_dir>/user/<uid>/`. On a fresh machine the list walk produces a `setting_id` with no `setting` map to merge in, so `PresetCollection::load_user_preset()` silently skips every cloud preset and your profiles disappear. | For each preset the Studio-provided `CheckFn` flags as needed, we additionally issue `GET /v1/iot-service/api/slicer/setting/<setting_id>` to pull the full `setting` payload, then inject `user_id` (not returned by the server) and convert `update_time` from `"YYYY-MM-DD HH:MM:SS"` into the unix-seconds string `load_user_preset()` expects. The resulting flat `values_map` is handed to Studio exactly where it would expect one from a local file.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Studio's loader path and the cloud endpoint both exist; the stock plugin simply never connects the two. The extra `GET /setting/<id>` per preset is the minimum RTT needed to survive a wiped local cache (on which the author got burnt while reverse-engineering this section).                                                                                                                                 | One HTTPS round-trip per synced preset on the first sync after a wipe (~100 KB response each). On a machine that already has the local files, Studio's `need_sync()` check short-circuits the download — same bandwidth as stock.                                                                                                        |
 | Firmware info synthesis (`get_printer_firmware`)               | Stock plugin serves `GET /v1/iot-service/api/slicer/resource/printer/firmware?dev_id=…` against the Bambu cloud, returning a JSON envelope (current/new version per module + release notes + binary URL) that Studio's `UpgradePanel` and `ReleaseNoteDialog` render.                                                                                                                                                                                | The plugin doesn't call the cloud at all. Instead the agent maintains a `DeviceFw` cache keyed by `dev_id` that harvests versions from every MQTT frame the printer already sends: `info.command=get_version` replies (module array with `name`/`sw_ver`/`sn`/`loader_ver`) and `push_status.upgrade_state.new_ver_list`. `render_firmware_json(dev_id)` then emits the same envelope Studio expects — current versions populate the Update panel, advertised newer versions light up the "update available" banner, the description links to `bambulab.com/en/support/firmware-download/all`. The actual flash is a passthrough: Studio's "Update" button publishes `{"upgrade":{"command":"upgrade_confirm"}}` on LAN MQTT, and the printer fetches the binary from Bambu's CDN itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | The cloud firmware catalogue requires a signed request with an `accessToken` for a linked account and answers with HTML behind Cloudflare from an untrusted client (no stable public JSON). What we need (current version, advertised new version, a way to flash the advertised one) is already on the wire in plaintext via MQTT, so we re-synthesise the envelope locally.                                     | No cross-version history — you can only flash what the printer is currently advertising, not an older or a beta OTA from the cloud catalogue. Release Notes text is a short auto-generated stub with an external link, not the full changelog. No effect when no new version is advertised (Release Notes dialog empty — same as stock). |
@@ -618,7 +618,7 @@ headers for everything the project links against:
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | Toolchain                           | `build-essential`, `cmake`, `pkg-config`                                                             | `gcc-c++`, `cmake`, `pkgconf-pkg-config`                                          |
 | MQTT / JSON / HTTP / TLS / zlib     | `libmosquitto-dev`, `libcjson-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
-| FFmpeg (default RTSPS camera path)  | `libavformat-dev`, `libavcodec-dev`, `libavutil-dev`, `libswscale-dev`                               | `ffmpeg-free-devel` (or `ffmpeg-devel` from RPM Fusion)                            |
+| FFmpeg (default RTSPS camera path)  | `libavcodec-dev`, `libavutil-dev`, `libswscale-dev` (no `libavformat-dev`)                           | `ffmpeg-free-devel` (or `ffmpeg-devel` from RPM Fusion)                            |
 | GStreamer (legacy RTSPS path)       | `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`                                            | `gstreamer1-devel`, `gstreamer1-plugins-base-devel`                               |
 
 
@@ -643,7 +643,7 @@ One-shot install examples:
 # Debian / Ubuntu (default ffmpeg backend)
 sudo apt install build-essential cmake pkg-config \
   libmosquitto-dev libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
-  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+  libavcodec-dev libavutil-dev libswscale-dev
 ```
 
 ```sh
@@ -668,33 +668,48 @@ printer model. Pick the implementation at configure time:
 
 | `-DOBN_VIDEO_BACKEND=…` | What it does                                                                                                                                        | Build deps                                              |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `ffmpeg` (default)      | `libavformat` + `libavcodec` (H.264 decode + MJPEG encode) + `libswscale`. Smaller runtime, no GStreamer framework dependency on macOS.             | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev` |
-| `gstreamer`             | Legacy `rtspsrc → rtph264depay → h264parse → <h264 dec> → videoconvert → videoscale → jpegenc → appsink` pipeline. Kept for one release as a fallback. | `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`  |
+| `ffmpeg` (default)      | In-process RTSP / RTSPS client (custom, see `stubs/rtsp_client.cpp`) + `libavcodec` H.264 decode + `libswscale` resample + `stb_image_write` baseline JPEG encode. **No `libavformat` dependency, and no MJPEG encoder dependency on libavcodec** (Bambu Studio's bundled libavcodec is decoder-only). Reuses libavcodec / libavutil / libswscale copies the host process already has loaded. | `libavcodec-dev libavutil-dev libswscale-dev` |
+| `gstreamer`             | Legacy `rtspsrc → rtph264depay → h264parse → <h264 dec> → videoconvert → videoscale → jpegenc → appsink` pipeline. Bare-Linux only -- known to abort inside Bambu Studio's AppImage (libjpeg ABI clash) and macOS bundles (no GStreamer.framework). | `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` |
 | `none`                  | RTSPS unsupported (Studio's camera widget reports an error cleanly). The MJPG path on port 6000 (A1/A1 mini/P1/P1P) and the file browser still work. | none                                                    |
 
 The C-ABI consumer (gstbambusrc on Linux/Windows, `BambuPlayer.mm` on macOS)
 sees the same JPEG bytes either way; the backend is only visible in `obn-bambusource.log`
 ("ff: ..." vs "gst: ...") and in the set of shared libraries the dylib pulls in.
 
-> **FFmpeg is loaded lazily.** With `OBN_VIDEO_BACKEND=ffmpeg` (the default)
-> `libBambuSource.so` does **not** carry a hard `NEEDED` dependency on
-> `libavformat.so.NN` / `libavcodec.so.NN` / `libavutil.so.NN` /
-> `libswscale.so.NN`. Instead, the first RTSPS pipeline that gets started
-> `dlopen`s the four libraries by name, walking a list of soname versions
-> the FFmpeg project has shipped over the last decade (`*.so.61` → `.60`
-> → `.59` → `.58` → `.57` → unversioned, plus the matching `.dylib`
-> filenames on macOS). This single binary therefore works on FFmpeg 4.x
-> through 7.x and -- crucially -- inside Bambu Studio's own bundle, where
-> `<install>/bin` may ship a different libav major than the system FFmpeg
-> the plugin was linked against. If none of the candidates resolves, the
-> plugin still loads cleanly (the MJPG path on port 6000 and the FTPS
-> file browser keep working); only the RTSPS camera widget reports
-> "FFmpeg backend unavailable: …" with the exact `dlopen`/`dlsym` error
-> in `obn-bambusource.log`.
+> **No libav linkage at all.** With `OBN_VIDEO_BACKEND=ffmpeg` (the default)
+> `libBambuSource.so` carries **zero** `DT_NEEDED` entries on the libav family
+> and **does not `dlopen` system libav either**. Instead, on the first
+> RTSPS pipeline start the plugin resolves the libavcodec / libavutil /
+> libswscale function pointers it needs via `dlsym(RTLD_DEFAULT, ...)` --
+> i.e. it binds to whatever copies of those libraries are already in the
+> host process. Bambu Studio's AppImage / macOS bundle DT_NEEDEDs them off
+> the main `bambu-studio` binary, so they are always already in process
+> by the time our plugin runs.
+>
+> This is by design. Earlier versions of the plugin tried to `dlopen` /
+> `dlmopen` system libavformat as a fallback. That kept failing with
+> `undefined symbol av_mastering_display_metadata_alloc_size, version
+> LIBAVUTIL_59` because system libavformat was built against a newer
+> libavutil minor than the AppImage already had loaded -- and glibc's
+> link model deduplicates by SONAME across `dlmopen()` namespaces, so
+> even an isolated namespace ended up reusing the older libavutil. The
+> reliable fix is to *not* mix libav copies: use only the set Studio
+> already has loaded (matching minors guaranteed) and implement the
+> RTSP / RTSPS protocol ourselves so we never need libavformat. See
+> `stubs/rtsp_client.cpp` for the protocol layer and `stubs/ffmpeg_dyn.cpp`
+> for the loader.
+>
+> If Studio is built without libavcodec for some reason (theoretical;
+> we have not seen it in the wild), the RTSPS camera widget reports
+> "ffmpeg_dyn: libavcodec is not loaded in this process" in
+> `obn-bambusource.log` and the rest of the plugin keeps working
+> (MJPG-on-port-6000 path for A1/P1, FTPS file browser, etc.).
 
-The build still uses `pkg-config` to find the FFmpeg headers (we need
-the type definitions), so a `libav*-dev` package is required at compile
-time even though no `.so` is referenced from `DT_NEEDED`.
+The build still uses `pkg-config` to find the libav headers (we need the
+type definitions like `AVFrame`, `AVCodecContext`, `AV_PIX_FMT_YUVJ420P`),
+so `libavcodec-dev` / `libavutil-dev` / `libswscale-dev` are required
+at compile time. **No `libavformat-dev` is needed -- we wrote the
+protocol layer ourselves.**
 
 ### Configure, build, install
 
@@ -787,22 +802,23 @@ common Flathub id `com.bambulab.BambuStudio`, configure and install like this
 make && make install
 ```
 
-**FFmpeg / camera.** `libBambuSource.so` calls FFmpeg (`libavformat`,
-`libavcodec`, `libavutil`, `libswscale`) for the LAN camera path on its
-default `OBN_VIDEO_BACKEND=ffmpeg` setting (see [Video backend](#video-backend)).
-The plugin `dlopen`s these libraries lazily by walking a list of soname
-candidates (`*.so.61` → `.60` → `.59` → `.58` → `.57` → unversioned), so
-host-versus-sandbox FFmpeg version mismatches no longer crash the dlopen
-of `libBambuSource.so` itself. The libraries still have to be **reachable
-inside Studio's environment** for the camera to work, though: Flatpak's
-runtime libraries live under the sandbox's library search path and may
-not match any of the candidates above; in that case RTSPS will fail to
-start ("FFmpeg backend unavailable: …" in `obn-bambusource.log`) but the
-rest of the plugin -- discovery, MQTT, printing, MJPG-on-port-6000 from
-A1/P1, file browser -- keeps working. The legacy
-`OBN_VIDEO_BACKEND=gstreamer` path still links GStreamer the old way and
-remains sensitive to host vs. sandbox mismatch. `OBN_VIDEO_BACKEND=none`
-opts out of RTSPS entirely.
+**FFmpeg / camera.** `libBambuSource.so` calls into `libavcodec`,
+`libavutil`, and `libswscale` for the LAN camera path on its default
+`OBN_VIDEO_BACKEND=ffmpeg` setting (the RTSP / RTSPS protocol itself is
+implemented in-process by `stubs/rtsp_client.cpp`; `libavformat` is
+**not** used). The plugin does not `dlopen` system libav: instead it
+resolves the libav function pointers it needs via
+`dlsym(RTLD_DEFAULT, ...)`, binding to whatever copies of those
+libraries are already in the host process. Bambu Studio's AppImage /
+Flatpak runtime DT_NEEDEDs them off the main `bambu-studio` binary, so
+they are always already in process by the time our plugin runs. There
+is therefore no longer a "host-versus-sandbox FFmpeg version mismatch"
+failure mode for the FFmpeg backend on Flatpak / AppImage. The legacy
+`OBN_VIDEO_BACKEND=gstreamer` path still links GStreamer the old way
+and *is* sensitive to host vs. sandbox mismatch (and is known to abort
+inside Studio's AppImage with a libjpeg ABI clash that we cannot fix
+from outside Studio's bundle). `OBN_VIDEO_BACKEND=none` opts out of
+RTSPS entirely.
 
 **Recommendation.** For the fewest surprises, run a **native** Studio package
 from your distribution or an **official AppImage**, or **build Studio from
@@ -817,13 +833,16 @@ rewiring. You may still need `**--vendor-mosquitto**` if the AppImage’s
 namespace does not expose a usable `libmosquitto` to the plugin. GStreamer is
 more likely to work than under Flatpak **if** the plugin is built against a
 toolchain and library versions compatible with what that AppImage ships;
-otherwise you can still hit `dlopen`/ABI or `libstdc++` mismatches. The same
-caveat applies to FFmpeg in the default `OBN_VIDEO_BACKEND=ffmpeg` build:
-the AppImage's bundled `libavcodec` may not be the version your plugin was
-linked against. When in
-doubt, prefer matching Studio’s release environment (same distro packages or
-same upstream build instructions) or building both Studio and the plugin from
-source.
+otherwise you can still hit `dlopen`/ABI or `libstdc++` mismatches.
+**FFmpeg in the default `OBN_VIDEO_BACKEND=ffmpeg` build is *not*
+affected by this**: the plugin doesn't link or `dlopen` libav at all,
+it binds to the AppImage's already-loaded libav copies via
+`dlsym(RTLD_DEFAULT, ...)`. So the FFmpeg-backed RTSPS path works
+identically inside or outside an AppImage as long as Studio has libav
+loaded (it does on every release we have looked at). When in doubt
+about the rest of the toolchain, prefer matching Studio’s release
+environment (same distro packages or same upstream build instructions)
+or building both Studio and the plugin from source.
 
 ## Logging
 
@@ -918,15 +937,17 @@ unhelpful (e.g. `GST_DEBUG`).
 | `OBN_AV_LOG_LEVEL`           | `AV_LOG_WARNING` (24)                                                                                                                                                                            | FFmpeg backend only. Lifts libav's own log threshold; only matters when diagnosing demux / decode failures (see `<libavutil/log.h>` for the numeric levels).           |
 | `OBN_GST_DEBUG`              | `GST_LEVEL_WARNING`                                                                                                                                                                              | GStreamer backend only. Same idea but for `rtspsrc` / `h264parse` / decoder bus messages. Numeric level (1..9) or `INFO` / `DEBUG`.                                   |
 
-The mirror file rolls every line through `[level]` plus a timestamp. FFmpeg
-backend lines are tagged `ff:`, GStreamer backend lines are tagged `gst:`,
-and any libav / GStreamer internal output appears under `[av WARN]` /
-`[gst WARNING]`. The dynamic libav loader emits one line at startup with
-the soname it picked (`ffmpeg_dyn: avformat=libavformat.so.61
-avcodec=libavcodec.so.61 avutil=libavutil.so.59 swscale=libswscale.so.8`);
-when it fails the same line carries a `dlopen`/`dlsym` error string that
-narrows the cause down to "library missing on this host" vs "version
-tag mismatch with Bambu Studio's bundled libav".
+The mirror file rolls every line through `[level]` plus a timestamp. The
+FFmpeg backend (default) tags its lines with `libav:` (RTSP control plane),
+`rtsp:` (handshake / DESCRIBE / SETUP / PLAY), and `h264:` (decoder /
+encoder); GStreamer backend lines are tagged `gst:`. Any libav internal
+output appears under `[av WARN]`. The dynamic libav loader emits one
+line at startup confirming it bound to the host process's already-loaded
+libav (`ffmpeg_dyn: resolved libav* via RTLD_DEFAULT (in-process
+libavcodec/libavutil/libswscale)`); when that fails the same line says
+exactly which symbol was missing, which is almost always "this Studio
+build does not bundle libavcodec at all" since the AppImage variant we
+support always does.
 
 ## License
 

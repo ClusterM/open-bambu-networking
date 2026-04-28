@@ -52,4 +52,26 @@ bool decode_rgba(const std::vector<std::uint8_t>& in, DecodedRGBA* out);
 // MIME type is left untouched.
 bool encode_png(const DecodedRGBA& src, std::vector<std::uint8_t>* out);
 
+// Encodes a tightly-packed row-major RGB888 surface (`rgb` of size
+// w*h*3) as a baseline JPEG into `*out`. Used by the RTSPS pipeline
+// to turn each decoded H.264 frame into an MJPEG sample for
+// libBambuSource's gstbambusrc consumer.
+//
+// The reason this lives in image_io rather than next to libavcodec is
+// that Bambu Studio's bundled libavcodec ships *decoder-only* (no
+// MJPEG encoder registered), so the obvious avcodec_find_encoder
+// path returns nullptr. stb_image_write has no external NEEDED
+// entries and produces baseline JPEG that GStreamer's jpegparse +
+// avdec_mjpeg consume happily.
+//
+// `quality` is in [1..100]; 80 mirrors the GStreamer jpegenc default
+// the legacy pipeline produced. Returns false on invalid dimensions
+// or stb_image_write failure (typically OOM). On success `*out`
+// contains a complete JPEG byte stream (caller controls clear /
+// reserve before calling).
+bool encode_jpeg(const std::uint8_t* rgb,
+                 std::uint32_t w, std::uint32_t h,
+                 int quality,
+                 std::vector<std::uint8_t>* out);
+
 } // namespace obn::image

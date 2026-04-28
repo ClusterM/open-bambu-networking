@@ -111,4 +111,39 @@ bool encode_png(const DecodedRGBA& src, std::vector<std::uint8_t>* out)
     return true;
 }
 
+bool encode_jpeg(const std::uint8_t* rgb,
+                 std::uint32_t w, std::uint32_t h,
+                 int quality,
+                 std::vector<std::uint8_t>* out)
+{
+    if (!rgb || !out) return false;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) return false;
+    if (quality < 1)   quality = 1;
+    if (quality > 100) quality = 100;
+
+    out->clear();
+    // Reserve a soft-typical baseline-JPEG size (~10-15 % of raw RGB
+    // for photographic content at q=80). Re-allocs are exponential
+    // anyway, so this is just to avoid the first few small grow steps.
+    const std::size_t raw = static_cast<std::size_t>(w) * h * 3;
+    out->reserve(raw / 8);
+
+    // stb_image_write's JPEG encoder takes tightly-packed data; the
+    // caller (h264_decoder.cpp) already routes sws_scale into a
+    // contiguous w*3-stride buffer for exactly this reason, so
+    // there is no per-row copy needed here.
+    const int rc = stbi_write_jpg_to_func(
+        &write_to_vector, out,
+        static_cast<int>(w),
+        static_cast<int>(h),
+        /*comp=*/3,
+        rgb,
+        quality);
+    if (rc == 0) {
+        out->clear();
+        return false;
+    }
+    return true;
+}
+
 } // namespace obn::image

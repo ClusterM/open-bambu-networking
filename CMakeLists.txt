@@ -274,12 +274,16 @@ set_target_properties(bambu_networking PROPERTIES
 # --------------------------------------------------------------------------
 
 # Picks the RTSPS backend used to demux H.264 + transcode to MJPEG:
-#   ffmpeg     - libavformat / libavcodec / libswscale (default, smaller
-#                runtime footprint, no GStreamer.framework dependency on
-#                macOS).
-#   gstreamer  - legacy rtspsrc -> jpegenc pipeline. Kept for one
-#                release as a fallback in case ffmpeg regresses on a
-#                user's setup; will be removed afterwards.
+#   ffmpeg     - in-process RTSP/RTSPS client (custom, stubs/rtsp_client.cpp)
+#                + libavcodec H.264 decode + libswscale + libavcodec MJPEG
+#                encode. NO libavformat dependency. libav* symbols are
+#                resolved via dlsym(RTLD_DEFAULT, ...) against whatever
+#                Studio's bundle has already loaded -- guaranteed ABI
+#                match against the AppImage's bundled libav minor.
+#                Default; smallest runtime footprint; works on macOS too.
+#   gstreamer  - legacy rtspsrc -> jpegenc pipeline. Bare-Linux only;
+#                aborts inside Studio's AppImage with a libjpeg ABI
+#                clash that we cannot fix from outside Studio's bundle.
 #   none       - no RTSPS support; only the MJPG path (port 6000) and
 #                the file-browser CTRL bridge work. Useful for small
 #                builds that don't ship live view.
@@ -314,6 +318,7 @@ set(_obn_bambusource_sources
     stubs/BambuSource.cpp
     stubs/image_io.cpp
     stubs/source_log.cpp
+    stubs/tls_socket.cpp
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
@@ -327,11 +332,18 @@ set(_obn_bambusource_sources
 set_source_files_properties(stubs/image_io.cpp PROPERTIES
     COMPILE_FLAGS "-Wno-missing-field-initializers")
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    # ffmpeg_dyn.cpp dlopen+dlsym's libav* lazily so libBambuSource has
-    # no hard NEEDED dependency on a specific FFmpeg soname major. See
-    # the long comment in stubs/ffmpeg_dyn.hpp for why this matters.
+    # The FFmpeg backend is now a custom RTSP/RTSPS client (rtsp_client)
+    # plus an H.264 -> MJPEG transcode (h264_decoder) running on top of
+    # libavcodec / libavutil / libswscale resolved through ffmpeg_dyn
+    # (which dlsym's against whatever Studio's bundle has loaded -- see
+    # stubs/ffmpeg_dyn.hpp). libavformat is no longer involved; the
+    # ABI clash that motivated all the dlmopen / namespace work was a
+    # libavutil-vs-libavformat version mismatch we side-step by simply
+    # not depending on libavformat anymore.
     list(APPEND _obn_bambusource_sources
-        stubs/video_pipeline_ffmpeg.cpp
+        stubs/video_pipeline_libav.cpp
+        stubs/rtsp_client.cpp
+        stubs/h264_decoder.cpp
         stubs/ffmpeg_dyn.cpp)
 elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
     list(APPEND _obn_bambusource_sources stubs/video_pipeline_gstreamer.cpp)
@@ -389,20 +401,24 @@ if(APPLE)
 endif()
 
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    # FFmpeg headers are pulled in for types/enums/macros only -- the
-    # actual libav* libraries are loaded at runtime via dlopen by
-    # stubs/ffmpeg_dyn.cpp. Linking PkgConfig::AVFORMAT etc. directly
-    # would re-introduce the very NEEDED-soname-pinning we are trying
-    # to avoid (libavformat.so.61 on the build host vs. .60 inside
-    # Studio's bundle => dlopen of libBambuSource itself fails =>
-    # Studio decides our plugin is broken and downloads the official
-    # one). Use the include dirs only; -ldl suffices for the runtime.
-    pkg_check_modules(AVFORMAT  REQUIRED libavformat)
+    # libavcodec / libavutil / libswscale headers only -- enough for
+    # the AVFrame / AVCodecContext / AVPixelFormat types and for the
+    # AV_LOG_*, AV_PIX_FMT_*, FF_QP2LAMBDA, AV_INPUT_BUFFER_PADDING_SIZE
+    # macros our decoder + scaler + MJPEG encoder depend on. The actual
+    # libraries are NEVER linked: at runtime ffmpeg_dyn.cpp resolves
+    # the symbols via dlsym(RTLD_DEFAULT, ...), picking up whatever
+    # libav copies Bambu Studio's bundle has already DT_NEEDED'd into
+    # the process. That guarantees ABI compatibility with whatever
+    # libavutil/libavcodec minor pair Studio shipped, even when the
+    # build host's system libav is a different release. libavformat is
+    # not used anywhere in the plugin -- the RTSP / RTSPS protocol is
+    # implemented in stubs/rtsp_client.cpp -- so we deliberately do
+    # NOT pkg_check_modules it here; build hosts can be missing
+    # libavformat-dev entirely.
     pkg_check_modules(AVCODEC   REQUIRED libavcodec)
     pkg_check_modules(AVUTIL    REQUIRED libavutil)
     pkg_check_modules(SWSCALE   REQUIRED libswscale)
     target_include_directories(BambuSource PRIVATE
-        ${AVFORMAT_INCLUDE_DIRS}
         ${AVCODEC_INCLUDE_DIRS}
         ${AVUTIL_INCLUDE_DIRS}
         ${SWSCALE_INCLUDE_DIRS}
