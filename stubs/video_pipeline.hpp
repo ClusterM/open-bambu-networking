@@ -24,9 +24,12 @@
 //
 //   * GstreamerPipeline  -- legacy, uses rtspsrc + decodebin + jpegenc.
 //                            Selected when -DOBN_VIDEO_BACKEND=gstreamer.
-//   * FfmpegPipeline     -- new default, uses libavformat / libavcodec
-//                            with an MJPEG encoder. Selected when
-//                            -DOBN_VIDEO_BACKEND=ffmpeg.
+//                            Bare-Linux only (libjpeg ABI clash inside
+//                            Studio's AppImage); kept for completeness.
+//   * LibavPipeline      -- default. Custom RTSP / RTSPS client (no
+//                            libavformat) + libavcodec H.264 decode +
+//                            libswscale + stb_image_write JPEG encode.
+//                            Selected when -DOBN_VIDEO_BACKEND=ffmpeg.
 //
 // `make_video_pipeline` is provided by exactly one of those translation
 // units depending on what was compiled in. A "none" build selects no
@@ -119,7 +122,7 @@ public:
 
 // Backend factory. Implemented by exactly one of:
 //   stubs/video_pipeline_gstreamer.cpp
-//   stubs/video_pipeline_ffmpeg.cpp
+//   stubs/video_pipeline_libav.cpp
 //   stubs/video_pipeline_none.cpp   (returns nullptr, RTSPS unsupported)
 //
 // `logger`/`log_ctx` are forwarded to the per-tunnel Logger that

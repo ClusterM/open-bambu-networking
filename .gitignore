@@ -1,7 +1,10 @@
 build/
 build-*/
+build.stale-*/
 config.mk
+config.ps1
 .cache/
+.vcpkg/
 compile_commands.json
 *.o
 *.so
@@ -12,3 +15,16 @@ compile_commands.json
 .idea/
 patches/
 3rd_party/
+
+# Diagnostic captures we keep producing while debugging Studio:
+# session logs from BambuStudio.conf log dir, exported symbol tables
+# from the stock plugin, ad-hoc cmake/build transcripts, etc. They
+# are useful locally but nothing in the repo references them.
+*.log
+*.log.0
+*.log.0.log
+obn-session.log*
+obn_session_log_*.txt
+exports_*.txt
+cmake_bambu_out.txt
+debug_*.log.*

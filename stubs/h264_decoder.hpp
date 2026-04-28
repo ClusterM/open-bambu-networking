@@ -1,6 +1,12 @@
-// H.264 decoder + MJPEG encoder built on libavcodec / libavutil /
-// libswscale resolved through ffmpeg_dyn (which in turn dlsym's
-// against whatever Studio's bundle already loaded; see ffmpeg_dyn.hpp).
+// H.264 decoder + JPEG encoder backing libBambuSource's RTSPS pipeline.
+//
+// Decode side runs on libavcodec / libavutil / libswscale resolved
+// through ffmpeg_dyn (dlsym(RTLD_DEFAULT, ...) against whatever Studio's
+// bundle already loaded; see ffmpeg_dyn.hpp). Encode side is *not*
+// libavcodec: Bambu Studio's bundled libavcodec is decoder-only, so
+// avcodec_find_encoder(MJPEG) returns NULL in-process. We encode each
+// frame with stb_image_write (header-only, no NEEDED entries), routed
+// through obn::image::encode_jpeg.
 //
 // The decoder feeds on a stream of raw H.264 NAL units (the kind
 // rtsp_client.cpp emits): no length prefix, no Annex-B start code.
@@ -15,18 +21,18 @@
 // internal state and then has everything it needs by the time the
 // first IDR slice arrives. In-band SPS/PPS work the same way.
 //
-// MJPEG output: we re-encode every successfully decoded frame to a
-// baseline MJPEG using libavcodec's mjpeg encoder, after a
-// libswscale pass that downscales / converts the source YUV to
-// YUVJ420P at the requested target dimensions. The C-ABI consumer
-// then ships those JPEG bytes straight to Studio's gstbambusrc
-// without further decoding -- exactly the contract the legacy
-// GStreamer pipeline used to honour.
+// JPEG output: every successfully decoded frame is libswscale-resampled
+// straight into a tightly-packed RGB24 buffer at the requested target
+// dimensions, then handed to stb_image_write's baseline JPEG encoder
+// at q=80 (override via OBN_JPEG_QUALITY). The C-ABI consumer ships
+// those JPEG bytes straight to Studio's gstbambusrc without further
+// decoding -- exactly the contract the legacy GStreamer pipeline used
+// to honour with libavcodec's mjpeg encoder.
 //
 // Threading: a single decode() call may loop receive_frame internally
 // until the decoder is empty, but only the *latest* JPEG is returned
 // (the upstream pipeline's mailbox drops stale frames anyway). All
-// state (decoder context, encoder context, scaler) is owned by the
+// state (decoder context, scaler, scratch RGB buffer) is owned by the
 // instance and not safe to share across threads.
 #pragma once
 
@@ -47,8 +53,8 @@ public:
     H264Decoder(const H264Decoder&)            = delete;
     H264Decoder& operator=(const H264Decoder&) = delete;
 
-    // Initialise the decoder + scaler + encoder. `track` carries the
-    // SDP-derived SPS / PPS / payload type; `target_w` / `target_h`
+    // Initialise the decoder + scaler + JPEG encoder. `track` carries
+    // the SDP-derived SPS / PPS / payload type; `target_w` / `target_h`
     // are the dimensions of the JPEG we hand back to Studio (the
     // source frame is resampled into them with libswscale).
     //
@@ -59,10 +65,11 @@ public:
              int target_fps);
 
     // Feed one raw NAL unit (no start code prefix). Internally:
-    //   * prepends Annex-B and ships to libavcodec_send_packet,
+    //   * prepends Annex-B and ships to avcodec_send_packet,
     //   * loops avcodec_receive_frame draining what is available,
     //   * for the *last* frame produced (if any), runs sws_scale
-    //     into a YUVJ420P scratch frame and then encodes it as MJPEG,
+    //     into a tightly-packed RGB24 buffer and then encodes it as
+    //     baseline JPEG via obn::image::encode_jpeg,
     //   * returns the encoded bytes via *jpeg (cleared first).
     //
     // If no frame popped out (i.e. SPS / PPS / SEI / non-IDR before

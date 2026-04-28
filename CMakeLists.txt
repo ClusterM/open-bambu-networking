@@ -275,11 +275,14 @@ set_target_properties(bambu_networking PROPERTIES
 
 # Picks the RTSPS backend used to demux H.264 + transcode to MJPEG:
 #   ffmpeg     - in-process RTSP/RTSPS client (custom, stubs/rtsp_client.cpp)
-#                + libavcodec H.264 decode + libswscale + libavcodec MJPEG
-#                encode. NO libavformat dependency. libav* symbols are
-#                resolved via dlsym(RTLD_DEFAULT, ...) against whatever
-#                Studio's bundle has already loaded -- guaranteed ABI
-#                match against the AppImage's bundled libav minor.
+#                + libavcodec H.264 decode + libswscale + stb_image_write
+#                baseline JPEG encode. NO libavformat dependency, and no
+#                libavcodec encoder dependency (Studio's bundled
+#                libavcodec ships decoder-only, so avcodec_find_encoder
+#                returns NULL in-process). libav* symbols are resolved
+#                via dlsym(RTLD_DEFAULT, ...) against whatever Studio's
+#                bundle has already loaded -- guaranteed ABI match
+#                against the AppImage's bundled libav minor.
 #                Default; smallest runtime footprint; works on macOS too.
 #   gstreamer  - legacy rtspsrc -> jpegenc pipeline. Bare-Linux only;
 #                aborts inside Studio's AppImage with a libjpeg ABI
@@ -333,13 +336,20 @@ set_source_files_properties(stubs/image_io.cpp PROPERTIES
     COMPILE_FLAGS "-Wno-missing-field-initializers")
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
     # The FFmpeg backend is now a custom RTSP/RTSPS client (rtsp_client)
-    # plus an H.264 -> MJPEG transcode (h264_decoder) running on top of
-    # libavcodec / libavutil / libswscale resolved through ffmpeg_dyn
-    # (which dlsym's against whatever Studio's bundle has loaded -- see
-    # stubs/ffmpeg_dyn.hpp). libavformat is no longer involved; the
-    # ABI clash that motivated all the dlmopen / namespace work was a
-    # libavutil-vs-libavformat version mismatch we side-step by simply
-    # not depending on libavformat anymore.
+    # plus H.264 decode + libswscale + baseline JPEG encode (h264_decoder
+    # routes the decoded RGB through obn::image::encode_jpeg / stb).
+    # libavcodec / libavutil / libswscale are resolved through ffmpeg_dyn
+    # (dlsym against whatever Studio's bundle has loaded -- see
+    # stubs/ffmpeg_dyn.hpp). Two FFmpeg things we deliberately do *not*
+    # depend on:
+    #   * libavformat -- replaced by our own RTSP client. The ABI clash
+    #     that motivated all the dlmopen / namespace work was a
+    #     libavutil-vs-libavformat version mismatch we side-step by not
+    #     depending on libavformat anymore.
+    #   * the libavcodec MJPEG encoder -- Studio's libavcodec ships
+    #     decoder-only (avcodec_find_encoder returns NULL), so we use
+    #     stb_image_write instead. Its only dependency is image_io.cpp,
+    #     which is already in the source list above.
     list(APPEND _obn_bambusource_sources
         stubs/video_pipeline_libav.cpp
         stubs/rtsp_client.cpp

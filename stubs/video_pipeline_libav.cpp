@@ -1,12 +1,14 @@
-// IVideoPipeline backed by a custom RTSP client + libavcodec.
+// IVideoPipeline backed by a custom RTSP client + libavcodec H.264
+// decoder + stb_image_write JPEG encoder.
 //
 // This replaces the previous libavformat-based pipeline. The protocol
 // (RTSP / RTSPS / TLS / RTP-over-TCP / H.264 NAL reassembly) is handled
-// by stubs/rtsp_client.cpp; the H.264 decode + libswscale + MJPEG
-// re-encode by stubs/h264_decoder.cpp; and we are the glue that drives
-// them on a worker thread and exposes the IVideoPipeline contract
-// upstream consumers (BambuSource.cpp on Linux/Windows, BambuPlayer.mm
-// on macOS) already speak.
+// by stubs/rtsp_client.cpp; the H.264 decode + libswscale + JPEG encode
+// by stubs/h264_decoder.cpp (decode through libavcodec, encode through
+// stb_image_write since Studio's bundled libavcodec ships decoder-only);
+// and we are the glue that drives them on a worker thread and exposes
+// the IVideoPipeline contract upstream consumers (BambuSource.cpp on
+// Linux/Windows, BambuPlayer.mm on macOS) already speak.
 //
 // The reason we no longer use libavformat is the libavutil ABI clash
 // hidden inside Bambu Studio's AppImage: the bundle ships an older
