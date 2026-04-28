@@ -670,6 +670,26 @@ The C-ABI consumer (gstbambusrc on Linux/Windows, `BambuPlayer.mm` on macOS)
 sees the same JPEG bytes either way; the backend is only visible in `obn-bambusource.log`
 ("ff: ..." vs "gst: ...") and in the set of shared libraries the dylib pulls in.
 
+> **FFmpeg is loaded lazily.** With `OBN_VIDEO_BACKEND=ffmpeg` (the default)
+> `libBambuSource.so` does **not** carry a hard `NEEDED` dependency on
+> `libavformat.so.NN` / `libavcodec.so.NN` / `libavutil.so.NN` /
+> `libswscale.so.NN`. Instead, the first RTSPS pipeline that gets started
+> `dlopen`s the four libraries by name, walking a list of soname versions
+> the FFmpeg project has shipped over the last decade (`*.so.61` → `.60`
+> → `.59` → `.58` → `.57` → unversioned, plus the matching `.dylib`
+> filenames on macOS). This single binary therefore works on FFmpeg 4.x
+> through 7.x and -- crucially -- inside Bambu Studio's own bundle, where
+> `<install>/bin` may ship a different libav major than the system FFmpeg
+> the plugin was linked against. If none of the candidates resolves, the
+> plugin still loads cleanly (the MJPG path on port 6000 and the FTPS
+> file browser keep working); only the RTSPS camera widget reports
+> "FFmpeg backend unavailable: …" with the exact `dlopen`/`dlsym` error
+> in `obn-bambusource.log`.
+
+The build still uses `pkg-config` to find the FFmpeg headers (we need
+the type definitions), so a `libav*-dev` package is required at compile
+time even though no `.so` is referenced from `DT_NEEDED`.
+
 ### Configure, build, install
 
 From the repository root, the usual three commands:
@@ -721,6 +741,7 @@ runs the smoke tests via `ctest`.
 | `--with-version=VER`      | auto-detected from `<prefix>/BambuStudio.conf` | The version string `bambu_network_get_version()` reports. Studio compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.`* and a main-branch source build usually wants `02.05.03.*`. When `--with-version` is not given, `./configure` reads `app.version` from the Studio config in the install prefix and bumps the last component to `99` so our plugin always looks "newer" than the agent Studio ships with itself. If neither the flag nor the config file is available, `./configure` refuses to proceed rather than hard-code a stale default that would silently fail Studio's compatibility gate at runtime. Maps to `-DOBN_VERSION=…`. |
 | `--disable-workarounds`   | enabled                                        | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With this passed the plugin is a strict drop-in — same wire protocols, nothing else. Studio transparently loses every workaround-backed feature (the LAN file browser stays empty, Send greys out on P2S, and so on) but nothing half-done runs at runtime. Maps to `-DOBN_ENABLE_WORKAROUNDS=OFF`.                                                                                                                                                  |
 | `--disable-ftps-fastpath` | enabled                                        | Stub out the `ft_*` C ABI; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `--disable-workarounds`. Maps to `-DOBN_FT_FTPS_FASTPATH=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `--video-backend=BACKEND` | `ffmpeg`                                       | Picks the RTSPS camera transcode backend baked into `libBambuSource.so`: `ffmpeg` (libav* — default), `gstreamer` (legacy fallback), or `none` (no RTSPS support; MJPG-on-port-6000 still works). See [Video backend](#video-backend) for the system packages each option needs. Maps to `-DOBN_VIDEO_BACKEND=…`.                                                                                                                                                                                                                                                                                                                                                                                            |
 | `--enable-tests`          | disabled                                       | Build `probe_plugin`, `ftps_parse_test`, and `*_live_test` smoke tests. Default is off for regular user builds; CI enables it explicitly. Maps to `-DOBN_BUILD_TESTS=ON`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `--no-conf-patch`         | patch enabled                                  | Do not edit `BambuStudio.conf` during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_STUDIO_CONF=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `--build-dir=DIR`         | `build`                                        | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
@@ -760,17 +781,22 @@ common Flathub id `com.bambulab.BambuStudio`, configure and install like this
 make && make install
 ```
 
-**FFmpeg / camera.** `libBambuSource.so` links FFmpeg (`libavformat`,
+**FFmpeg / camera.** `libBambuSource.so` calls FFmpeg (`libavformat`,
 `libavcodec`, `libavutil`, `libswscale`) for the LAN camera path on its
 default `OBN_VIDEO_BACKEND=ffmpeg` setting (see [Video backend](#video-backend)).
-A plugin `.so` built on the host against host FFmpeg libraries can mismatch
-the FFmpeg the Flatpak runtime ships inside its sandbox; **expect liveview /
-camera features to break or be absent** when using this plugin with Flatpak
-Studio, even if discovery, MQTT, and printing work. The legacy
-`OBN_VIDEO_BACKEND=gstreamer` path has the same problem in reverse — Flatpak
-Studio carries its own GStreamer inside the sandbox and a host-built plugin
-will not reliably resolve against it. The `OBN_VIDEO_BACKEND=none` build
-sidesteps the issue entirely at the cost of losing X1/P1S/P2S live view.
+The plugin `dlopen`s these libraries lazily by walking a list of soname
+candidates (`*.so.61` → `.60` → `.59` → `.58` → `.57` → unversioned), so
+host-versus-sandbox FFmpeg version mismatches no longer crash the dlopen
+of `libBambuSource.so` itself. The libraries still have to be **reachable
+inside Studio's environment** for the camera to work, though: Flatpak's
+runtime libraries live under the sandbox's library search path and may
+not match any of the candidates above; in that case RTSPS will fail to
+start ("FFmpeg backend unavailable: …" in `obn-bambusource.log`) but the
+rest of the plugin -- discovery, MQTT, printing, MJPG-on-port-6000 from
+A1/P1, file browser -- keeps working. The legacy
+`OBN_VIDEO_BACKEND=gstreamer` path still links GStreamer the old way and
+remains sensitive to host vs. sandbox mismatch. `OBN_VIDEO_BACKEND=none`
+opts out of RTSPS entirely.
 
 **Recommendation.** For the fewest surprises, run a **native** Studio package
 from your distribution or an **official AppImage**, or **build Studio from
@@ -889,7 +915,12 @@ unhelpful (e.g. `GST_DEBUG`).
 The mirror file rolls every line through `[level]` plus a timestamp. FFmpeg
 backend lines are tagged `ff:`, GStreamer backend lines are tagged `gst:`,
 and any libav / GStreamer internal output appears under `[av WARN]` /
-`[gst WARNING]`.
+`[gst WARNING]`. The dynamic libav loader emits one line at startup with
+the soname it picked (`ffmpeg_dyn: avformat=libavformat.so.61
+avcodec=libavcodec.so.61 avutil=libavutil.so.59 swscale=libswscale.so.8`);
+when it fails the same line carries a `dlopen`/`dlsym` error string that
+narrows the cause down to "library missing on this host" vs "version
+tag mismatch with Bambu Studio's bundled libav".
 
 ## License
 

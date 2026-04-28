@@ -317,7 +317,12 @@ set(_obn_bambusource_sources
     src/zip_reader.cpp
 )
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    list(APPEND _obn_bambusource_sources stubs/video_pipeline_ffmpeg.cpp)
+    # ffmpeg_dyn.cpp dlopen+dlsym's libav* lazily so libBambuSource has
+    # no hard NEEDED dependency on a specific FFmpeg soname major. See
+    # the long comment in stubs/ffmpeg_dyn.hpp for why this matters.
+    list(APPEND _obn_bambusource_sources
+        stubs/video_pipeline_ffmpeg.cpp
+        stubs/ffmpeg_dyn.cpp)
 elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
     list(APPEND _obn_bambusource_sources stubs/video_pipeline_gstreamer.cpp)
 else()
@@ -376,16 +381,25 @@ if(APPLE)
 endif()
 
 if(OBN_VIDEO_BACKEND STREQUAL "ffmpeg")
-    pkg_check_modules(AVFORMAT  REQUIRED IMPORTED_TARGET libavformat)
-    pkg_check_modules(AVCODEC   REQUIRED IMPORTED_TARGET libavcodec)
-    pkg_check_modules(AVUTIL    REQUIRED IMPORTED_TARGET libavutil)
-    pkg_check_modules(SWSCALE   REQUIRED IMPORTED_TARGET libswscale)
-    target_link_libraries(BambuSource PRIVATE
-        PkgConfig::AVFORMAT
-        PkgConfig::AVCODEC
-        PkgConfig::AVUTIL
-        PkgConfig::SWSCALE
+    # FFmpeg headers are pulled in for types/enums/macros only -- the
+    # actual libav* libraries are loaded at runtime via dlopen by
+    # stubs/ffmpeg_dyn.cpp. Linking PkgConfig::AVFORMAT etc. directly
+    # would re-introduce the very NEEDED-soname-pinning we are trying
+    # to avoid (libavformat.so.61 on the build host vs. .60 inside
+    # Studio's bundle => dlopen of libBambuSource itself fails =>
+    # Studio decides our plugin is broken and downloads the official
+    # one). Use the include dirs only; -ldl suffices for the runtime.
+    pkg_check_modules(AVFORMAT  REQUIRED libavformat)
+    pkg_check_modules(AVCODEC   REQUIRED libavcodec)
+    pkg_check_modules(AVUTIL    REQUIRED libavutil)
+    pkg_check_modules(SWSCALE   REQUIRED libswscale)
+    target_include_directories(BambuSource PRIVATE
+        ${AVFORMAT_INCLUDE_DIRS}
+        ${AVCODEC_INCLUDE_DIRS}
+        ${AVUTIL_INCLUDE_DIRS}
+        ${SWSCALE_INCLUDE_DIRS}
     )
+    target_link_libraries(BambuSource PRIVATE ${CMAKE_DL_LIBS})
 elseif(OBN_VIDEO_BACKEND STREQUAL "gstreamer")
     pkg_check_modules(GST     REQUIRED IMPORTED_TARGET gstreamer-1.0)
     pkg_check_modules(GST_APP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)

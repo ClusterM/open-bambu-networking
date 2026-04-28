@@ -18,16 +18,14 @@
 // honours so any in-flight av_read_frame returns immediately, then
 // joins the worker and tears down the AV* contexts. It is cheap to
 // destroy a pipeline that never produced a frame.
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/dict.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/log.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
-}
+//
+// All libav* entry points are routed through ffmpeg_dyn so the four
+// shared objects are dlopen'd lazily on the first start() rather than
+// being a hard NEEDED dependency. This keeps libBambuSource loadable
+// on hosts whose FFmpeg sonames don't match the build host's (most
+// notably inside Bambu Studio's own bundle, where <install>/bin
+// often ships a different libavformat major than the system FFmpeg).
+// See ffmpeg_dyn.hpp for the full motivation.
 
 #include <atomic>
 #include <chrono>
@@ -40,6 +38,7 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+#include "ffmpeg_dyn.hpp"
 #include "video_pipeline.hpp"
 
 namespace {
@@ -50,6 +49,7 @@ using obn::source::Logger;
 using obn::source::LL_DEBUG;
 using obn::source::LL_TRACE;
 using obn::source::set_last_error;
+using obn::ffmpeg_dyn::AvApi;
 
 // Demote libav's own log spam to mirror_log_fp at WARNING (== AV_LOG_WARNING)
 // so the user's stderr stays clean. Real failures still come through
@@ -75,14 +75,14 @@ void av_log_to_mirror(void* /*avcl*/, int level,
     std::fprintf(fp, "%s [av %s] %s\n", ts, tag, buf);
 }
 
-void av_init_once()
+void av_init_once(const AvApi* av)
 {
     static std::once_flag once;
-    std::call_once(once, []() {
+    std::call_once(once, [av]() {
         // libav's auto-init covers both the global state and the
         // network protocols (avformat_network_init is a counter, no
         // teardown required).
-        avformat_network_init();
+        av->avformat_network_init();
         // Crank back libav's own stderr noise unless OBN_AV_LOG_LEVEL
         // raises it. AV_LOG_WARNING is the same threshold the gst
         // backend uses.
@@ -91,8 +91,8 @@ void av_init_once()
             int n = std::atoi(env);
             if (n > 0) lvl = n;
         }
-        av_log_set_level(lvl);
-        av_log_set_callback(av_log_to_mirror);
+        av->av_log_set_level(lvl);
+        av->av_log_set_callback(av_log_to_mirror);
     });
 }
 
@@ -134,7 +134,16 @@ public:
 
     int start(const obn::video::StartConfig& cfg) override
     {
-        av_init_once();
+        if (!obn::ffmpeg_dyn::ensure_loaded()) {
+            std::string err = std::string("FFmpeg backend unavailable: ") +
+                              obn::ffmpeg_dyn::last_load_error();
+            log_fmt(logger_, log_ctx_, "ff: %s", err.c_str());
+            set_last_error(err.c_str());
+            return -1;
+        }
+        av_ = obn::ffmpeg_dyn::api();
+
+        av_init_once(av_);
 
         if (worker_started_.exchange(true)) {
             // Defensive: a second start() on the same object is a
@@ -154,7 +163,7 @@ public:
         target_h_   = cfg.target_height;
         target_fps_ = cfg.target_fps > 0 ? cfg.target_fps : 30;
 
-        fmt_ctx_ = avformat_alloc_context();
+        fmt_ctx_ = av_->avformat_alloc_context();
         if (!fmt_ctx_) {
             set_last_error("avformat_alloc_context failed");
             return -1;
@@ -172,33 +181,33 @@ public:
         // is filtered) and the default UDP-then-TCP fallback wastes
         // 5 s per session. Same property the gst backend sets on
         // rtspsrc (protocols=4 == TCP).
-        av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+        av_->av_dict_set(&opts, "rtsp_transport", "tcp", 0);
         // Self-signed printer cert: don't validate.
-        av_dict_set(&opts, "tls_verify", "0", 0);
+        av_->av_dict_set(&opts, "tls_verify", "0", 0);
         // 5 s connect timeout, 8 s socket timeout (microseconds).
         // Keeps a dead printer from hanging Bambu_Open forever.
-        av_dict_set(&opts, "stimeout",  "5000000", 0);
-        av_dict_set(&opts, "rw_timeout", "8000000", 0);
+        av_->av_dict_set(&opts, "stimeout",  "5000000", 0);
+        av_->av_dict_set(&opts, "rw_timeout", "8000000", 0);
         // We don't care about RTCP receiver-report timing.
-        av_dict_set(&opts, "max_delay", "120000", 0); // 120 ms in us
-        av_dict_set(&opts, "fflags", "nobuffer+discardcorrupt", 0);
-        av_dict_set(&opts, "flags",  "low_delay", 0);
+        av_->av_dict_set(&opts, "max_delay", "120000", 0); // 120 ms in us
+        av_->av_dict_set(&opts, "fflags", "nobuffer+discardcorrupt", 0);
+        av_->av_dict_set(&opts, "flags",  "low_delay", 0);
 
-        int rc = avformat_open_input(&fmt_ctx_, uri.c_str(), nullptr, &opts);
-        av_dict_free(&opts);
+        int rc = av_->avformat_open_input(&fmt_ctx_, uri.c_str(), nullptr, &opts);
+        av_->av_dict_free(&opts);
         if (rc < 0) {
             char errbuf[128]{};
-            av_strerror(rc, errbuf, sizeof(errbuf));
+            av_->av_strerror(rc, errbuf, sizeof(errbuf));
             log_fmt(logger_, log_ctx_,
                     "ff: avformat_open_input failed: %s (%d)", errbuf, rc);
             set_last_error(errbuf);
             return -1;
         }
 
-        rc = avformat_find_stream_info(fmt_ctx_, nullptr);
+        rc = av_->avformat_find_stream_info(fmt_ctx_, nullptr);
         if (rc < 0) {
             char errbuf[128]{};
-            av_strerror(rc, errbuf, sizeof(errbuf));
+            av_->av_strerror(rc, errbuf, sizeof(errbuf));
             log_fmt(logger_, log_ctx_,
                     "ff: avformat_find_stream_info failed: %s (%d)",
                     errbuf, rc);
@@ -206,8 +215,8 @@ public:
             return -1;
         }
 
-        video_stream_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO,
-                                            -1, -1, nullptr, 0);
+        video_stream_ = av_->av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO,
+                                                 -1, -1, nullptr, 0);
         if (video_stream_ < 0) {
             log_fmt(logger_, log_ctx_, "ff: no video stream in SDP");
             set_last_error("no video stream");
@@ -215,7 +224,7 @@ public:
         }
 
         AVStream* st = fmt_ctx_->streams[video_stream_];
-        const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
+        const AVCodec* dec = av_->avcodec_find_decoder(st->codecpar->codec_id);
         if (!dec) {
             log_fmt(logger_, log_ctx_,
                     "ff: no decoder for codec_id=%d", st->codecpar->codec_id);
@@ -226,12 +235,12 @@ public:
                 "ff: using decoder '%s' (codec_id=%d)",
                 dec->name, st->codecpar->codec_id);
 
-        dec_ctx_ = avcodec_alloc_context3(dec);
+        dec_ctx_ = av_->avcodec_alloc_context3(dec);
         if (!dec_ctx_) {
             set_last_error("avcodec_alloc_context3 (dec) failed");
             return -1;
         }
-        if (avcodec_parameters_to_context(dec_ctx_, st->codecpar) < 0) {
+        if (av_->avcodec_parameters_to_context(dec_ctx_, st->codecpar) < 0) {
             set_last_error("avcodec_parameters_to_context failed");
             return -1;
         }
@@ -240,7 +249,7 @@ public:
         // multi-threaded reorder buffers.
         dec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
         dec_ctx_->thread_count = 1;
-        if (avcodec_open2(dec_ctx_, dec, nullptr) < 0) {
+        if (av_->avcodec_open2(dec_ctx_, dec, nullptr) < 0) {
             set_last_error("avcodec_open2 (dec) failed");
             return -1;
         }
@@ -248,13 +257,13 @@ public:
         // MJPEG encoder. Quality is set via the qscale knob, with the
         // same trade-off the gst backend made (q=80 there ~= qscale=4
         // here on the standard MJPEG library quantiser table).
-        const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+        const AVCodec* enc = av_->avcodec_find_encoder(AV_CODEC_ID_MJPEG);
         if (!enc) {
             log_fmt(logger_, log_ctx_, "ff: no MJPEG encoder available");
             set_last_error("no MJPEG encoder");
             return -1;
         }
-        enc_ctx_ = avcodec_alloc_context3(enc);
+        enc_ctx_ = av_->avcodec_alloc_context3(enc);
         if (!enc_ctx_) {
             set_last_error("avcodec_alloc_context3 (enc) failed");
             return -1;
@@ -272,7 +281,7 @@ public:
         enc_ctx_->framerate  = AVRational{target_fps_, 1};
         enc_ctx_->flags     |= AV_CODEC_FLAG_QSCALE;
         enc_ctx_->global_quality = FF_QP2LAMBDA * 4;
-        if (avcodec_open2(enc_ctx_, enc, nullptr) < 0) {
+        if (av_->avcodec_open2(enc_ctx_, enc, nullptr) < 0) {
             set_last_error("avcodec_open2 (enc) failed");
             return -1;
         }
@@ -327,10 +336,13 @@ public:
     {
         stop_flag_.store(true, std::memory_order_release);
         if (worker_.joinable()) worker_.join();
-        if (sws_ctx_)   { sws_freeContext(sws_ctx_); sws_ctx_   = nullptr; }
-        if (enc_ctx_)   avcodec_free_context(&enc_ctx_);
-        if (dec_ctx_)   avcodec_free_context(&dec_ctx_);
-        if (fmt_ctx_)   avformat_close_input(&fmt_ctx_);
+        // av_ is null if start() failed before ensure_loaded() succeeded;
+        // in that case nothing was allocated, so nothing to free.
+        if (!av_) return;
+        if (sws_ctx_)   { av_->sws_freeContext(sws_ctx_); sws_ctx_   = nullptr; }
+        if (enc_ctx_)   av_->avcodec_free_context(&enc_ctx_);
+        if (dec_ctx_)   av_->avcodec_free_context(&dec_ctx_);
+        if (fmt_ctx_)   av_->avformat_close_input(&fmt_ctx_);
     }
 
 private:
@@ -342,16 +354,20 @@ private:
 
     void worker_main()
     {
-        AVPacket* pkt = av_packet_alloc();
-        AVPacket* enc_pkt = av_packet_alloc();
-        AVFrame*  frame   = av_frame_alloc();
-        AVFrame*  scaled  = av_frame_alloc();
+        // av_ is set in start() before the worker thread is spawned, so
+        // dereferencing it unconditionally here is safe.
+        const AvApi* av = av_;
+
+        AVPacket* pkt = av->av_packet_alloc();
+        AVPacket* enc_pkt = av->av_packet_alloc();
+        AVFrame*  frame   = av->av_frame_alloc();
+        AVFrame*  scaled  = av->av_frame_alloc();
         if (!pkt || !enc_pkt || !frame || !scaled) {
             log_fmt(logger_, log_ctx_, "ff: av_alloc failed in worker");
-            if (pkt)     av_packet_free(&pkt);
-            if (enc_pkt) av_packet_free(&enc_pkt);
-            if (frame)   av_frame_free(&frame);
-            if (scaled)  av_frame_free(&scaled);
+            if (pkt)     av->av_packet_free(&pkt);
+            if (enc_pkt) av->av_packet_free(&enc_pkt);
+            if (frame)   av->av_frame_free(&frame);
+            if (scaled)  av->av_frame_free(&scaled);
             worker_done_.store(true, std::memory_order_release);
             return;
         }
@@ -360,12 +376,12 @@ private:
         scaled->format = AV_PIX_FMT_YUVJ420P;
         scaled->width  = target_w_;
         scaled->height = target_h_;
-        if (av_frame_get_buffer(scaled, 32) < 0) {
+        if (av->av_frame_get_buffer(scaled, 32) < 0) {
             log_fmt(logger_, log_ctx_, "ff: av_frame_get_buffer failed");
-            av_packet_free(&pkt);
-            av_packet_free(&enc_pkt);
-            av_frame_free(&frame);
-            av_frame_free(&scaled);
+            av->av_packet_free(&pkt);
+            av->av_packet_free(&enc_pkt);
+            av->av_frame_free(&frame);
+            av->av_frame_free(&scaled);
             worker_done_.store(true, std::memory_order_release);
             return;
         }
@@ -374,11 +390,11 @@ private:
         std::int64_t  enc_pts     = 0;
 
         while (!stop_flag_.load(std::memory_order_acquire)) {
-            int rc = av_read_frame(fmt_ctx_, pkt);
+            int rc = av->av_read_frame(fmt_ctx_, pkt);
             if (rc < 0) {
                 if (rc == AVERROR(EAGAIN)) {
                     // Spurious wake-up from interrupt_cb; keep going.
-                    av_packet_unref(pkt);
+                    av->av_packet_unref(pkt);
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
                 }
@@ -388,33 +404,33 @@ private:
                     break;
                 }
                 char errbuf[128]{};
-                av_strerror(rc, errbuf, sizeof(errbuf));
+                av->av_strerror(rc, errbuf, sizeof(errbuf));
                 log_fmt(logger_, log_ctx_,
                         "ff: av_read_frame: %s (%d)", errbuf, rc);
                 break;
             }
             if (pkt->stream_index != video_stream_) {
-                av_packet_unref(pkt);
+                av->av_packet_unref(pkt);
                 continue;
             }
 
             // Decode.
-            rc = avcodec_send_packet(dec_ctx_, pkt);
-            av_packet_unref(pkt);
+            rc = av->avcodec_send_packet(dec_ctx_, pkt);
+            av->av_packet_unref(pkt);
             if (rc < 0) {
                 char errbuf[128]{};
-                av_strerror(rc, errbuf, sizeof(errbuf));
+                av->av_strerror(rc, errbuf, sizeof(errbuf));
                 log_at(LL_DEBUG, logger_, log_ctx_,
                        "ff: avcodec_send_packet: %s", errbuf);
                 continue;
             }
 
             while (true) {
-                rc = avcodec_receive_frame(dec_ctx_, frame);
+                rc = av->avcodec_receive_frame(dec_ctx_, frame);
                 if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
                 if (rc < 0) {
                     char errbuf[128]{};
-                    av_strerror(rc, errbuf, sizeof(errbuf));
+                    av->av_strerror(rc, errbuf, sizeof(errbuf));
                     log_at(LL_DEBUG, logger_, log_ctx_,
                            "ff: avcodec_receive_frame: %s", errbuf);
                     break;
@@ -425,11 +441,11 @@ private:
                 // a live camera but cheap to handle).
                 if (!sws_ctx_ || src_w_ != frame->width ||
                     src_h_ != frame->height || src_fmt_ != frame->format) {
-                    if (sws_ctx_) sws_freeContext(sws_ctx_);
+                    if (sws_ctx_) av->sws_freeContext(sws_ctx_);
                     src_w_   = frame->width;
                     src_h_   = frame->height;
                     src_fmt_ = frame->format;
-                    sws_ctx_ = sws_getContext(
+                    sws_ctx_ = av->sws_getContext(
                         src_w_, src_h_, static_cast<AVPixelFormat>(src_fmt_),
                         target_w_, target_h_, AV_PIX_FMT_YUVJ420P,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
@@ -445,22 +461,22 @@ private:
                             target_w_, target_h_);
                 }
 
-                if (av_frame_make_writable(scaled) < 0) break;
-                sws_scale(sws_ctx_,
-                          frame->data, frame->linesize, 0, src_h_,
-                          scaled->data, scaled->linesize);
+                if (av->av_frame_make_writable(scaled) < 0) break;
+                av->sws_scale(sws_ctx_,
+                              frame->data, frame->linesize, 0, src_h_,
+                              scaled->data, scaled->linesize);
                 scaled->pts = enc_pts++;
 
                 // Encode to JPEG.
-                rc = avcodec_send_frame(enc_ctx_, scaled);
+                rc = av->avcodec_send_frame(enc_ctx_, scaled);
                 if (rc < 0) {
                     char errbuf[128]{};
-                    av_strerror(rc, errbuf, sizeof(errbuf));
+                    av->av_strerror(rc, errbuf, sizeof(errbuf));
                     log_at(LL_DEBUG, logger_, log_ctx_,
                            "ff: avcodec_send_frame: %s", errbuf);
                     continue;
                 }
-                while (avcodec_receive_packet(enc_ctx_, enc_pkt) == 0) {
+                while (av->avcodec_receive_packet(enc_ctx_, enc_pkt) == 0) {
                     auto now = std::chrono::steady_clock::now();
                     auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    now - t0_).count();
@@ -477,7 +493,7 @@ private:
                         mailbox_flags_ = 0;
                         ready_         = true;
                     }
-                    av_packet_unref(enc_pkt);
+                    av->av_packet_unref(enc_pkt);
 
                     if (++frame_count == 1 || (frame_count % 60) == 0) {
                         log_fmt(logger_, log_ctx_,
@@ -492,21 +508,25 @@ private:
         // Flush the encoder so any in-flight frame is delivered before
         // we tear down. Best-effort; the caller will also stop polling
         // shortly after stop().
-        avcodec_send_frame(enc_ctx_, nullptr);
-        while (avcodec_receive_packet(enc_ctx_, enc_pkt) == 0) {
-            av_packet_unref(enc_pkt);
+        av->avcodec_send_frame(enc_ctx_, nullptr);
+        while (av->avcodec_receive_packet(enc_ctx_, enc_pkt) == 0) {
+            av->av_packet_unref(enc_pkt);
         }
 
-        av_packet_free(&pkt);
-        av_packet_free(&enc_pkt);
-        av_frame_free(&frame);
-        av_frame_free(&scaled);
+        av->av_packet_free(&pkt);
+        av->av_packet_free(&enc_pkt);
+        av->av_frame_free(&frame);
+        av->av_frame_free(&scaled);
         worker_done_.store(true, std::memory_order_release);
         log_at(LL_DEBUG, logger_, log_ctx_, "ff: worker exited");
     }
 
     Logger      logger_;
     void*       log_ctx_;
+
+    // Resolved by ensure_loaded() inside start(); stays valid for the
+    // lifetime of the process. Null if start() failed before the load.
+    const AvApi* av_ = nullptr;
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVCodecContext*  dec_ctx_ = nullptr;
