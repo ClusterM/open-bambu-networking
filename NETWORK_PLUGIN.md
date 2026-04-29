@@ -906,6 +906,7 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | Printer firmware catalogue | stock: unknown cloud catalogue call; ours: synthesised from MQTT state | §6.7 | source only (stock) |
 | Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, `PUT /v1/iot-service/api/user/notification`, `GET /v1/iot-service/api/user/notification?action=upload&ticket=<t>`, `PATCH /v1/iot-service/api/user/project/<pid>`, `GET /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf`, `POST /v1/user-service/my/task` | §6.8 | MITM |
 | User presets sync | `<m> /v1/iot-service/api/slicer/setting[/<id>]?public=false&version=<bundle>` | §6.9 | MITM + probe |
+| Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |
 | MakerWorld / Mall, OSS upload | various `design-service` / `iot-service` / OSS paths | §6.12 | not captured |
 | Camera / live view / HMS snapshot | not captured | §6.11 | — |
 | Analytics / telemetry | not captured | §6.13 | — |
@@ -1000,7 +1001,162 @@ Studio expects `ft_abi_version() == 1` (the default `abi_required` in `InitFTMod
 
 Semantically, this ABI describes a "tunnel + job" bus: open a connection to the printer (`ft_tunnel_create` from a `url`), start jobs on it, listen for results and messages.
 
-### 6.15. Error codes
+### 6.15. Filament Manager (cloud spool catalogue)
+
+Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through.
+
+| Symbol | Signature |
+|--------|-----------|
+| `bambu_network_get_filament_spools` | `int(void*, FilamentQueryParams, std::string* http_body)` |
+| `bambu_network_create_filament_spool` | `int(void*, std::string request_body, std::string* http_body)` |
+| `bambu_network_update_filament_spool` | `int(void*, std::string spool_id, std::string request_body, std::string* http_body)` |
+| `bambu_network_delete_filament_spools` | `int(void*, FilamentDeleteParams, std::string* http_body)` |
+| `bambu_network_get_filament_config` | `int(void*, std::string* http_body)` |
+
+`FilamentQueryParams` and `FilamentDeleteParams` are defined in `bambu_networking.hpp:260-275`:
+
+```cpp
+struct FilamentQueryParams {
+    std::string category;   // e.g. "PLA", "PETG"
+    std::string status;     // "0" = active, "1" = info_needed
+    std::string spool_id;   // single id (or comma-list) — sent as ?ids=
+    std::string rfid;       // single RFID (or comma-list) — sent as ?RFIDs=
+    int offset = 0;
+    int limit  = 20;
+};
+struct FilamentDeleteParams {
+    std::vector<std::string> ids;
+    std::vector<std::string> rfids;
+};
+```
+
+#### 6.15.1. Endpoints
+
+All paths are relative to the regional API host from §6.10.1, under the `design-user-service` subtree:
+
+| ABI call | HTTP | Path | Body | Evidence |
+|----------|------|------|------|----------|
+| `get_filament_config` | `GET` | `/v1/design-user-service/filament/config` | — | MITM |
+| `get_filament_spools` | `GET` | `/v1/design-user-service/my/filament/v2?offset=…&limit=…[&category=…&status=…&ids=…&RFIDs=…]` | — | MITM |
+| `create_filament_spool` | `POST` | `/v1/design-user-service/my/filament/v2` | `CreateFilamentV2Req` | MITM |
+| `update_filament_spool` | `PUT` | `/v1/design-user-service/my/filament/v2` (id is in body, not path) | `UpdateFilamentV2Req` | MITM |
+| `delete_filament_spools` | `DELETE` | `/v1/design-user-service/my/filament/v2/batch` | `BatchDeleteFilamentV2Req` | MITM |
+
+Auth and transport are the §6.10.1 defaults — `Authorization: Bearer <access_token>`, `Content-Type: application/json`. Stock `bambu_network_agent/02.06.01.50` overrides `User-Agent` for this surface (the only place it does so in the entire plugin), but the server accepts the generic `BBL-Slicer/v…` UA too — direct probes confirm there's no UA gating.
+
+#### 6.15.2. Request / response shapes
+
+Field names follow the cloud-side swagger (`design-user.api`, schemas `CreateFilamentV2Req` / `UpdateFilamentV2Req` / `ListFilamentV2Resp` / `BatchDeleteFilamentV2Req`); they are camelCase (`filamentVendor`, `netWeight`, `totalNetWeight`, `createdAt`, …) — distinct from Studio's local snake_case spool schema. Studio's `wgtFilaManagerCloudSync` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudSync.cpp`) translates between the two with `cloud_json_to_spool` / `spool_to_cloud_json`.
+
+**`GET /my/filament/v2` — list user's spools.** The plugin forwards the response body verbatim; Studio parses it. Empty list:
+
+```json
+{"hits":[]}
+```
+
+Populated list (one entry shown):
+
+```json
+{
+  "hits": [{
+    "id":             4986700,
+    "createType":     "ams" | "manual",
+    "filamentVendor": "Bambu Lab",
+    "filamentType":   "PETG",
+    "filamentName":   "PETG Basic",
+    "filamentId":     "GFG00",
+    "RFID":           "0000000000000000",
+    "color":          "#898989",
+    "colorType":      2,
+    "colors":         null,
+    "netWeight":      975,
+    "totalNetWeight": 1000,
+    "note":           "",
+    "createdAt":      1777418842,
+    "updatedAt":      1777418842,
+    "status":         0,
+    "isSupport":      false,
+    "trayIdName":     "0",
+    "category":       "PETG"
+  }]
+}
+```
+
+`id` is `int64`; `createdAt` / `updatedAt` are unix seconds; `status` is `0` (active) or `1` (info-needed). `colorType` is `0` (gradient), `1` (mixed) or `2` (solid). `trayIdName` is the AMS tray label when the spool was synced from a printer; empty for manual entries.
+
+**`POST /my/filament/v2` — create a spool.** Request body Studio assembles for an AMS-sourced spool (manual entries use `"createType":"manual"` and omit `RFID` / `trayIdName` / `rolls`):
+
+```json
+{
+  "RFID": "0000000000000000",
+  "color": "#898989",
+  "colorType": 2,
+  "createType": "ams",
+  "filamentId": "GFG00",
+  "filamentName": "PETG Basic",
+  "filamentType": "PETG",
+  "filamentVendor": "Bambu Lab",
+  "isSupport": false,
+  "netWeight": 975,
+  "rolls": 1,
+  "totalNetWeight": 1000,
+  "trayIdName": "0"
+}
+```
+
+Response on success is **just `{}`** (200 OK) — the server does not echo the new id. Studio re-issues `GET /my/filament/v2` afterwards to learn the assigned `id` and `createdAt`. *Plugins that synthesise a body must keep this contract intact: returning a non-`{}` payload won't break Studio (it still re-lists), but it will look anomalous in the log.*
+
+**`PUT /my/filament/v2` — partial update.** The body must always include `id` (int64) and `filamentName` (cloud requires it on every edit, even when nothing else changes — see Studio's `spool_to_cloud_update_json`); other fields are optional and only sent when modified. Request seen in MITM:
+
+```json
+{"filamentName": "PETG Basic", "id": 4986771, "netWeight": 500, "note": "test note"}
+```
+
+Response wraps the updated spool under `filamentV2`:
+
+```json
+{"filamentV2": {"id": 4986771, "createType": "ams", "...": "...", "netWeight": 500, "note": "test note"}}
+```
+
+A 404 response means "id not found"; Studio falls back to `POST` (create) on that path, see `wgtFilaManagerCloudSync::push_update_to_cloud`.
+
+**`DELETE /my/filament/v2/batch` — batch remove.** Body is `{"ids":[…]}` and/or `{"RFIDs":[…]}`; `ids` are JSON strings on the wire even though the schema is `int64` (the server accepts both forms). Response is `{}` (200 OK).
+
+```json
+{"ids": ["4986771"]}
+```
+
+**`GET /filament/config` — catalogue / dropdowns.** Returns the canonical filament list Studio uses to populate "Add spool" form pickers:
+
+```json
+{
+  "categories": ["PLA","PETG","TPU","ABS","ASA","PA","PC","PET","PPS","Support"],
+  "filamentSettings": [
+    {"filamentVendor":"Bambu Lab", "filamentType":"PLA",  "filamentName":"PLA Basic", "filamentId":"GFA00", "isSupport":false},
+    {"filamentVendor":"Bambu Lab", "filamentType":"PLA",  "filamentName":"PLA Matte", "filamentId":"GFA01", "isSupport":false},
+    "...": "... (~110 entries, ~11 KB)"
+  ]
+}
+```
+
+Studio caches the response for the lifetime of the WebView and keys vendor/type/name pickers off the same `filamentId` quadruples that show up under each spool.
+
+#### 6.15.3. When Studio actually calls these
+
+`wgtFilaManagerCloudDispatcher` serialises every cloud operation onto a single in-flight queue (`enqueue_pull` / `enqueue_push_create` / `enqueue_push_update` / `enqueue_push_delete`) so the server never sees concurrent writes from the same client. The triggers are:
+
+- **Login.** `GUI_App::on_user_login` calls `m_fila_manager_cloud_disp->enqueue_pull()` once an access token is available — this is the very first call most plugins ever see, before the user even opens the Filament Manager tab.
+- **Filament Manager panel mount.** `FilaManagerVM::OnPanelShown` re-issues a pull *and* fetches `get_filament_config`. Repeated tab focuses are debounced through the dispatcher.
+- **User actions.** "Add spool" → `create_filament_spool`; field edits → `update_filament_spool` (with the fallback-to-create on 404); single or multi-select delete → `delete_filament_spools`.
+- **AMS sync.** When the printer reports a new RFID-tagged spool, Studio synthesises a `createType:"ams"` POST with the matching `RFID` and `trayIdName`.
+
+Every successful pull rewrites the local store: cloud is the source of truth, and any local-only entries that didn't make it to the server (e.g. a failed previous push) are dropped on each refresh.
+
+#### 6.15.4. Implementation in `open-bambu-networking`
+
+The cloud half lives in `src/cloud_filament.cpp` (header `include/obn/cloud_filament.hpp`) and follows the same pattern as `cloud_presets`: thin wrappers over `obn::http::*` that pull the bearer token through `Agent::cloud_api_http_headers()`. The ABI shims in `src/abi_filament.cpp` only resolve the agent pointer and forward — no per-endpoint logic on this side. Five `BAMBU_NETWORK_ERR_{GET_FILAMENTS,CREATE_FILAMENT,UPDATE_FILAMENT,DELETE_FILAMENT,GET_FILAMENT_CONFIG}_FAILED` codes (-27..-31) are returned on transport / HTTP-error paths so Studio's UI can surface a meaningful toast instead of a silent retry-loop.
+
+### 6.16. Error codes
 
 The complete list of error values the plugin is expected to return through `int` lives in `src/slic3r/Utils/bambu_networking.hpp:13-94` (general, bind, `start_local_print_with_record`, `start_print`, `start_local_print`, `start_send_gcode_to_sdcard`, connection).
 
