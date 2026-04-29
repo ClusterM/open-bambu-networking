@@ -403,6 +403,7 @@ if(APPLE)
     # the bare-minimum frameworks for the rendering path.
     target_link_libraries(BambuSource PRIVATE
         "-framework Foundation"
+        "-framework QuartzCore"
         "-framework AppKit"
         "-framework AVFoundation"
         "-framework CoreMedia"
