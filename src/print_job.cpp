@@ -28,9 +28,12 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <system_error>
+
+#include <openssl/evp.h>
 
 namespace obn::print_job {
 
@@ -132,6 +135,54 @@ std::string now_seq_id()
 // accepts the array as-is. When there's no AMS involved we leave the
 // field as an empty array; that matches what the original plugin does
 // and the firmware treats it the same as "not provided".
+// Compute the uppercase-hex MD5 of a local file. Stock plugin parity:
+// the Bambu firmware cross-checks the uploaded 3mf against `print.md5`,
+// and the stock libbambu_networking.so always populates that field
+// itself (Studio leaves `params.ftp_file_md5` empty). We mirror that
+// so callers don't have to pre-hash. Returns empty on I/O failure —
+// the firmware will then refuse the job rather than printing garbage.
+std::string md5_of_file(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+
+    std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> ctx(
+        EVP_MD_CTX_new(),
+        [](EVP_MD_CTX* c){ if (c) EVP_MD_CTX_free(c); });
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1)
+        return {};
+
+    std::array<char, 64 * 1024> buf{};
+    while (f.read(buf.data(), buf.size()) || f.gcount() > 0) {
+        if (EVP_DigestUpdate(ctx.get(), buf.data(),
+                             static_cast<size_t>(f.gcount())) != 1)
+            return {};
+    }
+
+    unsigned char digest[EVP_MAX_MD_SIZE] = {0};
+    unsigned      len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest, &len) != 1) return {};
+
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string hex(len * 2, '\0');
+    for (unsigned i = 0; i < len; ++i) {
+        hex[2 * i    ] = kHex[(digest[i] >> 4) & 0xF];
+        hex[2 * i + 1] = kHex[ digest[i]       & 0xF];
+    }
+    return hex;
+}
+
+// Trim a single leading '/' from `s`. Stock plugin parity: when the
+// upload landed in the FTPS root the `print.file` and `print.url`
+// fields are bare names (`"foo.gcode.3mf"` and `"ftp://foo.gcode.3mf"`),
+// not `"/foo.gcode.3mf"` / `"ftp:///foo..."`. Internally we keep the
+// absolute path for FTP I/O — only the wire form drops the slash.
+std::string strip_leading_slash(const std::string& s)
+{
+    if (!s.empty() && s.front() == '/') return s.substr(1);
+    return s;
+}
+
 std::string format_ams_mapping(const std::string& mapping, bool use_ams)
 {
     std::string s = mapping;
@@ -323,7 +374,7 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     os << ",\"task_id\":"    << json_escape(opts.task_id);
     os << ",\"subtask_id\":" << json_escape(opts.subtask_id);
     os << ",\"subtask_name\":" << json_escape(subtask);
-    os << ",\"file\":" << json_escape(opts.file_path);
+    os << ",\"file\":" << json_escape(strip_leading_slash(opts.file_path));
     os << ",\"url\":"  << json_escape(opts.url);
     os << ",\"md5\":"  << json_escape(opts.md5);
     os << ",\"bed_type\":" << json_escape(bed_type);
@@ -342,11 +393,18 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     //   PrintParams::auto_bed_leveling         -> "auto_bed_leveling"
     //   PrintParams::auto_offset_cali          -> "nozzle_offset_cali"
     //   PrintParams::extruder_cali_manual_mode -> "extrude_cali_manual_mode"
-    if (!p.ams_mapping2.empty()) {
-        // Already a JSON array of {ams_id, slot_id} objects produced by
-        // SelectMachineDialog::get_ams_mapping_result; embed verbatim.
+    // Stock plugin parity: `ams_mapping2` is emitted **unconditionally**
+    // — even when AMS isn't in use the field appears as an empty array
+    // (`"ams_mapping2": []`). Confirmed via `tools/plugin_runner` against
+    // the stock libbambu_networking.so on N7 (see NETWORK_PLUGIN.md
+    // §6.8.2 "Per-PrintParams-field mapping" matrix). We feed it
+    // verbatim from `params.ams_mapping2` (a JSON-array string from
+    // SelectMachineDialog::get_ams_mapping_result), defaulting to `[]`
+    // when the caller didn't populate it.
+    if (p.ams_mapping2.empty())
+        os << ",\"ams_mapping2\":[]";
+    else
         os << ",\"ams_mapping2\":" << p.ams_mapping2;
-    }
     if (!p.nozzle_mapping.empty()) {
         // It's already a JSON array
         os << ",\"nozzle_mapping\":" << p.nozzle_mapping;
@@ -360,28 +418,34 @@ std::string build_project_file_json(const BBL::PrintParams& p,
         os << ",\"extrude_cali_manual_mode\":" << p.extruder_cali_manual_mode;
     }
 
-#if ABI_VERSION >= 0x020503
     // `cfg` is a string-encoded bitmask the stock plugin builds from
     // PrintParams flags that don't have a dedicated MQTT field. So far
     // only one bit is known:
     //   bit 2 (value 4) = use internal storage for timelapse.
-    // Driven by `task_timelapse_use_internal`. All other bits stay 0 in
-    // every captured stock frame; if more flags surface later, OR them
-    // into `cfg_bits` here. See NETWORK_PLUGIN.md §6.8.2.
+    // Driven by `task_timelapse_use_internal` (added to PrintParams in
+    // ABI 02.05.03). All other bits stay 0 in every captured stock
+    // frame; if more flags surface later, OR them into `cfg_bits` here.
+    // See NETWORK_PLUGIN.md §6.8.2.
     //
-    // Stock-plugin observation: builds without `task_timelapse_use_internal`
-    // (ABI < 02.05.03) omit `cfg` from `project_file` entirely, so we gate
-    // emission on the same ABI bound to keep wire-level parity.
+    // Wire-level parity: the cross-ABI `tools/plugin_runner` matrix
+    // (02.05.00 -> 02.06.01) showed the stock plugin emits `cfg` in
+    // `project_file` for **every** ABI we tested — older builds simply
+    // hardcode `"0"` because the underlying field doesn't exist yet.
+    // So we emit unconditionally and gate only the *value* on the ABI
+    // bound that introduced `task_timelapse_use_internal`.
     int cfg_bits = 0;
+#if ABI_VERSION >= 0x020503
     if (p.task_timelapse_use_internal) cfg_bits |= 4;
-    os << ",\"cfg\":\"" << cfg_bits << "\"";
 #endif
+    os << ",\"cfg\":\"" << cfg_bits << "\"";
 
-    // `extrude_cali_flag` has no known PrintParams source. Stock plugin
-    // emits 0 in every captured frame; presumably a "PA cali already
-    // pending" guard derived from cached printer state. Hardcode to 0
-    // until a capture shows otherwise. See NETWORK_PLUGIN.md §6.8.2.
-    os << ",\"extrude_cali_flag\":0";
+    // `extrude_cali_flag` is the wire mirror of `auto_flow_cali`:
+    // confirmed via `tools/plugin_runner` overlay (`auto_flow_cali=1`
+    // flipped the field from 0 to 1 across both 02.05.00 and 02.06.01).
+    // Studio populates this from the user's "Flow dynamics calibration"
+    // dropdown; the firmware uses it to short-circuit redundant PA
+    // cali runs. See NETWORK_PLUGIN.md §6.8.2.
+    os << ",\"extrude_cali_flag\":" << p.auto_flow_cali;
 
     os << "}}";
     return os.str();
@@ -416,14 +480,22 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
-    // Bambu printers expect print files to land in /cache/. Most printer
-    // configs leave params.ftp_folder empty, so we default to that; the
-    // ones that do set it (e.g. "sdcard/" on N1/N2S/C11/C12) are honored
-    // verbatim.
+    // Stock plugin parity: when `ftp_folder` is empty (which it always
+    // is — Studio never assigns m_ftp_folder anywhere in the public
+    // tree, see `3rd_party/BambuStudio/src/slic3r/GUI/Jobs/PrintJob.cpp`)
+    // the stock plugin uploads the 3mf to the **FTPS root**, not to
+    // `/cache/`. Confirmed by sniffing a real LAN print on N7 with the
+    // stock libbambu_networking.so loaded via `tools/plugin_runner`:
+    // the published `project_file` carries `"file":
+    // "<project>.gcode.3mf"` (no `/cache/` prefix) and the firmware
+    // happily accepts it. The `/cache/` path was an earlier guess that
+    // matched no observed traffic; we keep `ftp_folder` honored
+    // verbatim so a downstream caller can still target a specific
+    // directory if needed (e.g. `"sdcard/"` for printers whose
+    // firmware insists on it). See NETWORK_PLUGIN.md §6.8.2.
     std::string remote_folder = params.ftp_folder;
-    if (remote_folder.empty()) remote_folder = "cache/";
-    if (remote_folder.back() != '/') remote_folder += '/';
-    if (remote_folder.front() == '/') remote_folder.erase(0, 1);
+    if (!remote_folder.empty() && remote_folder.back() != '/') remote_folder += '/';
+    if (!remote_folder.empty() && remote_folder.front() == '/') remote_folder.erase(0, 1);
     std::string remote_name = print_job::pick_remote_name(params);
     std::string remote_path = "/" + remote_folder + remote_name;
 
@@ -445,8 +517,31 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
 
     print_job::ProjectFileOpts opts;
     opts.file_path = stored_path;
-    opts.url       = "ftp://" + stored_path; // printer fetches from its own FTPS
-    opts.md5       = params.ftp_file_md5;
+    // Stock plugin parity: when the upload landed in the FTPS root the
+    // wire URL is `"ftp://<name>"` (single slash). Concatenating
+    // `"ftp://"` with `/<name>` would produce `ftp:///<name>`; drop the
+    // lead slash for the URL form. The LAN firmware accepts both, but
+    // the wire-level diff against a captured stock frame stays clean
+    // only when it's gone. See NETWORK_PLUGIN.md §6.8.2.
+    {
+        std::string rel = stored_path;
+        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+        opts.url = "ftp://" + rel;
+    }
+    // Stock plugin parity: it always populates `print.md5` itself —
+    // Studio's PrintJob never sets `params.ftp_file_md5`. Hash the
+    // local 3mf if the caller didn't pre-compute one. Matters because
+    // the firmware refuses the job on MD5 mismatch (and an empty
+    // string trivially mismatches).
+    opts.md5 = params.ftp_file_md5;
+    if (opts.md5.empty()) {
+        opts.md5 = print_job::md5_of_file(params.filename);
+        if (opts.md5.empty()) {
+            OBN_WARN("local_print: failed to MD5 %s — sending empty md5; "
+                     "the printer will likely reject the job",
+                     params.filename.c_str());
+        }
+    }
     std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());
 
@@ -520,7 +615,15 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
 
     print_job::ProjectFileOpts opts;
     opts.file_path  = remote_path;
-    opts.url        = "ftp://" + remote_path;
+    // Stock plugin parity: drop the lead slash for the URL form so we
+    // emit `"ftp://<path>"` instead of `"ftp:///<path>"` when the file
+    // sits at FTPS root. See the matching block in run_local_print_job
+    // and NETWORK_PLUGIN.md §6.8.2.
+    {
+        std::string rel = remote_path;
+        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+        opts.url = "ftp://" + rel;
+    }
     opts.md5        = "";  // not known for a pre-existing file on storage
     opts.project_id = "0";
     opts.profile_id = "0";

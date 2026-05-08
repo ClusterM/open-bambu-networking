@@ -710,10 +710,13 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                      "-> degrading to cloud channel");
             use_lan_channel = false;
         } else {
+            // Stock plugin parity: when ftp_folder is empty the file
+            // lands in the FTPS root, not /cache/. See run_local_print
+            // in src/print_job.cpp and NETWORK_PLUGIN.md §6.8.2 for the
+            // wire-level evidence (sniffed against N7 in Developer Mode).
             std::string folder = p.ftp_folder;
-            if (folder.empty()) folder = "cache/";
-            if (folder.back() != '/') folder += '/';
-            if (folder.front() == '/') folder.erase(0, 1);
+            if (!folder.empty() && folder.back() != '/') folder += '/';
+            if (!folder.empty() && folder.front() == '/') folder.erase(0, 1);
             lan_remote_path = "/" + folder + remote_name;
 
             std::uint64_t total = 0;
@@ -751,7 +754,12 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     opts.md5        = md5;
     if (use_lan_channel) {
         opts.file_path = lan_remote_path;
-        opts.url       = "ftp://" + lan_remote_path;
+        // Stock plugin parity: drop the lead slash so we emit
+        // "ftp://<path>" instead of "ftp:///<path>" when the file is
+        // at FTPS root. See NETWORK_PLUGIN.md §6.8.2.
+        std::string rel = lan_remote_path;
+        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
+        opts.url       = "ftp://" + rel;
     } else {
         // Cloud: the printer fetches directly from S3 over HTTPS.
         opts.file_path = remote_name;

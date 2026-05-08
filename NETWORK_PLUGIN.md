@@ -737,9 +737,9 @@ The print-job submission ends with a single MQTT command published to the printe
 | `nozzle_mapping` | int array | `nozzle_mapping` (Studio passes a JSON-array string of ints, e.g. `"[0,1]"`) | Index = filament slot in the 3mf, value = physical nozzle/extruder position id. **Emitted only on multi-extruder printers** — Studio gates every assignment to `task_nozzle_mapping` on `MachineObject::GetNozzleRack()->IsSupported()` (see `SelectMachine.cpp:3107` and `CalibUtils.cpp:2225`/`2358`), so on single-nozzle hardware (P2S, X1C, A1, etc.) the field is omitted entirely from `project_file`. The Studio-side value is sourced verbatim from the printer's reply to the `get_auto_nozzle_mapping` MQTT query (`DevMappingNozzle.cpp:277-282` deserialises the `mapping` field into `std::vector<int>`), so the type is **always** a flat `int` array — no objects, no string-wrapped numbers, no `[0,-1,…]` sentinels analogous to `ams_mapping`. Stock-plugin observation: when Studio hands it a string with whitespace (e.g. `"[0,1, 2]"`), the stock plugin re-emits it as canonical `"[0,1,2]"`; this normalization is cosmetic and not required for firmware acceptance. |
 | `auto_bed_leveling` | int | `auto_bed_leveling` | Bed-leveling option as an int (0 = off, 1 = on, 2 = auto). Coexists with the boolean `bed_leveling`: the boolean is the user toggle, the int is the resolved policy after taking firmware capabilities into account. |
 | `nozzle_offset_cali` | int | `auto_offset_cali` (**name mismatch is intentional in upstream**) | Nozzle-offset calibration option (0 = off, 2 = auto). |
-| `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). Stock plugin always emits the field; absent from older firmware paths. |
-| `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`); confirmed by toggling that field via the override hook against a P2S and observing the resulting MQTT publish. No other bit values have been observed in the wild yet — if a future capture shows e.g. `"1"`, `"2"` or `"5"`, we'll learn another flag's meaning. Always emitted as a string, not a number. **Introduced together with `task_timelapse_use_internal` in ABI `02.05.03` — stock plugin builds against older ABIs (where the field doesn't exist in `PrintParams`) omit `cfg` from `project_file` entirely**; we mirror that and gate emission on `ABI_VERSION >= 0x020503` in `src/print_job.cpp`. |
-| `extrude_cali_flag` | int | not present in `PrintParams` | Stock-plugin-only field, observed value `0` in every captured frame. Likely a "PA cali already pending" guard derived from cached printer state, but unconfirmed; not referenced in the public Studio source. We hardcode `0` until a capture shows otherwise. |
+| `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it's omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01` via `tools/plugin_runner` overlays (variants `extruder_cali_0`, `extruder_cali_1`). |
+| `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. The cross-ABI `tools/plugin_runner` matrix confirmed this: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"` regardless of overlays; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — if a future capture shows e.g. `"1"`, `"2"` or `"5"`, we'll learn another flag's meaning. |
+| `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**, not hardcoded as we previously assumed: setting `auto_flow_cali=1` via `tools/plugin_runner` overlay flipped `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. (We earlier saw only `0` because every captured Studio session shipped `auto_flow_cali=0`.) Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
 
 Sibling `header` object the stock plugin wraps the command in (cloud and LAN alike when paired against signature-checking firmware):
 
@@ -759,6 +759,43 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 `cert_id` identifies the device certificate used for signing (its Subject DN includes `CN=<dev_id>.bambulab.com`); `payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 signature of that exact payload computed with the per-install private key shipped inside the stock plugin's obfuscated blob; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error `84033543`). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
 
 Other `PrintParams` members Studio populates but **does not put into the MQTT command** itself: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments`. They feed the cloud-side `POST /v1/user-service/my/task` body and the timelapse-storage preflight (see below), not `project_file`. (`task_timelapse_use_internal` *does* reach the MQTT command, but indirectly — see the `cfg` row in the table above.)
+
+##### Cross-ABI `project_file` reverse-engineering matrix
+
+The mapping above was verified by driving `tools/plugin_runner` against an N7 in Developer Mode with stock `libbambu_networking.so` for each of these versions:
+
+| ABI tag | Plugin file | `cfg` baseline behaviour | New schema field(s) vs the prior tag |
+|---|---|---|---|
+| `02.05.00` | `02.05.00.56` | always `"0"` | (reference) |
+| `02.05.01` | `02.05.01.52` | always `"0"` | none |
+| `02.05.02` | `02.05.02.58` | always `"0"` | none |
+| `02.05.03` | `02.05.03.63` | `"4"` if `task_timelapse_use_internal=true`, else `"0"` | `cfg` becomes settable (the `PrintParams::task_timelapse_use_internal` ABI break) |
+| `02.06.00` | `02.06.00.50` | same as `02.05.03` | none in `project_file`; only new exports are filament-spool CRUD (`bambu_network_get_filament_spools`, `bambu_network_create_filament_spool`, `bambu_network_update_filament_spool`, `bambu_network_delete_filament_spools`, `bambu_network_get_filament_config`) — those are HTTP plumbing, not LAN MQTT |
+| `02.06.01` | `02.06.01.50` | same as `02.05.03` | none |
+
+**Bottom line:** the on-the-wire `project_file` schema is essentially frozen across `02.05.x` -> `02.06.x`. The only ABI-significant change for LAN print submission is the addition of `task_timelapse_use_internal` in `02.05.03`, which feeds the `cfg` bitmask (and only bit `0x4` has been observed so far). All field mappings below were also confirmed identical between `02.05.00` and `02.06.01` for every overlay we tried (see the per-overlay table below) — only the `cfg` value differs between the two ABI families.
+
+##### Per-`PrintParams`-field mapping (overlay matrix on ABI `02.05.03`)
+
+These were collected by toggling one `PrintParams` field at a time via the override hook (`tools/plugin_runner --params-json …`) and diffing the resulting `project_file` against the all-defaults baseline. They confirm — and in some cases correct — the per-row notes in the table above.
+
+| `PrintParams` field overridden | Resulting `project_file` change |
+|---|---|
+| `task_use_ams=true`, `ams_mapping="[0]"`, `ams_mapping2='[{"ams_id":0,"slot_id":0}]'` | `use_ams: false → true`, `ams_mapping: [] → [0]`, `ams_mapping2: [] → [{"ams_id":0,"slot_id":0}]` |
+| `task_record_timelapse=false` (and `task_timelapse_use_internal=false`) | `timelapse: true → false`, `cfg: "4" → "0"` |
+| `task_timelapse_use_internal=false` (alone) | `cfg: "4" → "0"` (the `timelapse` boolean stays `true`) |
+| `task_bed_type="textured_plate"` | `bed_type: "auto" → "textured_plate"` |
+| `task_bed_type="supertack_plate"` | `bed_type: "auto" → "supertack_plate"` |
+| `task_bed_leveling=false`, `task_flow_cali=false`, `task_vibration_cali=false`, `task_layer_inspect=false` | All four matching booleans flip to `false` (`bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`) — direct one-to-one mapping |
+| `extruder_cali_manual_mode=0` | `extrude_cali_manual_mode` **appears** with value `0` (absent in baseline because `-1` is the default) |
+| `extruder_cali_manual_mode=1` | `extrude_cali_manual_mode` appears with value `1` |
+| `auto_offset_cali=2` | `nozzle_offset_cali: 0 → 2` (note the upstream rename) |
+| `auto_bed_leveling=2` | `auto_bed_leveling: 0 → 2` (coexists with the `bed_leveling` boolean) |
+| `auto_flow_cali=1` | `extrude_cali_flag: 0 → 1` (this is how the previously mysterious `extrude_cali_flag` is populated) |
+| `project_name="obn-rename-test"` | `subtask_name`, `file`, and `url` all switch in lock-step (`<project_name>`, `<project_name>.gcode.3mf`, `ftp://<project_name>.gcode.3mf`) — the FTP upload path follows suit |
+| `plate_index=2` | `param: "Metadata/plate_1.gcode" → "Metadata/plate_2.gcode"` |
+
+Fields that did **not** appear on this hardware (P2S/N7 single-extruder) regardless of overrides: `nozzle_mapping` (gated on multi-extruder, see the dedicated row above), `url_enc` (Developer Mode bypasses the encrypted-URL requirement), and the entire `header` envelope (Developer Mode disables signature verification — see §6.8.2 above).
 
 #### 6.8.3. Timelapse-storage preflight (`ipcam_get_media_info`)
 
