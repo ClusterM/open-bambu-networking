@@ -129,9 +129,11 @@ std::string this_dll_data_dir()
     int u8 = ::WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
                                    nullptr, 0, nullptr, nullptr);
     if (u8 <= 0) return {};
-    std::string path(static_cast<std::size_t>(u8 - 1), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
-                          path.data(), u8, nullptr, nullptr);
+    std::string path(static_cast<std::size_t>(u8), '\0');
+    if (::WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                              path.data(), u8, nullptr, nullptr) <= 0)
+        return {};
+    if (!path.empty() && path.back() == '\0') path.pop_back();
     // Strip "\BambuSource.dll"
     auto slash = path.find_last_of("\\/");
     if (slash == std::string::npos) return {};
