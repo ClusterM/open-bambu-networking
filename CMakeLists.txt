@@ -162,6 +162,8 @@ option(OBN_STATIC_MOSQUITTO "Link libmosquitto via pkg-config --static" OFF)
 option(OBN_VENDOR_MOSQUITTO "Bundle libmosquitto via FetchContent (static PIC)" OFF)
 set(OBN_MOSQUITTO_GIT_TAG "v2.1.2"
     CACHE STRING "Git tag for eclipse/mosquitto when OBN_VENDOR_MOSQUITTO is ON")
+set(OBN_CJSON_GIT_TAG "v1.7.18"
+    CACHE STRING "Git tag for DaveGamble/cJSON when OBN_VENDOR_MOSQUITTO is ON")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

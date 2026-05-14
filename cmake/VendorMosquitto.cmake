@@ -5,6 +5,9 @@ function(obn_vendor_mosquitto_setup)
     find_package(Threads REQUIRED)
     include(FetchContent)
 
+    include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorCJSON.cmake")
+    obn_vendor_cjson_setup()
+
     FetchContent_Declare(eclipse_mosquitto
         GIT_REPOSITORY https://github.com/eclipse/mosquitto.git
         GIT_TAG ${OBN_MOSQUITTO_GIT_TAG}

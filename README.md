@@ -308,23 +308,23 @@ headers for everything the project links against:
 | Component                           | Debian / Ubuntu packages                                                                             | Fedora-style packages                                                             |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | Toolchain                           | `build-essential`, `cmake`, `pkg-config`                                                             | `gcc-c++`, `cmake`, `pkgconf-pkg-config`                                          |
-| MQTT / JSON / HTTP / TLS / zlib     | `libmosquitto-dev`, `libcjson-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
+| MQTT / HTTP / TLS / zlib              | `libmosquitto-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
 
 > Note  
-> `libcjson-dev` and `uthash-dev` are required for `--vendor-mosquitto` option only (see below).
+> `uthash-dev` is required for `--vendor-mosquitto` only (see below). Vendored mosquitto pulls in cJSON automatically; host `libcjson-dev` is not required.
 
 One-shot install examples:
 
 ```sh
 # Debian / Ubuntu
 sudo apt install build-essential cmake pkg-config \
-  libmosquitto-dev libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
+  libmosquitto-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
 ```
 
 ```sh
 # Fedora
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
-  mosquitto-devel cjson-devel uthash-devel libcurl-devel openssl-devel zlib-devel
+  mosquitto-devel uthash-devel libcurl-devel openssl-devel zlib-devel
 ```
 
 #### Linux: configure, build and install
