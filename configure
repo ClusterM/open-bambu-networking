@@ -13,6 +13,7 @@ OBN_VERSION=""
 CLIENT_TYPE=bambu_studio
 WORKAROUNDS=ON
 FTPS_FASTPATH=ON
+TLS_FALLBACK=ON
 TESTS=OFF
 PATCH_CONF=ON
 STATIC_MOSQUITTO=OFF
@@ -89,6 +90,8 @@ Optional features:
                              back to its internal FTP for 'Send to
                              Printer'. Re-enable with
                              --enable-ftps-fastpath.
+  --disable-tls-fallback   Do not retry LAN MQTT / FTP on plaintext if
+                             TLS fails. Re-enable with --enable-tls-fallback.
   --enable-tests             Build probe_plugin / *_live_test smoke tests
                              (disabled by default). Disable again with
                              --disable-tests.
@@ -134,6 +137,8 @@ for arg in "$@"; do
         --enable-workarounds)      WORKAROUNDS=ON ;;
         --disable-ftps-fastpath)   FTPS_FASTPATH=OFF ;;
         --enable-ftps-fastpath)    FTPS_FASTPATH=ON ;;
+        --disable-tls-fallback)    TLS_FALLBACK=OFF ;;
+        --enable-tls-fallback)     TLS_FALLBACK=ON ;;
         --disable-tests)           TESTS=OFF ;;
         --enable-tests)            TESTS=ON ;;
         --no-conf-patch)           PATCH_CONF=OFF ;;
@@ -394,6 +399,7 @@ set -- "$@" \
     -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
     -DOBN_FT_FTPS_FASTPATH="$FTPS_FASTPATH" \
+    -DOBN_TLS_FALLBACK="$TLS_FALLBACK" \
     -DOBN_BUILD_TESTS="$TESTS" \
     -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF" \
     -DOBN_STATIC_MOSQUITTO="$STATIC_MOSQUITTO" \

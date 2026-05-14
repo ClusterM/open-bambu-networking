@@ -147,6 +147,7 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
                   cfg.host.c_str(), cfg.port, rc, mqtt::Client::err_str(rc));
 
         if (use_ssl_ && rc != MOSQ_ERR_INVAL) {
+#if OBN_TLS_FALLBACK
             // Any TLS connect failure -> retry plain on port 1883.
             // MOSQ_ERR_INVAL means invalid parameters (a code bug), not a
             // network issue, so a plain retry would not help.
@@ -161,6 +162,7 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
                 OBN_ERROR("mqtt plain connect to %s:1883 also failed rc=%d (%s)",
                           cfg.host.c_str(), rc, mqtt::Client::err_str(rc));
             }
+#endif
         }
     }
     return map_mqtt_err(rc);

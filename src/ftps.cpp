@@ -823,6 +823,9 @@ std::string connect_with_fallback(Client& client, ConnectConfig cfg)
         return client.connect(cfg);
     }
 
+#if !OBN_TLS_FALLBACK
+    return client.connect(cfg);
+#else
     // Try TLS transport first. On any transport error (TCP / TLS handshake /
     // missing banner) fall back to plain. Auth errors (wrong credentials etc.)
     // are not retried on plain because the same credentials will fail there
@@ -852,6 +855,7 @@ std::string connect_with_fallback(Client& client, ConnectConfig cfg)
         return err;
     }
     return {};
+#endif
 }
 
 } // namespace obn::ftps

@@ -10,6 +10,7 @@
 #   .\configure.ps1                                    # bambu_studio, x64-windows-static
 #   .\configure.ps1 -ClientType orca_slicer
 #   .\configure.ps1 -BuildType Debug -EnableTests:$false
+#   .\configure.ps1 -TlsFallback:$false
 #   .\configure.ps1 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows
 #   .\configure.ps1 -Generator "Visual Studio 17 2022"   # pin a VS version
 #
@@ -36,6 +37,7 @@ param(
     [string]   $ClientType   = "bambu_studio",
     [bool]     $Workarounds   = $true,
     [bool]     $FtpsFastpath  = $true,
+    [bool]     $TlsFallback   = $true,
     [bool]     $EnableTests   = $false,
     [bool]     $PatchConf     = $true,
     # On Windows install the DirectShow source filter (HKCU CLSID +
@@ -279,6 +281,7 @@ if ($VcpkgTriplet -like "x86-*" -and $Architecture -eq "x64") {
 # splitting "-DFOO=" and "ON" into two adjacent elements.
 $workaroundsVal      = if ($Workarounds)        { "ON" } else { "OFF" }
 $ftpsFastpathVal     = if ($FtpsFastpath)       { "ON" } else { "OFF" }
+$tlsFallbackVal      = if ($TlsFallback)        { "ON" } else { "OFF" }
 $enableTestsVal      = if ($EnableTests)        { "ON" } else { "OFF" }
 $patchConfVal        = if ($PatchConf)          { "ON" } else { "OFF" }
 $registerDshowVal    = if ($RegisterDShowFilter){ "ON" } else { "OFF" }
@@ -300,6 +303,7 @@ $cmakeArgs += @(
     "-DOBN_CLIENT_TYPE=$ClientType",
     "-DOBN_ENABLE_WORKAROUNDS=$workaroundsVal",
     "-DOBN_FT_FTPS_FASTPATH=$ftpsFastpathVal",
+    "-DOBN_TLS_FALLBACK=$tlsFallbackVal",
     "-DOBN_BUILD_TESTS=$enableTestsVal",
     "-DOBN_PATCH_CLIENT_CONF=$patchConfVal",
     "-DOBN_REGISTER_DSHOW_FILTER=$registerDshowVal"

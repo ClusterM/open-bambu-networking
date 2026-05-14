@@ -114,6 +114,10 @@ endif()
 # / storage picker / percent progress).
 option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
 
+# When ON, failed TLS on LAN MQTT (8883) or FTPS (990) is retried once on
+# plaintext (1883 / 21). When OFF, no automatic downgrade.
+option(OBN_TLS_FALLBACK "Retry LAN MQTT / FTP with plaintext when TLS fails" ON)
+
 # Toggles every non-stock behaviour in the plugin. With this ON the plugin
 # makes choices the original bambu_networking.so never would in order to
 # get Developer-Mode LAN printers (most notably the P2S, which has a USB
@@ -162,6 +166,12 @@ option(OBN_STATIC_MOSQUITTO "Link libmosquitto via pkg-config --static" OFF)
 option(OBN_VENDOR_MOSQUITTO "Bundle libmosquitto via FetchContent (static PIC)" OFF)
 set(OBN_MOSQUITTO_GIT_TAG "v2.1.2"
     CACHE STRING "Git tag for eclipse/mosquitto when OBN_VENDOR_MOSQUITTO is ON")
+
+if(OBN_TLS_FALLBACK)
+    message(STATUS "obn: OBN_TLS_FALLBACK=ON")
+else()
+    message(STATUS "obn: OBN_TLS_FALLBACK=OFF")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -351,6 +361,7 @@ target_compile_definitions(bambu_networking PRIVATE
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
     OBN_FT_FTPS_FASTPATH=$<BOOL:${OBN_FT_FTPS_FASTPATH}>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
+    OBN_TLS_FALLBACK=$<BOOL:${OBN_TLS_FALLBACK}>
 )
 target_link_libraries(bambu_networking PRIVATE
     obn_mosquitto_iface
@@ -475,6 +486,7 @@ add_library(BambuSource SHARED ${_obn_bambusource_sources})
 target_include_directories(BambuSource PRIVATE include stubs)
 target_compile_definitions(BambuSource PRIVATE
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
+    OBN_TLS_FALLBACK=$<BOOL:${OBN_TLS_FALLBACK}>
 )
 if(WIN32)
     set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "")
@@ -693,6 +705,9 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/log.cpp
         src/os_compat.cpp)
     target_include_directories(ftps_live_test PRIVATE include)
+    target_compile_definitions(ftps_live_test PRIVATE
+        OBN_TLS_FALLBACK=$<BOOL:${OBN_TLS_FALLBACK}>
+    )
     target_link_libraries(ftps_live_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
     # Hermetic unit test for src/ftps_parse.hpp. Exercises the `ls -l`
@@ -726,6 +741,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
+        OBN_TLS_FALLBACK=$<BOOL:${OBN_TLS_FALLBACK}>
     )
     target_link_libraries(lan_live_test PRIVATE
         obn_mosquitto_iface

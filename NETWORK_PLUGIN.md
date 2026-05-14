@@ -567,6 +567,12 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_install_device_cert` | `void(void*, std::string dev_id, bool lan_only)` |
 | `bambu_network_start_discovery` | `bool(void*, bool start, bool sending)` — SSDP |
 
+#### 6.4.1. LAN MQTT / FTP — TLS ports vs plaintext (field observation)
+
+On most printers the stock stack expects **MQTT over TLS on TCP/8883** and **implicit FTPS on TCP/990** (see §7.5.1 and §7.6.3). In the wild, some units behave differently: the TLS listener on those ports is **closed or unreachable**, while the **plaintext** services on **TCP/1883** (MQTT) and **TCP/21** (FTP) still accept connections. The original Bambu plugin therefore tries the TLS ports first and falls back to plaintext when the connection fails.
+
+This has been reported at least on **P1S** running firmware **1.09.01.00 and earlier**; whether it is limited to that model/firmware line or also appears elsewhere is **not** confirmed from Studio sources alone. Studio still exposes `use_ssl_for_ftp` and `use_ssl_for_mqtt` on `PrintParams`, and `bambu_network_connect_printer` carries a `use_ssl` flag — a drop-in replacement plugin should honour those flags and implement a TLS→plaintext fallback (or strict mode only) consistent with user expectations. Community report: [open-bambu-networking#9](https://github.com/ClusterM/open-bambu-networking/issues/9).
+
 ### 6.5. Authentication and user
 
 | Symbol | Signature |
@@ -1698,7 +1704,7 @@ On the wire there are **two** TCP sockets in play, even though Studio only ever 
 | Channel | Endpoint | Direction | Carries |
 |---------|----------|-----------|---------|
 | CTRL tunnel | TLS over TCP/**6000** (the same socket Studio opened with `Bambu_Create` / `Bambu_Open`) | Studio ↔ plugin | JSON requests/responses + optional inline blobs (thumbnails) |
-| FTPS data plane | implicit FTPS over TCP/**990** (opened *by the plugin*, not by Studio) | plugin ↔ printer | `LIST` / `RETR` / `STOR` / `DELE`, i.e. the actual file metadata and bulk bytes |
+| FTPS data plane | implicit FTPS over TCP/**990** (opened *by the plugin*, not by Studio); **some firmwares** expose **plain FTP on TCP/21** instead when TLS is unavailable (§6.4.1) | plugin ↔ printer | `LIST` / `RETR` / `STOR` / `DELE`, i.e. the actual file metadata and bulk bytes |
 
 In other words: Studio does not know there is an FTPS connection. From its point of view the entire file-browser feature is "send a JSON request on the camera tunnel, get a JSON response back". The plugin maps each CTRL command onto one or more FTPS operations and then synthesises a response.
 
@@ -1842,6 +1848,7 @@ There are no concurrent CTRL requests on the same tunnel: `PrinterFileSystem::Ru
 
 Bambu firmware ships a stripped-down vsftpd / busybox-ftpd hybrid (the exact image varies across O1S / X1 / P1 / P2S / A-series) that deviates from RFC 959 / 4217 in several ways. None of these quirks are documented anywhere in the stock plugin or Studio source, so a fresh implementation needs to know all of them up front:
 
+- **TLS vs plaintext on different ports.** The usual layout is **implicit TLS on TCP/990** (below). On some units (reported at least for **P1S** on firmware **≤ 1.09.01.00**) TLS on 990 may be unavailable while **plain FTP on TCP/21** still works — same login and PASV/data quirks, but no TLS on control or data and no `PBSZ`/`PROT P` sequence (§6.4.1).
 - **Implicit TLS, TCP/990.** The TLS handshake starts immediately after the TCP `connect()`; there is no `AUTH TLS` upgrade dance. A plaintext FTP client that opens 990 and waits for a `220` banner gets nothing — the server is already in TLS mode.
 - **Self-signed cert with no usable SAN.** The certificate Bambu's FTPS daemon presents has no SAN that matches the printer's LAN IP, so OpenSSL hostname verification always fails. Run with `SSL_VERIFY_NONE` (the same compromise the stock plugin makes for MQTT against the same printer). Pinning against the bundled `printer.cer` chain works on some firmwares but not all.
 - **Login is `USER bblp` + `PASS <printer-access-code>`.** The 8-character code shown on the printer screen is the FTPS password. There is no anonymous mode, and no other usernames are accepted.
