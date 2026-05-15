@@ -41,6 +41,13 @@ function(obn_vendor_cjson_setup)
     target_include_directories(cjson PUBLIC "$<BUILD_INTERFACE:${_obn_cjson_iface_root}>")
     set_target_properties(cjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+    # Consumers of mosquitto's public headers need this path too (#include
+    # <cjson/cJSON.h> via mosquitto/libcommon_cjson.h); do not link the cjson
+    # target into the plugin again (already inside vendored libmosquitto_common).
+    add_library(obn_vendor_cjson_iface INTERFACE)
+    target_include_directories(obn_vendor_cjson_iface INTERFACE
+        "$<BUILD_INTERFACE:${_obn_cjson_iface_root}>")
+
     add_library(cJSON ALIAS cjson)
 
     file(WRITE "${_obn_cjson_override_dir}/FindcJSON.cmake"

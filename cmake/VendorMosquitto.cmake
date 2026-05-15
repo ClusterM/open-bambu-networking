@@ -46,6 +46,7 @@ function(obn_vendor_mosquitto_setup)
         "${eclipse_mosquitto_SOURCE_DIR}/include"
     )
     target_link_libraries(obn_mosquitto_iface INTERFACE
+        obn_vendor_cjson_iface
         libmosquitto_static
         OpenSSL::SSL
         OpenSSL::Crypto
