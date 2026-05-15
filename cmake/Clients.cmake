@@ -50,11 +50,10 @@
 #       "OrcaSlicer.conf"). Used by the patch script template.
 #
 #   OBN_CLIENT_DEFAULT_PREFIX
-#       Recommended default install prefix (Linux only). Native config
-#       dir is preferred; the Flatpak config dir
-#       (~/.var/app/<app-id>/config/<dir>) is used only when the native
-#       one is missing AND the Flatpak one exists. Empty on non-Linux
-#       or when $HOME is unset.
+#       Recommended default install prefix: native config dir per OS (Linux
+#       ~/.config or Flatpak fallback; macOS Library/Application Support;
+#       Windows %APPDATA%). Empty when the platform has no convention or
+#       $HOME / APPDATA is unset.
 
 function(obn_resolve_client client_type)
     if(NOT client_type STREQUAL "bambu_studio" AND
@@ -90,6 +89,7 @@ function(obn_resolve_client client_type)
         set(_client_native  "${_home}/.config/BambuStudio")
         set(_client_flatpak "${_home}/.var/app/com.bambulab.BambuStudio/config/BambuStudio")
         set(_client_appdata "${_appdata}/BambuStudio")
+        set(_client_mac     "${_home}/Library/Application Support/BambuStudio")
     else() # orca_slicer
         if(NOT DEFINED OBN_VERSION OR OBN_VERSION STREQUAL "")
             message(FATAL_ERROR
@@ -104,6 +104,7 @@ function(obn_resolve_client client_type)
         set(_client_native  "${_home}/.config/OrcaSlicer")
         set(_client_flatpak "${_home}/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer")
         set(_client_appdata "${_appdata}/OrcaSlicer")
+        set(_client_mac     "${_home}/Library/Application Support/OrcaSlicer")
     endif()
 
     if(WIN32 AND NOT _appdata STREQUAL "")
@@ -112,6 +113,9 @@ function(obn_resolve_client client_type)
         # <data_dir> == %APPDATA%\BambuStudio (or \OrcaSlicer). No Flatpak
         # equivalent on Windows.
         set(OBN_CLIENT_DEFAULT_PREFIX     "${_client_appdata}" PARENT_SCOPE)
+    elseif(APPLE AND NOT _home STREQUAL "")
+        # wx StandardPaths::GetUserDataDir() on macOS (not ~/.config).
+        set(OBN_CLIENT_DEFAULT_PREFIX     "${_client_mac}" PARENT_SCOPE)
     elseif(UNIX AND NOT APPLE AND NOT _home STREQUAL "")
         # Native preferred; Flatpak only as a fallback when native is missing.
         # Mirrors the priority in ./configure. Same shape for both clients.

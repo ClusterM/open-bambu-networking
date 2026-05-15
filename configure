@@ -47,19 +47,18 @@ Install paths:
                          libraries. Per --client-type, configure prefers
                          the native config dir and only falls back to
                          the Flatpak config dir when the native one is
-                         missing AND the Flatpak one exists:
+                         missing AND the Flatpak one exists (Linux only):
                            bambu_studio -> $HOME/.config/BambuStudio
-                                           or
-                                           $HOME/.var/app/
-                                             com.bambulab.BambuStudio/
-                                             config/BambuStudio
+                                           or Flatpak path (see above)
+                                           or on macOS:
+                                           $HOME/Library/Application
+                                             Support/BambuStudio
                            orca_slicer  -> $HOME/.config/OrcaSlicer
-                                           or
-                                           $HOME/.var/app/
-                                             com.orcaslicer.OrcaSlicer/
-                                             config/OrcaSlicer
-                         (Linux only -- on other platforms you must
-                         pass --prefix explicitly.)
+                                           or Flatpak path
+                                           or on macOS:
+                                           $HOME/Library/Application
+                                             Support/OrcaSlicer
+                         On Windows you must pass --prefix explicitly.
 
 Build settings:
   --build-dir=DIR        Build directory (default: build).
@@ -185,7 +184,9 @@ has_utlist_header() {
         /usr/include/utlist.h \
         /usr/local/include/utlist.h \
         /usr/include/uthash/utlist.h \
-        /usr/local/include/uthash/utlist.h
+        /usr/local/include/uthash/utlist.h \
+        /opt/homebrew/include/utlist.h \
+        /opt/homebrew/include/uthash/utlist.h
     do
         [ -r "$hdr" ] && return 0
     done
@@ -200,11 +201,14 @@ configure: --vendor-mosquitto requires utlist.h (uthash development headers), bu
 Install the package and run configure again:
   Debian/Ubuntu: sudo apt install uthash-dev
   Fedora/RHEL:   sudo dnf install uthash-devel
+  macOS Homebrew: brew install uthash
 EOF
     exit 1
 fi
 
-# On Linux, default the install prefix to the per-client config directory.
+# On Linux and macOS, default the install prefix to the per-client config
+# directory when PREFIX is unset. Linux also prefers native ~/.config over
+# Flatpak under ~/.var/app when only one exists.
 # Both supported slicers (Bambu Studio and Orca Slicer) ship as Flathub
 # apps too -- under the Flatpak runtime the slicer's data dir lives at
 # ~/.var/app/<app-id>/config/<dir>/ instead of ~/.config/<dir>/. We
@@ -220,19 +224,23 @@ fi
 # wrong conf file.
 STUDIO_NATIVE_DIR="${HOME:-}/.config/BambuStudio"
 STUDIO_FLATPAK_DIR="${HOME:-}/.var/app/com.bambulab.BambuStudio/config/BambuStudio"
+STUDIO_MAC_DIR="${HOME:-}/Library/Application Support/BambuStudio"
 ORCA_NATIVE_DIR="${HOME:-}/.config/OrcaSlicer"
 ORCA_FLATPAK_DIR="${HOME:-}/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer"
+ORCA_MAC_DIR="${HOME:-}/Library/Application Support/OrcaSlicer"
 
 case "$CLIENT_TYPE" in
     bambu_studio)
         client_label="Bambu Studio"
         client_native_dir="$STUDIO_NATIVE_DIR"
         client_flatpak_dir="$STUDIO_FLATPAK_DIR"
+        client_mac_dir="$STUDIO_MAC_DIR"
         ;;
     orca_slicer)
         client_label="Orca Slicer"
         client_native_dir="$ORCA_NATIVE_DIR"
         client_flatpak_dir="$ORCA_FLATPAK_DIR"
+        client_mac_dir="$ORCA_MAC_DIR"
         ;;
 esac
 
@@ -247,6 +255,10 @@ if [ -z "$PREFIX" ]; then
             else
                 PREFIX="$client_native_dir"
             fi
+            ;;
+        Darwin)
+            # wx StandardPaths user data dir on macOS (see NETWORK_PLUGIN.md).
+            PREFIX="$client_mac_dir"
             ;;
     esac
 fi
@@ -381,10 +393,13 @@ cmake "$@"
 
 case "$CLIENT_TYPE" in
     bambu_studio)
-        patch_target_conf="$STUDIO_NATIVE_DIR/BambuStudio.conf"
+        case "$(uname -s)" in
+            Darwin) patch_target_conf="$STUDIO_MAC_DIR/BambuStudio.conf" ;;
+            *)        patch_target_conf="$STUDIO_NATIVE_DIR/BambuStudio.conf" ;;
+        esac
         ;;
     orca_slicer)
-        patch_target_conf="$PREFIX/OrcaSlicer.conf"
+        patch_target_conf="${PREFIX}/OrcaSlicer.conf"
         ;;
 esac
 

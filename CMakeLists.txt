@@ -651,7 +651,7 @@ endif()
 # time inside a CMake script-mode interpreter, so the file is allowed
 # to use string(JSON), file(READ/WRITE), foreach, etc. just like a
 # regular CMakeLists.
-if(OBN_PATCH_CLIENT_CONF AND ((UNIX AND NOT APPLE) OR WIN32))
+if(OBN_PATCH_CLIENT_CONF AND (UNIX OR WIN32))
     set(_obn_patch_out
         "${CMAKE_CURRENT_BINARY_DIR}/patch_${OBN_CLIENT_TYPE}_conf.cmake")
     configure_file("${OBN_CLIENT_CONF_PATCH_SCRIPT}"

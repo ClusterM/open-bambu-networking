@@ -255,10 +255,20 @@ if [ -n "$SO_PATH" ]; then
         printf '  [FAIL] %s does not exist; build the plugin first.\n' "$SO_PATH"
         FAIL=1
     else
-        nm -D --defined-only "$SO_PATH" 2>/dev/null \
-            | awk '$2=="T" || $2=="W" {print $3}' \
-            | grep -E '^bambu_network_' \
-            | sort -u > "$WORK/so_symbols.txt"
+        UNAME_S=$(uname -s 2>/dev/null || printf '%s' '')
+        if [ "$UNAME_S" = Darwin ]; then
+            # Mach-O: no ELF dynamic symtab; -gU lists globals defined in the image.
+            nm -gU "$SO_PATH" 2>/dev/null \
+                | awk '{print $NF}' \
+                | sed 's/^_//' \
+                | grep -E '^bambu_network_' \
+                | sort -u > "$WORK/so_symbols.txt"
+        else
+            nm -D --defined-only "$SO_PATH" 2>/dev/null \
+                | awk '$2=="T" || $2=="W" {print $3}' \
+                | grep -E '^bambu_network_' \
+                | sort -u > "$WORK/so_symbols.txt"
+        fi
         report_missing "$(basename "$SO_PATH") exports every snapshot symbol" \
             "$SNAP/symbols.txt" "$WORK/so_symbols.txt" \
             "Some bambu_network_* symbols declared in the snapshot are NOT exported by the built .so. Studio would crash when dlsym returns NULL." \
