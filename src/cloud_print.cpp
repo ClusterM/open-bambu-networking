@@ -43,6 +43,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_job.hpp"
+#include "obn/print_params_ftp_prefs.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -728,6 +729,8 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             if (!folder.empty() && folder.back() != '/') folder += '/';
             if (!folder.empty() && folder.front() == '/') folder.erase(0, 1);
             lan_remote_path = "/" + folder + remote_name;
+
+            print_params_set_use_ssl_for_ftp(p.use_ssl_for_ftp);
 
             std::uint64_t total = 0;
             std::string ca_file = bambu_ca_bundle_path();

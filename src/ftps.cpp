@@ -747,11 +747,17 @@ void Client::quit()
 {
     if (!p_) return;
     if (obn::os::socket_valid(p_->ctrl_fd)) {
-        // Best-effort: send QUIT and drain the 221 reply.
-        std::string wire = "QUIT\r\n";
+        // Best-effort: send QUIT and drain the 221 reply. Use a short
+        // timeout so an unresponsive peer cannot stall teardown for the
+        // full control_timeout_ms used during transfers.
+        constexpr int kQuitTimeoutMs  = 1000;
+        const int     prev_timeout_ms = p_->control_timeout_ms;
+        p_->control_timeout_ms        = kQuitTimeoutMs;
+        std::string wire              = "QUIT\r\n";
         p_->ctrl_write(wire.data(), wire.size());
         std::string body;
         p_->read_reply(&body);
+        p_->control_timeout_ms = prev_timeout_ms;
     }
     if (p_->ctrl_ssl) {
         SSL_shutdown(p_->ctrl_ssl);

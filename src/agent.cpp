@@ -15,6 +15,7 @@
 #include "obn/cover_server.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/print_params_ftp_prefs.hpp"
 #include "obn/ssdp.hpp"
 
 namespace obn {
@@ -98,6 +99,8 @@ int Agent::connect_printer(std::string dev_id,
 
 int Agent::disconnect_printer()
 {
+    print_params_set_use_ssl_for_ftp(true);
+
     std::unique_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -506,7 +509,8 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         }
         if (!host.empty()) {
             cover_cache::ensure(host, user, pass, ca,
-                                subtask_name, plate_idx, cover_version);
+                                  print_params_get_use_ssl_for_ftp(),
+                                  subtask_name, plate_idx, cover_version);
         }
     }
 

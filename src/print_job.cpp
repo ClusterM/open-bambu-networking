@@ -21,6 +21,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/ftps.hpp"
 #include "obn/log.hpp"
+#include "obn/print_params_ftp_prefs.hpp"
 
 #include <algorithm>
 #include <array>
@@ -468,6 +469,8 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
              params.filename.c_str(), params.project_name.c_str(),
              params.task_use_ams ? 1 : 0);
 
+    print_params_set_use_ssl_for_ftp(params.use_ssl_for_ftp);
+
     if (params.dev_ip.empty() || params.password.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
@@ -593,6 +596,8 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
              params.dst_file.c_str(), params.plate_index,
              params.task_use_ams ? 1 : 0);
 
+    print_params_set_use_ssl_for_ftp(params.use_ssl_for_ftp);
+
     if (params.dev_id.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
@@ -661,6 +666,9 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
 {
     OBN_INFO("send_gcode_to_sdcard dev=%s ip=%s file=%s",
              params.dev_id.c_str(), params.dev_ip.c_str(), params.filename.c_str());
+
+    print_params_set_use_ssl_for_ftp(params.use_ssl_for_ftp);
+
     if (params.dev_ip.empty() || params.password.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,

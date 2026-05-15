@@ -334,6 +334,7 @@ add_library(bambu_networking SHARED
     src/ftps.cpp
     src/http_client.cpp
     src/json_lite.cpp
+    src/print_params_ftp_prefs.cpp
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
@@ -717,6 +718,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/lan_session.cpp
         src/log.cpp
         src/mqtt_client.cpp
+        src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
         src/ssdp.cpp
         src/zip_reader.cpp)

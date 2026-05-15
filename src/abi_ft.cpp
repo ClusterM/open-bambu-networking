@@ -57,6 +57,7 @@
 #if OBN_FT_FTPS_FASTPATH
 #include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/print_params_ftp_prefs.hpp"
 #endif
 
 extern "C" {
@@ -308,10 +309,14 @@ std::string tunnel_ensure_ftp(FT_Tunnel* t)
     std::lock_guard<std::mutex> lk(t->ftp_mu);
     if (t->ftp) return {};
 
+    const bool ftp_tls = obn::print_params_get_use_ssl_for_ftp();
+
     obn::ftps::ConnectConfig cfg;
     cfg.host     = t->lan.ip;
+    cfg.port     = ftp_tls ? 990 : 21;
     cfg.username = t->lan.user.empty() ? std::string{"bblp"} : t->lan.user;
     cfg.password = t->lan.password;
+    cfg.use_tls  = ftp_tls;
     // We don't have Agent's CA bundle visible from the C ABI; the
     // printer's self-signed cert can't be verified without it anyway.
     // Same trade-off the print job makes when no cert folder is set.

@@ -46,8 +46,9 @@ std::string path_for(const std::string& subtask_name,
                      const std::string& version = {});
 
 // Background fetcher: if the file at path_for(...) doesn't already exist,
-// spawn a detached thread that connects to `host` via FTPS using the
-// printer's LAN credentials (`user`/`password`), downloads
+// spawn a detached thread that connects to `host` (FTP or implicit TLS per
+// `use_ssl_for_ftp`, consistent with PrintParams) using the printer's LAN
+// credentials (`user`/`password`), downloads
 // /cache/<subtask_name>{.gcode.3mf,.3mf}, parses the ZIP central
 // directory, extracts Metadata/plate_<plate_idx>.png (falling back to
 // plate_1.png) and atomically writes it to disk.
@@ -56,10 +57,13 @@ std::string path_for(const std::string& subtask_name,
 // the same (name,plate,version) while a previous fetch is still in
 // flight is a no-op. A different `version` for the same name forces a
 // re-fetch even if a stale PNG is still on disk.
+// `use_ssl_for_ftp` comes from the last PrintParams seen on this agent
+// (see print_params_ftp_prefs).
 void ensure(const std::string& host,
             const std::string& user,
             const std::string& password,
             const std::string& ca_file,
+            bool               use_ssl_for_ftp,
             const std::string& subtask_name,
             int                plate_idx,
             const std::string& version = {});

@@ -84,6 +84,7 @@ bool download_ftps_file(const std::string& host,
                         const std::string& user,
                         const std::string& password,
                         const std::string& ca_file,
+                        bool use_ssl_for_ftp,
                         const std::vector<std::string>& remote_paths,
                         std::vector<std::uint8_t>* out,
                         std::string* picked_path)
@@ -92,9 +93,11 @@ bool download_ftps_file(const std::string& host,
 
     obn::ftps::ConnectConfig cfg;
     cfg.host     = host;
+    cfg.port     = use_ssl_for_ftp ? 990 : 21;
     cfg.username = user.empty() ? std::string{"bblp"} : user;
     cfg.password = password;
     cfg.ca_file  = ca_file;
+    cfg.use_tls  = use_ssl_for_ftp;
 
     obn::ftps::Client c;
     if (std::string err = c.connect(cfg); !err.empty()) {
@@ -160,6 +163,7 @@ void fetch_worker(std::string host,
                   std::string user,
                   std::string password,
                   std::string ca_file,
+                  bool        use_ssl_for_ftp,
                   std::string subtask_name,
                   int         plate_idx,
                   std::string version,
@@ -211,8 +215,8 @@ void fetch_worker(std::string host,
 
     std::vector<std::uint8_t> zipbuf;
     std::string picked;
-    if (download_ftps_file(host, user, password, ca_file, candidates,
-                           &zipbuf, &picked)) {
+    if (download_ftps_file(host, user, password, ca_file, use_ssl_for_ftp,
+                           candidates, &zipbuf, &picked)) {
         OBN_DEBUG("cover_cache: fetched %s (%zu bytes)",
                   picked.c_str(), zipbuf.size());
     }
@@ -319,6 +323,7 @@ void ensure(const std::string& host,
             const std::string& user,
             const std::string& password,
             const std::string& ca_file,
+            bool               use_ssl_for_ftp,
             const std::string& subtask_name,
             int                plate_idx,
             const std::string& version)
@@ -337,7 +342,8 @@ void ensure(const std::string& host,
     if (!claim_inflight(key)) return; // another worker is already on it.
 
     std::thread(fetch_worker, host, user, password, ca_file,
-                subtask_name, plate_idx, version, std::move(key)).detach();
+                use_ssl_for_ftp, subtask_name, plate_idx, version,
+                std::move(key)).detach();
 }
 
 } // namespace obn::cover_cache
