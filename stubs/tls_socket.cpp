@@ -181,7 +181,8 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
                                                    obn::lan_tls::serial_env_wait_ms());
         }
         if (!ca_file || !*ca_file) {
-            obn::source::set_last_error("OBN_LAN_TLS_CA_FILE not set");
+            obn::source::set_last_error(
+                "OBN_LAN_TLS_CA_FILE not set (check obn.lan_tls.env in config dir)");
             return -1;
         }
         if (!serial || !*serial) {

@@ -10,7 +10,9 @@ namespace obn::lan_tls {
 // True unless OBN_SKIP_TLS_VERIFY is 1/true/yes/y/t.
 bool verify_enabled();
 
-// In-memory registry (libbambu_networking). Each update syncs to process env.
+// In-memory registry (libbambu_networking). Each update syncs to process env
+// and <config_dir>/obn.lan_tls.env for libBambuSource (separate dlopen).
+void registry_set_config_dir(const std::string& dir);
 void registry_set_ca_file(const std::string& path);
 void registry_put_ip_serial(const std::string& ip, const std::string& serial);
 // Snapshotted device leaf PEM (install_device_cert); trust anchor supplement.
@@ -30,7 +32,7 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
 std::string merged_trust_bundle_path(const std::string& ca_file,
                                      const std::string& peer_cert_file);
 
-// Process env (OBN_LAN_TLS_CA_FILE) — IPC from libbambu_networking.
+// Process env or <config_dir>/obn.lan_tls.env — IPC from libbambu_networking.
 const char* resolve_lan_ca_file();
 
 // Process env (OBN_LAN_TLS_PEER_<ip>) — IPC from libbambu_networking.

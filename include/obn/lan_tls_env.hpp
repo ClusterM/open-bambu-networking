@@ -19,10 +19,12 @@ namespace obn::lan_tls {
 const char* env_var_get(const char* key);
 
 inline constexpr const char* kEnvCaFile       = "OBN_LAN_TLS_CA_FILE";
+inline constexpr const char* kEnvConfigDir    = "OBN_CONFIG_DIR";
 inline constexpr const char* kEnvIpPrefix     = "OBN_LAN_TLS_IP_";
 inline constexpr const char* kEnvPeerPrefix   = "OBN_LAN_TLS_PEER_";
 inline constexpr const char* kEnvSkipVerify   = "OBN_SKIP_TLS_VERIFY";
 inline constexpr const char* kEnvSerialWaitMs = "OBN_LAN_TLS_SERIAL_WAIT_MS";
+inline constexpr const char* kLanTlsStateFile = "obn.lan_tls.env";
 
 inline constexpr int kDefaultSerialEnvWaitMs = 5000;
 inline constexpr int kSerialEnvPollMs        = 100;

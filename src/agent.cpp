@@ -837,6 +837,7 @@ void Agent::set_config_dir(std::string dir)
     // once during plugin init, before any user-facing ABI.
     std::string cfg = config_dir();
     if (!cfg.empty()) {
+        obn::lan_tls::registry_set_config_dir(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
         hydrate_session();

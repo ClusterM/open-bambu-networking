@@ -5,10 +5,12 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #include <filesystem>
 
@@ -29,6 +31,7 @@ namespace obn::lan_tls {
 namespace {
 
 std::mutex g_mu;
+std::string g_config_dir;
 std::string g_ca_file;
 std::unordered_map<std::string, std::string> g_ip_to_serial;
 std::unordered_map<std::string, std::string> g_ip_to_peer_cert;
@@ -51,6 +54,122 @@ bool set_env_var(const char* key, const char* value)
     return ::setenv(key, value, /*overwrite=*/1) == 0;
 }
 #endif
+
+const char* env_var_get_os(const char* key)
+{
+    if (!key || !*key) return nullptr;
+#if defined(_WIN32)
+    thread_local std::string buf;
+    buf.assign(32768, '\0');
+    const DWORD n = ::GetEnvironmentVariableA(
+        key, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return nullptr;
+    buf.resize(n);
+    return buf.c_str();
+#else
+    const char* v = std::getenv(key);
+    return (v && *v) ? v : nullptr;
+#endif
+}
+
+bool is_lan_tls_ipc_key(const char* key)
+{
+    return key && std::strncmp(key, "OBN_LAN_TLS_", 12) == 0;
+}
+
+std::vector<std::filesystem::path> state_file_search_paths()
+{
+    std::vector<std::filesystem::path> out;
+    auto add = [&](const std::filesystem::path& base) {
+        if (base.empty()) return;
+        out.push_back(base / kLanTlsStateFile);
+    };
+    if (!g_config_dir.empty()) add(g_config_dir);
+    if (const char* cfg = env_var_get_os(kEnvConfigDir)) add(cfg);
+#if defined(_WIN32)
+    if (const char* appdata = std::getenv("APPDATA")) {
+        add(std::filesystem::path(appdata) / "OrcaSlicer");
+        add(std::filesystem::path(appdata) / "BambuStudio");
+    }
+#else
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME")) {
+        add(std::filesystem::path(xdg) / "OrcaSlicer");
+        add(std::filesystem::path(xdg) / "BambuStudio");
+    }
+    if (const char* home = std::getenv("HOME")) {
+        add(std::filesystem::path(home) / ".config" / "OrcaSlicer");
+        add(std::filesystem::path(home) / ".config" / "BambuStudio");
+    }
+#endif
+    return out;
+}
+
+bool apply_state_line(const std::string& line)
+{
+    if (line.empty() || line[0] == '#') return false;
+    const auto eq = line.find('=');
+    if (eq == std::string::npos || eq == 0) return false;
+    const std::string key = line.substr(0, eq);
+    const std::string val = line.substr(eq + 1);
+    if (key.empty()) return false;
+    return set_env_var(key.c_str(), val.c_str());
+}
+
+void hydrate_env_from_state_file_once()
+{
+    static std::once_flag once;
+    std::call_once(once, []() {
+        for (const auto& path : state_file_search_paths()) {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(path, ec)) continue;
+            std::ifstream in(path);
+            if (!in) continue;
+            std::string line;
+            while (std::getline(in, line)) {
+                (void)apply_state_line(line);
+            }
+            OBN_INFO("lan_tls: hydrated env from %s", path.string().c_str());
+            return;
+        }
+    });
+}
+
+void write_state_file_locked()
+{
+    if (g_config_dir.empty()) return;
+    const std::filesystem::path out = std::filesystem::path(g_config_dir) / kLanTlsStateFile;
+    const std::filesystem::path tmp = out.string() + ".tmp";
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f) {
+        OBN_WARN("lan_tls: cannot write %s", tmp.string().c_str());
+        return;
+    }
+    f << "# Open Bambu Networking LAN TLS IPC (auto-generated)\n";
+    if (!g_ca_file.empty()) {
+        f << kEnvCaFile << '=' << g_ca_file << '\n';
+    }
+    for (const auto& [ip, serial] : g_ip_to_serial) {
+        if (serial.empty()) continue;
+        f << env_key_for_ip(ip) << '=' << serial << '\n';
+    }
+    for (const auto& [ip, path] : g_ip_to_peer_cert) {
+        if (path.empty()) continue;
+        f << peer_env_key_for_ip(ip) << '=' << path << '\n';
+    }
+    if (!f) {
+        OBN_WARN("lan_tls: write failed for %s", tmp.string().c_str());
+        return;
+    }
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp, out, ec);
+    if (ec) {
+        OBN_WARN("lan_tls: rename %s -> %s failed", tmp.string().c_str(),
+                 out.string().c_str());
+        return;
+    }
+    OBN_DEBUG("lan_tls: wrote %s", out.string().c_str());
+}
 
 void sync_ca_env_locked()
 {
@@ -79,6 +198,14 @@ void sync_peer_env_locked(const std::string& ip, const std::string& path)
     }
 }
 
+void sync_registry_locked()
+{
+    sync_ca_env_locked();
+    for (const auto& [ip, serial] : g_ip_to_serial) sync_ip_env_locked(ip, serial);
+    for (const auto& [ip, path] : g_ip_to_peer_cert) sync_peer_env_locked(ip, path);
+    write_state_file_locked();
+}
+
 void warn_skip_once()
 {
     if (g_skip_warn_logged) return;
@@ -91,18 +218,10 @@ void warn_skip_once()
 const char* env_var_get(const char* key)
 {
     if (!key || !*key) return nullptr;
-#if defined(_WIN32)
-    thread_local std::string buf;
-    buf.assign(32768, '\0');
-    const DWORD n = ::GetEnvironmentVariableA(
-        key, buf.data(), static_cast<DWORD>(buf.size()));
-    if (n == 0 || n >= buf.size()) return nullptr;
-    buf.resize(n);
-    return buf.c_str();
-#else
-    const char* v = std::getenv(key);
-    return (v && *v) ? v : nullptr;
-#endif
+    if (const char* v = env_var_get_os(key)) return v;
+    if (!is_lan_tls_ipc_key(key)) return nullptr;
+    hydrate_env_from_state_file_once();
+    return env_var_get_os(key);
 }
 
 bool verify_enabled()
@@ -114,12 +233,27 @@ bool verify_enabled()
     return true;
 }
 
+void registry_set_config_dir(const std::string& dir)
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_config_dir = dir;
+    if (!dir.empty()) {
+        (void)set_env_var(kEnvConfigDir, dir.c_str());
+    }
+    sync_registry_locked();
+    OBN_DEBUG("lan_tls: config_dir=%s", dir.c_str());
+}
+
 void registry_set_ca_file(const std::string& path)
 {
     std::lock_guard<std::mutex> lk(g_mu);
     g_ca_file = path;
-    sync_ca_env_locked();
-    OBN_DEBUG("lan_tls: ca_file=%s", path.c_str());
+    sync_registry_locked();
+    if (path.empty()) {
+        OBN_WARN("lan_tls: ca_file empty (printer.cer missing?)");
+    } else {
+        OBN_INFO("lan_tls: ca_file=%s", path.c_str());
+    }
 }
 
 void registry_put_ip_serial(const std::string& ip, const std::string& serial)
@@ -127,7 +261,7 @@ void registry_put_ip_serial(const std::string& ip, const std::string& serial)
     if (ip.empty() || serial.empty()) return;
     std::lock_guard<std::mutex> lk(g_mu);
     g_ip_to_serial[ip] = serial;
-    sync_ip_env_locked(ip, serial);
+    sync_registry_locked();
     OBN_DEBUG("lan_tls: ip=%s serial=%s", ip.c_str(), serial.c_str());
 }
 
@@ -137,11 +271,10 @@ void registry_set_peer_cert(const std::string& ip, const std::string& path)
     std::lock_guard<std::mutex> lk(g_mu);
     if (path.empty()) {
         g_ip_to_peer_cert.erase(ip);
-        sync_peer_env_locked(ip, "");
-        return;
+    } else {
+        g_ip_to_peer_cert[ip] = path;
     }
-    g_ip_to_peer_cert[ip] = path;
-    sync_peer_env_locked(ip, path);
+    sync_registry_locked();
     OBN_DEBUG("lan_tls: ip=%s peer_cert=%s", ip.c_str(), path.c_str());
 }
 
