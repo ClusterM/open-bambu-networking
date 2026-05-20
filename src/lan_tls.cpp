@@ -25,6 +25,7 @@
 #  include <windows.h>
 #else
 #  include <cerrno>
+#  include <sys/stat.h>
 #  include <unistd.h>
 #endif
 
@@ -119,8 +120,20 @@ bool apply_state_line(const std::string& line)
     const std::string key = line.substr(0, eq);
     const std::string val = line.substr(eq + 1);
     if (key.empty()) return false;
+    if (key != kEnvConfigDir && !is_lan_tls_ipc_key(key.c_str())) return false;
     return set_env_var(key.c_str(), val.c_str());
 }
+
+#if !defined(_WIN32)
+void restrict_user_readwrite(const std::filesystem::path& path)
+{
+    if (path.empty()) return;
+    if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+        OBN_WARN("lan_tls: chmod(0600) failed on %s: %s",
+                 path.c_str(), std::strerror(errno));
+    }
+}
+#endif
 
 void hydrate_env_from_state_file_once()
 {
@@ -184,6 +197,9 @@ void write_state_file_locked()
         fs::remove(tmp, rmec);
         return;
     }
+#if !defined(_WIN32)
+    restrict_user_readwrite(out);
+#endif
     OBN_TRACE("lan_tls: wrote %s", out.string().c_str());
 }
 

@@ -28,7 +28,7 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
                               std::string*       err);
 
 // Build a temp PEM file with ca_file + peer_cert (for mosquitto_tls_set).
-// Returns ca_file when peer is empty; empty string on I/O failure.
+// Returns ca_file when peer is empty or when merge/temp-file I/O fails.
 std::string merged_trust_bundle_path(const std::string& ca_file,
                                      const std::string& peer_cert_file);
 

@@ -171,21 +171,24 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
     init_once();
 
     const bool want_verify = !obn::lan_tls::skip_verify_from_env();
-    const char* ca_file    = obn::lan_tls::resolve_lan_ca_file();
-    const char* serial     = nullptr;
+    std::string ca_path;
+    std::string serial_str;
     if (want_verify) {
-        if (expected_serial && *expected_serial) {
-            serial = expected_serial;
-        } else {
-            serial = obn::lan_tls::wait_env_serial(host.c_str(),
-                                                   obn::lan_tls::serial_env_wait_ms());
+        if (const char* ca = obn::lan_tls::resolve_lan_ca_file()) {
+            ca_path = ca;
         }
-        if (!ca_file || !*ca_file) {
+        if (expected_serial && *expected_serial) {
+            serial_str = expected_serial;
+        } else if (const char* s = obn::lan_tls::wait_env_serial(
+                       host.c_str(), obn::lan_tls::serial_env_wait_ms())) {
+            serial_str = s;
+        }
+        if (ca_path.empty()) {
             obn::source::set_last_error(
                 "OBN_LAN_TLS_CA_FILE not set (check obn.lan_tls.env in config dir)");
             return -1;
         }
-        if (!serial || !*serial) {
+        if (serial_str.empty()) {
             char msg[256];
             std::snprintf(msg, sizeof(msg),
                           "no serial for %s after %dms (key=%s)",
@@ -195,14 +198,21 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
             return -1;
         }
     }
-    const char* peer_cert = obn::lan_tls::resolve_lan_peer_cert(
-        host.c_str(), serial);
+    std::string peer_path;
+    if (want_verify) {
+        if (const char* peer = obn::lan_tls::resolve_lan_peer_cert(
+                host.c_str(), serial_str.c_str())) {
+            peer_path = peer;
+        }
+    }
 
     SSL_CTX* ctx = nullptr;
     bool     owned_ctx = false;
     if (want_verify) {
         std::string err;
-        ctx = make_verify_ctx(ca_file, peer_cert, err);
+        ctx = make_verify_ctx(ca_path.c_str(),
+                              peer_path.empty() ? nullptr : peer_path.c_str(),
+                              err);
         if (!ctx) {
             obn::source::set_last_error(err.c_str());
             return -1;
@@ -230,7 +240,7 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
         return -1;
     }
 
-    const char* sni = want_verify ? serial : host.c_str();
+    const char* sni = want_verify ? serial_str.c_str() : host.c_str();
     SSL_set_fd(ssl, static_cast<int>(fd));
     SSL_set_tlsext_host_name(ssl, sni);
     if (SSL_connect(ssl) != 1) {
@@ -241,7 +251,7 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
         return -1;
     }
 
-    if (want_verify && !verify_peer_cn(ssl, serial)) {
+    if (want_verify && !verify_peer_cn(ssl, serial_str.c_str())) {
         obn::source::set_last_error("TLS hostname verify failed");
         SSL_free(ssl);
         obn::os::close_socket(fd);

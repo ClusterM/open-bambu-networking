@@ -16,6 +16,8 @@
 namespace obn::lan_tls {
 
 // Platform-correct env read (GetEnvironmentVariableA on Windows, getenv elsewhere).
+// The returned pointer is valid only until the next env_var_get() on this thread
+// (Windows uses one thread_local buffer). Copy to std::string before another read.
 const char* env_var_get(const char* key);
 
 inline constexpr const char* kEnvCaFile       = "OBN_LAN_TLS_CA_FILE";
