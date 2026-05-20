@@ -1,0 +1,28 @@
+#pragma once
+
+#include <optional>
+#include <string>
+
+typedef struct ssl_ctx_st SSL_CTX;
+
+namespace obn::lan_tls {
+
+// True unless OBN_SKIP_TLS_VERIFY is 1/true/yes/y/t.
+bool verify_enabled();
+
+// In-memory registry (libbambu_networking). Each update syncs to process env.
+void registry_set_ca_file(const std::string& path);
+void registry_put_ip_serial(const std::string& ip, const std::string& serial);
+// Snapshotted device leaf PEM (install_device_cert); trust anchor supplement.
+void registry_set_peer_cert(const std::string& ip, const std::string& path);
+
+std::string registry_ca_file();
+std::optional<std::string> registry_lookup_serial(const std::string& ip);
+
+// Load printer.cer (+ optional peer leaf), enable VERIFY_PEER + PARTIAL_CHAIN.
+bool configure_lan_ssl_verify(SSL_CTX*           ctx,
+                              const std::string& ca_file,
+                              const std::string& peer_cert_file,
+                              std::string*       err);
+
+} // namespace obn::lan_tls

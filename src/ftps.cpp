@@ -1,6 +1,8 @@
 #include "obn/ftps.hpp"
 
 #include "ftps_parse.hpp"
+#include "obn/lan_tls.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
 
@@ -25,6 +27,7 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #include <algorithm>
 #include <atomic>
@@ -70,6 +73,23 @@ std::string openssl_last_error()
     ERR_error_string_n(e, buf, sizeof(buf));
     ERR_clear_error();
     return buf;
+}
+
+bool verify_peer_cn(SSL* ssl, const std::string& expected_cn, std::string& err)
+{
+    X509* cert = SSL_get1_peer_certificate(ssl);
+    if (!cert) {
+        err = "no peer certificate";
+        return false;
+    }
+    const int ok = X509_check_host(cert, expected_cn.c_str(),
+                                   expected_cn.size(), 0, nullptr);
+    X509_free(cert);
+    if (ok != 1) {
+        err = "certificate CN/host mismatch (expected " + expected_cn + ")";
+        return false;
+    }
+    return true;
 }
 
 int wait_fd(socket_t fd, short events, int timeout_ms)
@@ -226,6 +246,7 @@ struct Client::Impl {
     SSL*     ctrl_ssl   = nullptr;
     socket_t ctrl_fd    = kInvalidSocket;
     std::string host;
+    std::string tls_verify_hostname;
     int      control_timeout_ms = 10000;
     int      data_timeout_ms    = 60000;
     bool     use_tls            = true;
@@ -347,6 +368,7 @@ std::string Client::connect_transport(const ConnectConfig& cfg)
     p_->control_timeout_ms = cfg.control_timeout_s * 1000;
     p_->data_timeout_ms    = cfg.data_timeout_s * 1000;
     p_->host               = cfg.host;
+    p_->tls_verify_hostname = cfg.tls_verify_hostname;
     p_->use_tls            = cfg.use_tls;
     // Clear any stale read buffer left from a previous session.
     p_->ctrl_buf.clear();
@@ -357,35 +379,59 @@ std::string Client::connect_transport(const ConnectConfig& cfg)
     p_->ctrl_fd = fd;
 
     if (cfg.use_tls) {
+        const bool want_verify = obn::lan_tls::verify_enabled()
+                                 && !cfg.tls_verify_hostname.empty();
+        if (obn::lan_tls::verify_enabled() && cfg.tls_verify_hostname.empty()) {
+            return "TLS verify requires printer serial (tls_verify_hostname)";
+        }
+        if (want_verify && cfg.ca_file.empty()) {
+            return "TLS verify requires ca_file (printer.cer)";
+        }
+
         p_->ctx = SSL_CTX_new(TLS_client_method());
         if (!p_->ctx) return "SSL_CTX_new: " + openssl_last_error();
         SSL_CTX_set_options(p_->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
-        // Bambu's firmware presents TLS 1.2-era ciphers; leave defaults.
-        // Printer cert has no matching SAN for the IP, so we always skip
-        // hostname verification. Chain verification is enabled only if a CA
-        // bundle was provided.
-        if (!cfg.ca_file.empty()) {
-            if (SSL_CTX_load_verify_locations(p_->ctx, cfg.ca_file.c_str(), nullptr) != 1) {
-                OBN_WARN("ftps: load_verify_locations(%s) failed: %s (falling back to no-verify)",
-                         cfg.ca_file.c_str(), openssl_last_error().c_str());
-                SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
-            } else {
-                SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_PEER, nullptr);
+
+        const char* sni = cfg.host.c_str();
+        if (!cfg.tls_verify_hostname.empty()) sni = cfg.tls_verify_hostname.c_str();
+
+        if (want_verify) {
+            std::string peer;
+            if (const char* p = obn::lan_tls::peer_cert_path_for_ip(cfg.host.c_str())) {
+                peer = p;
             }
+            std::string verr;
+            if (!obn::lan_tls::configure_lan_ssl_verify(
+                    p_->ctx, cfg.ca_file, peer, &verr)) {
+                return "TLS verify setup: " + verr;
+            }
+        } else if (!cfg.ca_file.empty()) {
+            if (SSL_CTX_load_verify_locations(p_->ctx, cfg.ca_file.c_str(), nullptr) != 1) {
+                OBN_WARN("ftps: load_verify_locations(%s) failed: %s (no-verify mode)",
+                         cfg.ca_file.c_str(), openssl_last_error().c_str());
+            }
+            SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
         } else {
             SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
         }
-        // Bambu firmware uses X25519 + session tickets and is happy with TLS
-        // session reuse; we don't need to opt-in explicitly.
         SSL_CTX_set_session_cache_mode(p_->ctx, SSL_SESS_CACHE_CLIENT);
 
         p_->ctrl_ssl = SSL_new(p_->ctx);
         if (!p_->ctrl_ssl) return "SSL_new: " + openssl_last_error();
         SSL_set_fd(p_->ctrl_ssl, static_cast<int>(fd));
-        SSL_set_tlsext_host_name(p_->ctrl_ssl, cfg.host.c_str());
+        SSL_set_tlsext_host_name(p_->ctrl_ssl, sni);
         if (drive_ssl(p_->ctrl_ssl, fd, SSL_connect, p_->control_timeout_ms) <= 0) {
             return "TLS handshake: " + openssl_last_error();
         }
+        if (want_verify) {
+            std::string verr;
+            if (!verify_peer_cn(p_->ctrl_ssl, cfg.tls_verify_hostname, verr)) {
+                return "TLS verify: " + verr;
+            }
+        }
+        OBN_DEBUG("ftps: TLS verify_host=%s ca=%s",
+                  cfg.tls_verify_hostname.c_str(),
+                  cfg.ca_file.c_str());
     }
 
     // Plain FTP sends the 220 banner immediately after TCP connect.
@@ -468,7 +514,9 @@ static SSL* wrap_data_tls(Client::Impl& p, SSL* ctrl_ssl, socket_t fd,
     SSL* data_ssl = SSL_new(p.ctx);
     if (!data_ssl) { err = "data SSL_new"; return nullptr; }
     SSL_set_fd(data_ssl, static_cast<int>(fd));
-    SSL_set_tlsext_host_name(data_ssl, host.c_str());
+    const char* sni = host.c_str();
+    if (!p.tls_verify_hostname.empty()) sni = p.tls_verify_hostname.c_str();
+    SSL_set_tlsext_host_name(data_ssl, sni);
     // Reuse the control channel's TLS session. Some FTPS servers
     // (pureftpd when hardened, newer vsftpd builds with
     // require_ssl_reuse=YES) refuse data channels that don't share the

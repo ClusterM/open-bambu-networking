@@ -22,10 +22,11 @@ struct ConnectConfig {
     // empty, peer verification is disabled entirely (fallback for non-
     // standard installs where the bundle is missing).
     std::string ca_file;
-    // Skip hostname verification. Printers' certs use the serial number
-    // (e.g. CN=22E8BJ610801473) as the CN, and Studio connects by IP, so
-    // hostname checks never match. Kept even when ca_file is set.
-    bool        tls_insecure = true;
+    // When non-empty and verify is enabled, passed to mosquitto_tls_verify_hostname_set
+    // (TCP still uses cfg.host). For LAN this is the printer serial (dev_id).
+    std::string tls_verify_hostname;
+    // Skip hostname verification (legacy / OBN_SKIP_TLS_VERIFY path).
+    bool        tls_insecure = false;
     // Force cert_reqs=SSL_VERIFY_NONE: SSL handshake proceeds without
     // checking that the server's certificate is signed by anything we
     // trust. Used for the cloud broker on Windows where we lack a

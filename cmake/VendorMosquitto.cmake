@@ -38,6 +38,8 @@ function(obn_vendor_mosquitto_setup)
         FetchContent_Populate(eclipse_mosquitto)
         include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoOpenSSL35Patch.cmake")
         obn_patch_mosquitto_openssl35_engine("${eclipse_mosquitto_SOURCE_DIR}")
+        include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoTlsVerifyHost.cmake")
+        obn_patch_mosquitto_tls_verify_host("${eclipse_mosquitto_SOURCE_DIR}")
     endif()
     add_subdirectory("${eclipse_mosquitto_SOURCE_DIR}" "${eclipse_mosquitto_BINARY_DIR}")
 

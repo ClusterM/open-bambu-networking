@@ -31,14 +31,15 @@
 //       -> RTSP(S) on port 322 (X1/P1S/P2S/N7 firmware protocol);
 //          routed through obn::rtsp::Passthrough (raw H.264 byte stream).
 //
-// Any extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...)
-// are ignored. The printer only cares about the auth packet (MJPG) or
+// Extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...) are
+// ignored by the printer but device= is used for LAN TLS verify (SNI +
+// CN=serial). The printer only cares about the auth packet (MJPG) or
 // the RTSP DESCRIBE/SETUP/PLAY exchange.
 //
 // Protocol summary (see OpenBambuAPI/video.md for the canonical spec):
 //
-//   1. TLS handshake over TCP on <ip>:<port>; printer cert is self-signed,
-//      we do NOT verify it (same as the stock plugin).
+//   1. TLS handshake over TCP on <ip>:<port>; chain + CN=serial verified
+//      via printer.cer unless OBN_SKIP_TLS_VERIFY is set.
 //   2. Send 80-byte auth packet:
 //        [0..3]   little-endian uint32 = 0x40          (payload size)
 //        [4..7]   little-endian uint32 = 0x3000        (type: auth)
@@ -116,10 +117,13 @@
 
 #include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/lan_tls.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/zip_reader.hpp"
 
 #include "source_log.hpp"
 #include "rtsp_passthrough.hpp"
+#include "tls_socket.hpp"
 
 #if defined(_WIN32)
 #    define OBN_EXPORT extern "C" __declspec(dllexport)
@@ -359,27 +363,13 @@ bool parse_url(const std::string& url, TunnelUrl* out)
 }
 
 // -----------------------------------------------------------------------
-// OpenSSL one-time init. Called lazily from the first Bambu_Create to
-// avoid paying the cost in Studio processes that never touch the camera.
+// OpenSSL one-time init via tls_socket (shared with RTSPS / FTPS paths).
 // -----------------------------------------------------------------------
-
-std::once_flag g_ssl_init_flag;
-SSL_CTX*       g_ssl_ctx = nullptr;
 
 void ssl_init_once()
 {
-    std::call_once(g_ssl_init_flag, []() {
-        SSL_library_init();
-        OpenSSL_add_all_algorithms();
-        SSL_load_error_strings();
-        // Stock plugin accepts any TLS1.2+ handshake from the printer's
-        // self-signed cert. We mirror that.
-        g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (g_ssl_ctx) {
-            SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_VERSION);
-            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, nullptr);
-        }
-    });
+    // Ensures OpenSSL + the shared tls_socket SSL_CTX are ready.
+    (void)obn::tls::shared_ctx();
 }
 
 // -----------------------------------------------------------------------
@@ -593,68 +583,6 @@ void tunnel_close(Tunnel* t)
     }
 }
 
-// Resolve-and-connect with a total deadline. Returns kInvalidSocket on
-// error. Mirrors obn::tls::dial() so we share Winsock-vs-POSIX shape;
-// kept local because the TLS-less MJPG path needs the raw fd before
-// SSL_new is called.
-obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
-{
-    obn::os::winsock_init_once();
-
-    addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    addrinfo* res = nullptr;
-    char port_s[16];
-    std::snprintf(port_s, sizeof(port_s), "%d", port);
-    int gai = ::getaddrinfo(host.c_str(), port_s, &hints, &res);
-    if (gai != 0 || !res) {
-#if defined(_WIN32)
-        set_last_error(::gai_strerrorA(gai));
-#else
-        set_last_error(::gai_strerror(gai));
-#endif
-        return obn::os::kInvalidSocket;
-    }
-
-    obn::os::socket_t fd = obn::os::kInvalidSocket;
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeout_ms);
-    for (auto* ai = res; ai; ai = ai->ai_next) {
-        auto raw = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        fd = static_cast<obn::os::socket_t>(raw);
-        if (!obn::os::socket_valid(fd)) { fd = obn::os::kInvalidSocket; continue; }
-        // Keep connect() from blocking forever; 5 s matches what the
-        // stock plugin uses (observed via strace).
-#if defined(_WIN32)
-        DWORD tv_ms = static_cast<DWORD>(timeout_ms);
-        ::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_SNDTIMEO,
-                     reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-        ::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_RCVTIMEO,
-                     reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
-        BOOL one_b = TRUE;
-        ::setsockopt(static_cast<SOCKET>(fd), IPPROTO_TCP, TCP_NODELAY,
-                     reinterpret_cast<const char*>(&one_b), sizeof(one_b));
-        if (::connect(static_cast<SOCKET>(fd), ai->ai_addr,
-                      static_cast<int>(ai->ai_addrlen)) == 0) break;
-#else
-        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        int one = 1;
-        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-#endif
-        obn::os::close_socket(fd);
-        fd = obn::os::kInvalidSocket;
-        if (std::chrono::steady_clock::now() > deadline) break;
-    }
-    freeaddrinfo(res);
-    if (!obn::os::socket_valid(fd)) set_last_error("connect failed");
-    return fd;
-}
-
 // Writes `len` bytes via SSL, handling short writes. Returns 0 on OK.
 int ssl_write_all(SSL* ssl, const void* buf, size_t len)
 {
@@ -733,7 +661,8 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
             t->url.host.c_str(), t->url.port, t->url.user.c_str());
 
     if (pass->start(t->url.host, t->url.port, t->url.user, t->url.passwd,
-                    t->url.path, t->url.scheme == Scheme::Rtsps) != 0) {
+                    t->url.path, t->url.scheme == Scheme::Rtsps,
+                    t->url.device) != 0) {
         return -1;
     }
 
@@ -1077,6 +1006,15 @@ std::string ensure_ftp(Tunnel* t)
     cfg.port     = 990;
     cfg.username = t->url.user.empty() ? "bblp" : t->url.user;
     cfg.password = t->url.passwd;
+    if (!obn::lan_tls::skip_verify_from_env()) {
+        if (const char* ca = std::getenv(obn::lan_tls::kEnvCaFile)) {
+            cfg.ca_file = ca;
+        }
+        if (const char* serial = obn::lan_tls::wait_env_serial(
+                cfg.host.c_str(), obn::lan_tls::serial_env_wait_ms())) {
+            cfg.tls_verify_hostname = serial;
+        }
+    }
     log_fmt(t->logger, t->log_ctx,
             "ctrl: FTPS connect host=%s user=%s", cfg.host.c_str(), cfg.username.c_str());
     std::string err = t->ftp->connect(cfg);
@@ -2097,6 +2035,9 @@ OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
             scheme_name, t->url.host.c_str(), t->url.port,
             t->url.path.c_str(), t->url.user.c_str(),
             t->url.passwd.empty() ? "(empty!)" : "***");
+    if (!t->url.device.empty() && !t->url.host.empty()) {
+        obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
+    }
     *tunnel = t;
     return Bambu_success;
 }
@@ -2123,44 +2064,15 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return open_rtsp(t);
     }
 
-    log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing %s:%d",
+    log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing tls://%s:%d",
             t->url.host.c_str(), t->url.port);
 
-    t->fd = dial(t->url.host, t->url.port, /*timeout_ms=*/5000);
-    if (!obn::os::socket_valid(t->fd)) {
-        log_fmt(t->logger, t->log_ctx, "Bambu_Open: connect failed: %s",
+    const char* serial =
+        t->url.device.empty() ? nullptr : t->url.device.c_str();
+    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
+                           &t->fd, &t->ssl, serial) != 0) {
+        log_fmt(t->logger, t->log_ctx, "Bambu_Open: TLS dial failed: %s",
                 obn::source::get_last_error());
-        return -1;
-    }
-    log_fmt(t->logger, t->log_ctx,
-            "Bambu_Open: TCP connected, fd=%lld",
-            static_cast<long long>(t->fd));
-
-    if (!g_ssl_ctx) {
-        set_last_error("SSL_CTX not ready");
-        tunnel_close(t);
-        return -1;
-    }
-    t->ssl = SSL_new(g_ssl_ctx);
-    if (!t->ssl) {
-        set_last_error("SSL_new failed");
-        tunnel_close(t);
-        return -1;
-    }
-    // SSL_set_fd takes int. Windows SOCKET fits in 32 bits in practice
-    // (Microsoft docs that as guaranteed) so the truncating cast is
-    // safe; on POSIX socket_t IS int, so this is a no-op.
-    SSL_set_fd(t->ssl, static_cast<int>(t->fd));
-    // SNI: some self-signed printer certs are issued for the device IP;
-    // set it anyway so they can still inspect it server-side.
-    SSL_set_tlsext_host_name(t->ssl, t->url.host.c_str());
-    int rc = SSL_connect(t->ssl);
-    if (rc != 1) {
-        char errbuf[256];
-        ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
-        log_fmt(t->logger, t->log_ctx,
-                "Bambu_Open: TLS handshake failed: %s", errbuf);
-        tunnel_close(t);
         return -1;
     }
 

@@ -84,6 +84,7 @@ int Passthrough::start(const std::string& host,
                        const std::string& passwd,
                        const std::string& path,
                        bool               tls,
+                       const std::string& device,
                        int                connect_timeout_ms)
 {
     auto& I = *impl_;
@@ -95,6 +96,7 @@ int Passthrough::start(const std::string& host,
     u.passwd  = passwd;
     u.path    = path;
     u.tls     = tls;
+    u.device  = device;
 
     if (I.client.start(u, connect_timeout_ms) != 0) {
         // rtsp::Client already filled set_last_error.

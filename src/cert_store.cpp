@@ -157,7 +157,8 @@ bool ensure_parent_dir(const std::string& file_path)
 bool capture_peer_cert_pem(const std::string& host,
                            int                port,
                            int                timeout_ms,
-                           const std::string& out_pem_path)
+                           const std::string& out_pem_path,
+                           const std::string& tls_sni)
 {
     init_openssl_once();
 
@@ -184,9 +185,9 @@ bool capture_peer_cert_pem(const std::string& host,
         obn::os::close_socket(fd);
         return false;
     }
-    // Set SNI so that servers multiplexing on IP route correctly. Printers
-    // ignore it but Studio's own plugin sends the dev_ip as SNI, so we match.
-    ::SSL_set_tlsext_host_name(ssl, host.c_str());
+    // SNI: prefer serial (dev_id) so firmware that routes on CN gets the right cert.
+    const std::string& sni = tls_sni.empty() ? host : tls_sni;
+    ::SSL_set_tlsext_host_name(ssl, sni.c_str());
     // SSL_set_fd takes the native int handle; on Windows SOCKET is wider than
     // int, but the socket numbers vcpkg's Winsock hands out always fit in 32
     // bits in practice. Cast through the typedef to keep the warning level

@@ -51,6 +51,8 @@ struct Url {
     std::string user    = "bblp";
     std::string passwd;
     std::string path    = "/streaming/live/1";
+    // Printer serial from ?device= (SNI + CN verify for RTSPS TLS).
+    std::string device;
     // True for rtsps:// (TLS on top of TCP). Always true for Bambu;
     // settable for unit tests and the rare custom firmware that opts
     // out.

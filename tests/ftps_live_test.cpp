@@ -5,6 +5,7 @@
 // Without OBN_UPLOAD_FILE the test only connects + LISTs the root dir.
 
 #include "obn/ftps.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 
 #include <cstdio>
@@ -24,7 +25,24 @@ int main()
     cfg.host     = env("OBN_PRINTER_IP", "10.13.1.30");
     cfg.username = env("OBN_USER", "bblp");
     cfg.password = env("OBN_ACCESS_CODE");
-    cfg.ca_file  = env("OBN_CA_FILE"); // optional
+    cfg.ca_file  = env("OBN_CA_FILE");
+    cfg.tls_verify_hostname = env("OBN_PRINTER_SERIAL");
+    if (cfg.ca_file.empty()) {
+        cfg.ca_file = obn::lan_tls::registry_ca_file();
+    }
+    if (cfg.tls_verify_hostname.empty()) {
+        if (auto s = obn::lan_tls::registry_lookup_serial(cfg.host)) {
+            cfg.tls_verify_hostname = *s;
+        }
+    }
+    if (obn::lan_tls::verify_enabled() && cfg.ca_file.empty()) {
+        std::fprintf(stderr, "set OBN_CA_FILE (path to printer.cer)\n");
+        return 2;
+    }
+    if (obn::lan_tls::verify_enabled() && cfg.tls_verify_hostname.empty()) {
+        std::fprintf(stderr, "set OBN_PRINTER_SERIAL (dev_id for TLS verify)\n");
+        return 2;
+    }
     if (cfg.password.empty()) {
         std::fprintf(stderr, "set OBN_ACCESS_CODE\n");
         return 2;

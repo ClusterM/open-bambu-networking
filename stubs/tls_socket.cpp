@@ -2,10 +2,13 @@
 
 #include "source_log.hpp"
 
+#include "obn/lan_tls.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/os_compat.hpp"
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -35,34 +38,23 @@ namespace obn::tls {
 namespace {
 
 std::once_flag g_init_flag;
-SSL_CTX*       g_ctx = nullptr;
+SSL_CTX*       g_ctx_insecure = nullptr;
 
 void init_once()
 {
     std::call_once(g_init_flag, []() {
-        // Winsock must be initialised before getaddrinfo() and friends.
-        // No-op on POSIX. Idempotent and thread-safe on Windows.
         obn::os::winsock_init_once();
 
-        // OpenSSL 1.1 made these no-ops, but they remain harmless on
-        // older libcrypto versions Studio sometimes pins.
         SSL_library_init();
         OpenSSL_add_all_algorithms();
         SSL_load_error_strings();
-        g_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_ctx) {
+        g_ctx_insecure = SSL_CTX_new(TLS_client_method());
+        if (!g_ctx_insecure) {
             obn::source::set_last_error("SSL_CTX_new failed");
             return;
         }
-        // TLS 1.0 floor: Bambu firmware is happy with anything from
-        // 1.0 upwards; pinning higher would lock out older A1 mini
-        // firmware that still negotiates TLS 1.1.
-        SSL_CTX_set_min_proto_version(g_ctx, TLS1_VERSION);
-        // No verify: every printer ships its own self-signed cert
-        // with no published CA chain. We have no anchor to verify
-        // against, so the best we can do is rely on the auth packet /
-        // RTSP credentials inside the encrypted tunnel.
-        SSL_CTX_set_verify(g_ctx, SSL_VERIFY_NONE, nullptr);
+        SSL_CTX_set_min_proto_version(g_ctx_insecure, TLS1_VERSION);
+        SSL_CTX_set_verify(g_ctx_insecure, SSL_VERIFY_NONE, nullptr);
     });
 }
 
@@ -76,23 +68,44 @@ void store_openssl_error(const char* prefix)
 }
 
 #if defined(_WIN32)
-// Windows uses gai_strerrorA from <ws2tcpip.h>; it is safe to call but
-// not thread-safe across calls. For our error-reporting purposes we
-// copy out immediately into set_last_error, so racing is fine.
-const char* gai_strerror_portable(int rc)
-{
-    return ::gai_strerrorA(rc);
-}
+const char* gai_strerror_portable(int rc) { return ::gai_strerrorA(rc); }
 #else
 const char* gai_strerror_portable(int rc) { return ::gai_strerror(rc); }
 #endif
+
+SSL_CTX* make_verify_ctx(const char* ca_file, const char* peer_cert,
+                         std::string& err)
+{
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        err = "SSL_CTX_new failed";
+        return nullptr;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_VERSION);
+    std::string peer_path = peer_cert ? peer_cert : "";
+    if (!obn::lan_tls::configure_lan_ssl_verify(ctx, ca_file, peer_path, &err)) {
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+    return ctx;
+}
+
+bool verify_peer_cn(SSL* ssl, const char* expected_cn)
+{
+    if (!expected_cn || !*expected_cn) return false;
+    X509* cert = SSL_get1_peer_certificate(ssl);
+    if (!cert) return false;
+    const int ok = X509_check_host(cert, expected_cn, std::strlen(expected_cn), 0, nullptr);
+    X509_free(cert);
+    return ok == 1;
+}
 
 } // namespace
 
 SSL_CTX* shared_ctx()
 {
     init_once();
-    return g_ctx;
+    return g_ctx_insecure;
 }
 
 obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
@@ -116,18 +129,10 @@ obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeout_ms);
     for (auto* ai = res; ai; ai = ai->ai_next) {
-        // socket() returns int on POSIX and SOCKET (uintptr_t) on Win;
-        // both fit our socket_t alias. Failure value is -1 on POSIX and
-        // INVALID_SOCKET on Win, both of which compare unequal to a
-        // valid socket via socket_valid().
         auto raw = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         fd = static_cast<obn::os::socket_t>(raw);
         if (!obn::os::socket_valid(fd)) { fd = obn::os::kInvalidSocket; continue; }
 
-        // Same coarse send/recv timeout drives both the connect attempt
-        // and downstream blocking reads; OpenSSL inherits it. Windows'
-        // SO_SNDTIMEO/SO_RCVTIMEO take a DWORD millisecond count; POSIX
-        // takes a struct timeval -- different ABI, so split here.
 #if defined(_WIN32)
         DWORD tv_ms = static_cast<DWORD>(timeout_ms);
         ::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_SNDTIMEO,
@@ -157,37 +162,92 @@ obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
 }
 
 int dial_tls(const std::string& host, int port, int timeout_ms,
-             obn::os::socket_t* out_fd, SSL** out_ssl)
+             obn::os::socket_t* out_fd, SSL** out_ssl,
+             const char* expected_serial)
 {
     *out_fd  = obn::os::kInvalidSocket;
     *out_ssl = nullptr;
 
-    SSL_CTX* ctx = shared_ctx();
-    if (!ctx) return -1;
+    init_once();
+
+    const bool want_verify = !obn::lan_tls::skip_verify_from_env();
+    const char* ca_file    = std::getenv(obn::lan_tls::kEnvCaFile);
+    const char* peer_cert  = obn::lan_tls::peer_cert_path_for_ip(host.c_str());
+    const char* serial     = nullptr;
+    if (want_verify) {
+        if (expected_serial && *expected_serial) {
+            serial = expected_serial;
+        } else {
+            serial = obn::lan_tls::wait_env_serial(host.c_str(),
+                                                   obn::lan_tls::serial_env_wait_ms());
+        }
+        if (!ca_file || !*ca_file) {
+            obn::source::set_last_error("OBN_LAN_TLS_CA_FILE not set");
+            return -1;
+        }
+        if (!serial || !*serial) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "no serial for %s after %dms (key=%s)",
+                          host.c_str(), obn::lan_tls::serial_env_wait_ms(),
+                          obn::lan_tls::env_key_for_ip(host).c_str());
+            obn::source::set_last_error(msg);
+            return -1;
+        }
+    }
+
+    SSL_CTX* ctx = nullptr;
+    bool     owned_ctx = false;
+    if (want_verify) {
+        std::string err;
+        ctx = make_verify_ctx(ca_file, peer_cert, err);
+        if (!ctx) {
+            obn::source::set_last_error(err.c_str());
+            return -1;
+        }
+        owned_ctx = true;
+    } else {
+        ctx = g_ctx_insecure;
+        if (!ctx) {
+            obn::source::set_last_error("SSL_CTX not initialized");
+            return -1;
+        }
+    }
 
     obn::os::socket_t fd = dial(host, port, timeout_ms);
-    if (!obn::os::socket_valid(fd)) return -1;
+    if (!obn::os::socket_valid(fd)) {
+        if (owned_ctx) SSL_CTX_free(ctx);
+        return -1;
+    }
 
     SSL* ssl = SSL_new(ctx);
     if (!ssl) {
         store_openssl_error("SSL_new");
         obn::os::close_socket(fd);
+        if (owned_ctx) SSL_CTX_free(ctx);
         return -1;
     }
-    // SSL_set_fd takes int. Windows SOCKETs always fit in 32 bits in
-    // practice (Microsoft documents the limit) so the truncating cast
-    // here is safe; on POSIX socket_t IS int so the cast is a no-op.
+
+    const char* sni = want_verify ? serial : host.c_str();
     SSL_set_fd(ssl, static_cast<int>(fd));
-    // SNI is required by some Bambu firmware revisions even though they
-    // never actually swap certs based on it. Setting it unconditionally
-    // is harmless and matches what OrcaSlicer's RTSP code does.
-    SSL_set_tlsext_host_name(ssl, host.c_str());
+    SSL_set_tlsext_host_name(ssl, sni);
     if (SSL_connect(ssl) != 1) {
         store_openssl_error("SSL_connect");
         SSL_free(ssl);
         obn::os::close_socket(fd);
+        if (owned_ctx) SSL_CTX_free(ctx);
         return -1;
     }
+
+    if (want_verify && !verify_peer_cn(ssl, serial)) {
+        obn::source::set_last_error("TLS hostname verify failed");
+        SSL_free(ssl);
+        obn::os::close_socket(fd);
+        if (owned_ctx) SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    if (owned_ctx) SSL_CTX_free(ctx);
 
     *out_fd  = fd;
     *out_ssl = ssl;
@@ -197,9 +257,6 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
 void close_tls(obn::os::socket_t* fd, SSL** ssl)
 {
     if (ssl && *ssl) {
-        // SSL_shutdown returns 0 on partial close, 1 on full close, -1
-        // on error. We don't care about a graceful shutdown here -- the
-        // peer is fine with a TCP RST.
         SSL_shutdown(*ssl);
         SSL_free(*ssl);
         *ssl = nullptr;
@@ -218,9 +275,6 @@ int ssl_write_all(SSL* ssl, const void* buf, std::size_t len)
         int n = SSL_write(ssl, p + sent, static_cast<int>(len - sent));
         if (n <= 0) {
             int err = SSL_get_error(ssl, n);
-            // WANT_READ during a write means the underlying handshake
-            // wants to renegotiate; loop back and OpenSSL will drive
-            // the read leg internally on the next SSL_write().
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
                 continue;
             return -1;
@@ -240,8 +294,6 @@ int ssl_read_full(SSL* ssl, void* buf, std::size_t len)
             int err = SSL_get_error(ssl, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
                 continue;
-            // ZERO_RETURN is a clean TLS close-notify; treat it as EOF
-            // only when we have at least the previous bytes intact.
             if (err == SSL_ERROR_ZERO_RETURN) return 1;
             return -1;
         }
@@ -254,8 +306,6 @@ int ssl_read_line(SSL* ssl, std::string* out, std::size_t max_len)
 {
     out->clear();
     out->reserve(128);
-    // Two-byte sliding window (last char + current char) so we can
-    // detect CRLF without a second buffer or lookahead.
     char prev = '\0';
     while (out->size() < max_len) {
         char c = '\0';
@@ -268,7 +318,6 @@ int ssl_read_line(SSL* ssl, std::string* out, std::size_t max_len)
             return -1;
         }
         if (prev == '\r' && c == '\n') {
-            // Strip the trailing CR we already pushed.
             if (!out->empty()) out->pop_back();
             return 0;
         }

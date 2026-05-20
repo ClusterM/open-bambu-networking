@@ -9,12 +9,10 @@
 // bugs in the past, hence this consolidation.
 //
 // Design:
-//   * One process-wide SSL_CTX, configured TLS 1.0+ with SSL_VERIFY_NONE
-//     (Bambu burns a different per-batch self-signed CA into every
-//     printer; verifying would just be theatre).
-//   * dial() uses SO_SNDTIMEO/SO_RCVTIMEO on the socket so subsequent
-//     SSL_read/SSL_write also honour the timeout without us having to
-//     drive a second select() loop on top of OpenSSL.
+//   * dial_tls(): LAN verify via printer.cer + serial (env or caller);
+//     OBN_SKIP_TLS_VERIFY falls back to a shared SSL_VERIFY_NONE ctx.
+//   * dial(): plain TCP; SO_SNDTIMEO/SO_RCVTIMEO on the socket so
+//     SSL_read/SSL_write honour the timeout without a select() loop.
 //   * ssl_read_full / ssl_read_line are blocking helpers tuned for
 //     RTSP-style framing -- read exactly N bytes for binary payloads,
 //     read up to CRLF for headers. Single-byte SSL_read is fine here
@@ -57,13 +55,11 @@ SSL_CTX* shared_ctx();
 obn::os::socket_t dial(const std::string& host, int port, int timeout_ms);
 
 // One-shot TLS dial: dial() + SSL_new + SSL_set_tlsext_host_name + SSL_connect.
-// On success: returns 0, *out_fd holds the connected socket, *out_ssl
-// holds the established SSL session.
-// On failure: returns -1, both out-params get cleaned up to
-// kInvalidSocket / nullptr, and obn::source::set_last_error carries
-// an OpenSSL error string.
+// expected_serial: optional printer serial from the camera URL (?device=); used
+// for SNI + CN verify when set, otherwise polled from OBN_LAN_TLS_IP_* env.
 int dial_tls(const std::string& host, int port, int timeout_ms,
-             obn::os::socket_t* out_fd, SSL** out_ssl);
+             obn::os::socket_t* out_fd, SSL** out_ssl,
+             const char* expected_serial = nullptr);
 
 // Tear down a TLS session and the underlying socket. Safe to call with
 // already-closed values; sets *fd to kInvalidSocket and *ssl to nullptr

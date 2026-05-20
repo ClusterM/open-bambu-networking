@@ -61,6 +61,7 @@ public:
               const std::string& passwd,
               const std::string& path,
               bool               tls,
+              const std::string& device = {},
               int                connect_timeout_ms = 5000);
 
     // Non-blocking pop of the next ready Annex-B sample. The caller

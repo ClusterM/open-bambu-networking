@@ -20,6 +20,9 @@
 #endif
 
 #include "obn/log.hpp"
+#include "obn/lan_tls.hpp"
+
+extern "C" int mosquitto_tls_verify_hostname_set(struct mosquitto* mosq, const char* hostname);
 
 namespace obn::mqtt {
 
@@ -150,30 +153,34 @@ int Client::connect(const ConnectConfig& cfg)
     }
 
     if (cfg.use_tls) {
-        // Three TLS modes, decided by what the caller has supplied:
-        //   1. ca_file provided -> chain verification against that bundle;
-        //      hostname check still skipped because the printer's cert CN is
-        //      its serial number, not the IP we connect by.
-        //   2. no ca_file, tls_insecure=true -> accept anything; fall back to
-        //      the distro trust store just because libmosquitto requires us
-        //      to hand it *some* CA path.
-        //   3. no ca_file, tls_insecure=false -> distro trust store with full
-        //      verification. Unlikely to work for LAN but left as an option
-        //      for future cloud use.
+        // LAN (serial hostname verify) vs cloud (public CA / system store).
+        const bool lan_hostname_verify = !cfg.tls_verify_hostname.empty();
+        const bool skip_verify =
+            cfg.tls_insecure
+            || (lan_hostname_verify && !obn::lan_tls::verify_enabled());
+
+        if (lan_hostname_verify && !skip_verify) {
+            int rc = ::mosquitto_tls_verify_hostname_set(mosq_,
+                cfg.tls_verify_hostname.c_str());
+            if (rc != MOSQ_ERR_SUCCESS) {
+                OBN_ERROR("mqtt tls_verify_hostname_set rc=%d (%s)", rc, err_str(rc));
+                return rc;
+            }
+        }
+
         const char* cafile = nullptr;
         const char* capath = nullptr;
         bool        verify_peer = false;
         if (!cfg.ca_file.empty()) {
             cafile      = cfg.ca_file.c_str();
-            // skip_chain_verify wins over verify_peer: when caller has
-            // told us the supplied cafile is just a placeholder to keep
-            // mosquitto_tls_set happy (e.g. cloud-on-Windows with the
-            // BBL cert that won't actually validate *.bambulab.com),
-            // we must NOT ask SSL_VERIFY_PEER or the handshake fails.
-            verify_peer = !cfg.tls_skip_chain_verify;
-            OBN_DEBUG("mqtt using ca bundle %s (verify_peer=%d, skip_chain=%d)",
+            verify_peer = !cfg.tls_skip_chain_verify && !skip_verify;
+            OBN_DEBUG("mqtt using ca bundle %s (verify_peer=%d, skip_chain=%d, insecure=%d)",
                       cafile, verify_peer ? 1 : 0,
-                      cfg.tls_skip_chain_verify ? 1 : 0);
+                      cfg.tls_skip_chain_verify ? 1 : 0,
+                      skip_verify ? 1 : 0);
+        } else if (lan_hostname_verify && !skip_verify) {
+            OBN_ERROR("mqtt LAN TLS verify enabled but ca_file is empty");
+            return MOSQ_ERR_TLS;
         } else {
 #if defined(_WIN32)
             // Windows has no canonical /etc/ssl trust dir and OpenSSL static
@@ -218,7 +225,7 @@ int Client::connect(const ConnectConfig& cfg)
             OBN_ERROR("mqtt tls_opts_set rc=%d (%s)", rc, err_str(rc));
             return rc;
         }
-        if (cfg.tls_insecure) {
+        if (skip_verify) {
             rc = ::mosquitto_tls_insecure_set(mosq_, true);
             if (rc != MOSQ_ERR_SUCCESS) {
                 OBN_ERROR("mqtt tls_insecure_set rc=%d (%s)", rc, err_str(rc));

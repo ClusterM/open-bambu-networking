@@ -319,23 +319,23 @@ headers for everything the project links against:
 | Component                           | Debian / Ubuntu packages                                                                             | Fedora-style packages                                                             |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | Toolchain                           | `build-essential`, `cmake`, `pkg-config`                                                             | `gcc-c++`, `cmake`, `pkgconf-pkg-config`                                          |
-| MQTT / HTTP / TLS / zlib              | `libmosquitto-dev`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `mosquitto-devel`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
+| MQTT / HTTP / TLS / zlib              | `git`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `git`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
 
 > Note  
-> `uthash-dev` is required for `--vendor-mosquitto` only (see below). Vendored mosquitto pulls in cJSON automatically; host `libcjson-dev` is not required.
+> libmosquitto is **always vendored** via FetchContent at configure time (needs `git` + network). `uthash-dev` supplies `utlist.h`; cJSON is bundled automatically.
 
 One-shot install examples:
 
 ```sh
 # Debian / Ubuntu
-sudo apt install build-essential cmake pkg-config \
-  libmosquitto-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
+sudo apt install build-essential cmake pkg-config git \
+  uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
 ```
 
 ```sh
 # Fedora
-sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
-  mosquitto-devel uthash-devel libcurl-devel openssl-devel zlib-devel
+sudo dnf install gcc-c++ cmake pkgconf-pkg-config git \
+  uthash-devel libcurl-devel openssl-devel zlib-devel
 ```
 
 #### Linux: configure, build and install
@@ -403,8 +403,9 @@ Bambu Studio for Windows is a 64-bit MSVC build (Visual Studio 2019, see
 **the plugin must be built with the same compiler and STL Studio uses** —
 i.e. MSVC from Visual Studio 2019 (toolset v142). MinGW or any libstdc++
 flavour will silently mangle types and crash on the first `bambu_network_*`
-call. C++ libraries (OpenSSL, libcurl, zlib, libmosquitto) come from
+call. C++ libraries (OpenSSL, libcurl, zlib) come from
 [vcpkg](https://github.com/microsoft/vcpkg) in manifest mode (`vcpkg.json`).
+libmosquitto is always vendored via FetchContent (same as Linux).
 
 #### Prerequisites (Windows)
 

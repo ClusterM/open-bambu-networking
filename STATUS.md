@@ -48,7 +48,7 @@ Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_li
 | `bambu_network_destroy_agent` | ✅ | Deletes the agent instance. |
 | `bambu_network_init_log` | ✅ | No-op here: log sinks are configured inside `create_agent`, before the first log line. |
 | `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache and transient state. |
-| `bambu_network_set_cert_file` | ✅ | Studio's embedded CA bundle (`slicer_base64.cer`) is loaded and reused as the HTTPS/MQTTS trust store. |
+| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder; **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
 | `bambu_network_set_country_code` | ✅ | Stored; drives cloud region selection (`api_host`, `web_host`). |
 | `bambu_network_start` | ✅ | Starts worker threads. If a cached session is present the plugin also kicks off `connect_cloud()` here — the stock call chain normally goes through `EVT_USER_LOGIN_HANDLE`, but that cascade can silently stall for cached sign-ins; starting from `start()` guarantees cloud MQTT gets initiated. |
 
