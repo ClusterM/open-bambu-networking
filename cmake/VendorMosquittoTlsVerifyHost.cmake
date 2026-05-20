@@ -7,6 +7,7 @@ function(obn_patch_mosquitto_tls_verify_host _src_root)
     endif()
 
     set(_mark "obn: tls_verify_hostname")
+    set(_partial_mark "obn: X509_V_FLAG_PARTIAL_CHAIN")
 
     set(_internal "${_src_root}/lib/mosquitto_internal.h")
     file(READ "${_internal}" _body)
@@ -30,6 +31,20 @@ function(obn_patch_mosquitto_tls_verify_host _src_root)
         string(REPLACE
             "if(tls__set_verify_hostname(mosq, host)){"
             "if(tls__set_verify_hostname(mosq, tls_host)){"
+            _body "${_body}")
+        file(WRITE "${_net}" "${_body}")
+    endif()
+
+    file(READ "${_net}" _body)
+    string(FIND "${_body}" "${_partial_mark}" _pos)
+    if(_pos LESS 0)
+        string(REPLACE
+            "#include <openssl/ui.h>"
+            "#include <openssl/ui.h>\n#include <openssl/x509v3.h> /* ${_partial_mark} */"
+            _body "${_body}")
+        string(REPLACE
+            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t}"
+            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t\tX509_VERIFY_PARAM *vpm = SSL_CTX_get0_param(mosq->ssl_ctx); /* ${_partial_mark} */\n\t\t\t\tif(vpm){\n\t\t\t\t\tX509_VERIFY_PARAM_set_flags(vpm, X509_VERIFY_PARAM_get_flags(vpm) | X509_V_FLAG_PARTIAL_CHAIN);\n\t\t\t\t}\n\t\t\t}"
             _body "${_body}")
         file(WRITE "${_net}" "${_body}")
     endif()

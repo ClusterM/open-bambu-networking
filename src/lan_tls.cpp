@@ -3,9 +3,14 @@
 #include "obn/lan_tls_env.hpp"
 #include "obn/log.hpp"
 
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
+
+#include <filesystem>
 
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -17,6 +22,7 @@
 #  include <windows.h>
 #else
 #  include <cerrno>
+#  include <unistd.h>
 #endif
 
 namespace obn::lan_tls {
@@ -149,6 +155,46 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
     }
     ::SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     return true;
+}
+
+std::string read_pem_file(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+std::string merged_trust_bundle_path(const std::string& ca_file,
+                                     const std::string& peer_cert_file)
+{
+    if (peer_cert_file.empty()) return ca_file;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(ca_file, ec)
+        || !std::filesystem::is_regular_file(peer_cert_file, ec)) {
+        return ca_file;
+    }
+    const std::string ca   = read_pem_file(ca_file);
+    const std::string peer = read_pem_file(peer_cert_file);
+    if (ca.empty() || peer.empty()) return ca_file;
+
+    std::ostringstream name;
+    name << "obn-trust-"
+#if !defined(_WIN32)
+         << ::getpid() << '-'
+#endif
+         << std::chrono::steady_clock::now().time_since_epoch().count() << ".pem";
+    std::filesystem::path out =
+        std::filesystem::temp_directory_path(ec) / name.str();
+    if (out.empty()) return ca_file;
+
+    std::ofstream f(out, std::ios::binary);
+    if (!f) return ca_file;
+    f << ca;
+    if (!ca.empty() && ca.back() != '\n') f << '\n';
+    f << peer;
+    if (!peer.empty() && peer.back() != '\n') f << '\n';
+    if (!f) return ca_file;
+    return out.string();
 }
 
 std::string registry_ca_file()

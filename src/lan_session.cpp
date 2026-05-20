@@ -92,10 +92,11 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
             if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
         } else {
             OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
-                     rc, mqtt::Client::err_str(rc));
+                     rc, obn::mqtt::Client::connack_str(rc));
             if (on_connected_)
                 on_connected_(BBL::ConnectStatusFailed,
-                              std::string("mqtt connect rc=") + mqtt::Client::err_str(rc));
+                              std::string("mqtt connect rc=")
+                                  + obn::mqtt::Client::connack_str(rc));
         }
     });
 

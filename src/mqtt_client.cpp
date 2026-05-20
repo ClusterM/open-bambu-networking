@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 
@@ -21,6 +22,7 @@
 
 #include "obn/log.hpp"
 #include "obn/lan_tls.hpp"
+#include "obn/lan_tls_env.hpp"
 
 extern "C" int mosquitto_tls_verify_hostname_set(struct mosquitto* mosq, const char* hostname);
 
@@ -52,6 +54,28 @@ void global_cleanup()
 const char* Client::err_str(int rc)
 {
     return ::mosquitto_strerror(rc);
+}
+
+namespace {
+
+const char* connack_reason(int rc)
+{
+    switch (rc) {
+    case 0: return "accepted";
+    case 1: return "unacceptable protocol version";
+    case 2: return "identifier rejected";
+    case 3: return "server unavailable";
+    case 4: return "bad username or password";
+    case 5: return "not authorized";
+    default: return "unknown connack code";
+    }
+}
+
+} // namespace
+
+const char* Client::connack_str(int rc)
+{
+    return connack_reason(rc);
 }
 
 std::string Client::detailed_err(int rc, int wsa_err)
@@ -103,8 +127,21 @@ Client::Client(std::string client_id)
     ::mosquitto_message_callback_set(mosq_, &Client::s_on_message);
 }
 
+namespace {
+
+void remove_trust_bundle_file(const std::string& path)
+{
+    if (path.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+} // namespace
+
 Client::~Client()
 {
+    remove_trust_bundle_file(merged_trust_path_);
+    merged_trust_path_.clear();
     if (mosq_) {
         if (loop_started_.load(std::memory_order_acquire)) {
             ::mosquitto_disconnect(mosq_);
@@ -171,8 +208,20 @@ int Client::connect(const ConnectConfig& cfg)
         const char* cafile = nullptr;
         const char* capath = nullptr;
         bool        verify_peer = false;
+        std::string trust_bundle;
         if (!cfg.ca_file.empty()) {
-            cafile      = cfg.ca_file.c_str();
+            trust_bundle = cfg.ca_file;
+            if (lan_hostname_verify && !skip_verify) {
+                if (const char* peer = obn::lan_tls::peer_cert_path_for_ip(cfg.host.c_str())) {
+                    trust_bundle = obn::lan_tls::merged_trust_bundle_path(
+                        cfg.ca_file, peer);
+                }
+            }
+            if (trust_bundle != cfg.ca_file) {
+                remove_trust_bundle_file(merged_trust_path_);
+                merged_trust_path_ = trust_bundle;
+            }
+            cafile      = trust_bundle.c_str();
             verify_peer = !cfg.tls_skip_chain_verify && !skip_verify;
             OBN_DEBUG("mqtt using ca bundle %s (verify_peer=%d, skip_chain=%d, insecure=%d)",
                       cafile, verify_peer ? 1 : 0,
@@ -343,9 +392,11 @@ void Client::disconnect()
         // Must match ~Client()'s force=true path: loop_stop(false) can return
         // before the network thread releases the TLS socket; immediate
         // destroy() then races (Windows: connect_async -> MOSQ_ERR_ERRNO /
-        // EBADF when Orca disconnects+reconnects LAN MQTT in one UI tick
+        // EBADF when Orca disconnects+reconnects LAN MQTT in one UI tick).
         ::mosquitto_loop_stop(mosq_, /*force=*/true);
     }
+    remove_trust_bundle_file(merged_trust_path_);
+    merged_trust_path_.clear();
 }
 
 void Client::s_on_connect(::mosquitto* /*m*/, void* obj, int rc)
@@ -353,7 +404,7 @@ void Client::s_on_connect(::mosquitto* /*m*/, void* obj, int rc)
     auto* self = static_cast<Client*>(obj);
     if (!self) return;
     self->connected_.store(rc == 0, std::memory_order_release);
-    OBN_INFO("mqtt connect callback rc=%d (%s)", rc, err_str(rc));
+    OBN_INFO("mqtt connect callback rc=%d (%s)", rc, connack_str(rc));
     OnConnectCb cb;
     {
         std::lock_guard<std::mutex> lk(self->mu_);

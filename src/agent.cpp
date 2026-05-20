@@ -53,10 +53,14 @@ int Agent::connect_printer(std::string dev_id,
     // Studio calls connect_printer() again when the user switches to a
     // different printer or re-enters the access code. Tear down any prior
     // session cleanly so we don't leak MQTT threads.
+    bool switching_printer = false;
     {
         std::unique_ptr<LanSession> prev;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (lan_session_ && lan_session_->dev_id() != dev_id) {
+                switching_printer = true;
+            }
             prev = std::move(lan_session_);
         }
         // prev.reset() happens outside the lock; destructor joins the MQTT
@@ -64,10 +68,7 @@ int Agent::connect_printer(std::string dev_id,
         // mu_.
     }
 
-    // Clearing the certified-devices cache so that if Studio re-binds to the
-    // same printer (e.g. after a firmware reboot or an access-code change)
-    // we snapshot its cert again on the very next install_device_cert() tick.
-    {
+    if (switching_printer) {
         std::lock_guard<std::mutex> lk(mu_);
         certified_devs_.clear();
     }
@@ -80,6 +81,20 @@ int Agent::connect_printer(std::string dev_id,
         if (!cfg_dir.empty()) {
             std::string peer = cert_store::device_cert_path(cfg_dir, dev_id);
             std::error_code ec;
+            bool have_peer = std::filesystem::is_regular_file(peer, ec);
+            if (use_ssl && obn::lan_tls::verify_enabled() && !have_peer) {
+                OBN_INFO("connect_printer: snapshot device cert before LAN MQTT");
+                if (cert_store::capture_peer_cert_pem(
+                        dev_ip, 8883, /*timeout_ms=*/3000, peer, dev_id)) {
+                    have_peer = std::filesystem::is_regular_file(peer, ec);
+                    if (have_peer) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        certified_devs_.insert(dev_id);
+                    }
+                } else {
+                    OBN_WARN("connect_printer: device cert snapshot failed");
+                }
+            }
             if (std::filesystem::is_regular_file(peer, ec)) {
                 obn::lan_tls::registry_set_peer_cert(dev_ip, peer);
             }
@@ -1010,6 +1025,28 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     if (cfg_dir.empty()) {
         OBN_WARN("install_device_cert dev=%s: config_dir not set", dev_id.c_str());
         return;
+    }
+
+    const std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(out_path, ec)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            certified_devs_.insert(dev_id);
+            if (!ip.empty()) {
+                obn::lan_tls::registry_set_peer_cert(ip, out_path);
+            }
+            return;
+        }
+    }
+
+    // Do not open a second TLS session to :8883 while LAN MQTT is up — the
+    // printer drops one of them (seen as mqtt rc=7 / rc=5 on Orca reconnect).
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id) {
+            return;
+        }
     }
 
     // Claim the inflight slot and launch the worker. cert_snapshot_inflight_
