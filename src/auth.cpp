@@ -10,6 +10,10 @@
 #include <filesystem>
 #include <fstream>
 
+#if !defined(_WIN32)
+#  include <sys/stat.h>
+#endif
+
 namespace obn::auth {
 
 namespace {
@@ -45,6 +49,17 @@ clock::time_point parse_iso8601(const std::string& s)
     auto t = obn::os::timegm_safe(&tm);
     return clock::from_time_t(t);
 }
+
+#if !defined(_WIN32)
+void restrict_user_readwrite(const std::string& path)
+{
+    if (path.empty()) return;
+    if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+        OBN_WARN("auth: chmod(0600) failed on %s: %s",
+                 path.c_str(), std::strerror(errno));
+    }
+}
+#endif
 
 } // namespace
 
@@ -84,6 +99,9 @@ void Store::load_locked()
     OBN_INFO("auth: loaded session for %s (user_id=%s, expires=%s)",
              s_.account.c_str(), s_.user_id.c_str(),
              to_iso8601(s_.expires_at).c_str());
+#if !defined(_WIN32)
+    restrict_user_readwrite(path_);
+#endif
 }
 
 void Store::persist_locked() const
@@ -138,6 +156,9 @@ void Store::persist_locked() const
         }
         out.close();
     }
+#if !defined(_WIN32)
+    restrict_user_readwrite(tmp);
+#endif
 #if defined(_WIN32)
     // Windows MoveFileEx semantics through std::filesystem::rename do not
     // overwrite by default. Remove the destination first so the rename
@@ -152,7 +173,11 @@ void Store::persist_locked() const
                   tmp.c_str(), path_.c_str(), ec.message().c_str());
         std::error_code rmec;
         fs::remove(tmp, rmec);
+        return;
     }
+#if !defined(_WIN32)
+    restrict_user_readwrite(path_);
+#endif
 }
 
 void Store::set(Session s)
