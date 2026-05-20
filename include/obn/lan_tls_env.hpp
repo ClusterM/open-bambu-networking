@@ -2,7 +2,11 @@
 
 // Header-only ENV IPC between libbambu_networking and libBambuSource (same
 // process, separate dlopen). Networking syncs registry -> setenv; BambuSource
-// reads via getenv.
+// reads via env_var_get().
+//
+// Windows: registry writes use SetEnvironmentVariableA AND _putenv_s; reads use
+// GetEnvironmentVariableA. Mixing SetEnvironmentVariable with getenv() does NOT
+// work — the CRT cache is not updated (wait_env_serial would spin forever).
 
 #include <chrono>
 #include <cstdlib>
@@ -10,6 +14,9 @@
 #include <thread>
 
 namespace obn::lan_tls {
+
+// Platform-correct env read (GetEnvironmentVariableA on Windows, getenv elsewhere).
+const char* env_var_get(const char* key);
 
 inline constexpr const char* kEnvCaFile       = "OBN_LAN_TLS_CA_FILE";
 inline constexpr const char* kEnvIpPrefix     = "OBN_LAN_TLS_IP_";
@@ -43,14 +50,12 @@ inline std::string peer_env_key_for_ip(const std::string& ip)
 inline const char* peer_cert_path_for_ip(const char* ip)
 {
     if (!ip || !*ip) return nullptr;
-    const std::string key = peer_env_key_for_ip(ip);
-    const char*       v   = std::getenv(key.c_str());
-    return (v && *v) ? v : nullptr;
+    return env_var_get(peer_env_key_for_ip(ip).c_str());
 }
 
 inline int serial_env_wait_ms()
 {
-    const char* v = std::getenv(kEnvSerialWaitMs);
+    const char* v = env_var_get(kEnvSerialWaitMs);
     if (!v || !*v) return kDefaultSerialEnvWaitMs;
     char* end = nullptr;
     long  ms  = std::strtol(v, &end, 10);
@@ -61,12 +66,12 @@ inline int serial_env_wait_ms()
 
 inline bool skip_verify_from_env()
 {
-    const char* v = std::getenv(kEnvSkipVerify);
+    const char* v = env_var_get(kEnvSkipVerify);
     if (!v || !*v) return false;
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
 }
 
-// Poll getenv(env_key_for_ip(ip)) until non-empty or timeout_ms elapses.
+// Poll env until non-empty or timeout_ms elapses.
 inline const char* wait_env_serial(const char* ip, int timeout_ms)
 {
     if (!ip || !*ip) return nullptr;
@@ -74,7 +79,7 @@ inline const char* wait_env_serial(const char* ip, int timeout_ms)
     const auto        deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
-        if (const char* v = std::getenv(key.c_str())) {
+        if (const char* v = env_var_get(key.c_str())) {
             if (*v) return v;
         }
         if (std::chrono::steady_clock::now() >= deadline) return nullptr;

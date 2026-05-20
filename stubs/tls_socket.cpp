@@ -171,8 +171,7 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
     init_once();
 
     const bool want_verify = !obn::lan_tls::skip_verify_from_env();
-    const char* ca_file    = std::getenv(obn::lan_tls::kEnvCaFile);
-    const char* peer_cert  = obn::lan_tls::peer_cert_path_for_ip(host.c_str());
+    const char* ca_file    = obn::lan_tls::resolve_lan_ca_file();
     const char* serial     = nullptr;
     if (want_verify) {
         if (expected_serial && *expected_serial) {
@@ -195,6 +194,8 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
             return -1;
         }
     }
+    const char* peer_cert = obn::lan_tls::resolve_lan_peer_cert(
+        host.c_str(), serial);
 
     SSL_CTX* ctx = nullptr;
     bool     owned_ctx = false;

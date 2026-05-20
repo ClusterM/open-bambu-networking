@@ -45,10 +45,34 @@ void close_lib(lib_handle_t h) { ::FreeLibrary(h); }
 
 const char* last_error_str()
 {
-    static char buf[256];
+    static char buf[512];
     DWORD err = ::GetLastError();
-    std::snprintf(buf, sizeof(buf), "win32 error %lu", static_cast<unsigned long>(err));
+    char* msg = nullptr;
+    const DWORD n = ::FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM
+            | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&msg), 0, nullptr);
+    if (n > 0 && msg) {
+        std::snprintf(buf, sizeof(buf), "win32 error %lu (%.*s)",
+                      static_cast<unsigned long>(err),
+                      static_cast<int>(n), msg);
+        ::LocalFree(msg);
+    } else {
+        std::snprintf(buf, sizeof(buf), "win32 error %lu",
+                      static_cast<unsigned long>(err));
+    }
     return buf;
+}
+
+void add_plugin_dir_to_dll_search(const char* plugin_path)
+{
+    std::string dir(plugin_path);
+    const auto pos = dir.find_last_of("\\/");
+    if (pos == std::string::npos) return;
+    dir.resize(pos);
+    // Let LoadLibrary resolve deps colocated with the plugin (CI build dir).
+    ::SetDllDirectoryA(dir.c_str());
 }
 #else
 using lib_handle_t = void*;
@@ -224,6 +248,9 @@ int main(int argc, char** argv)
         return 2;
     }
 
+#if defined(_WIN32)
+    add_plugin_dir_to_dll_search(argv[1]);
+#endif
     lib_handle_t h = open_lib(argv[1]);
     if (!h) {
         std::fprintf(stderr, "open_lib failed: %s\n", last_error_str());

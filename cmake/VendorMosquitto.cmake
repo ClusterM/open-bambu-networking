@@ -30,6 +30,12 @@ function(obn_vendor_mosquitto_setup)
     set(WITH_STATIC_LIBRARIES ON CACHE BOOL "" FORCE)
     set(WITH_PIC ON CACHE BOOL "" FORCE)
     set(WITH_LIB_CPP OFF CACHE BOOL "" FORCE)
+    # Client-only embed: skip broker/apps features that pull extra deps on Windows
+    # (LineEditing, libwebsockets, PThreads4W is still required via vcpkg pthreads).
+    set(WITH_WEBSOCKETS OFF CACHE BOOL "" FORCE)
+    set(WITH_CTRL_SHELL OFF CACHE BOOL "" FORCE)
+    set(WITH_SRV OFF CACHE BOOL "" FORCE)
+    set(INC_MEMTRACK OFF CACHE BOOL "" FORCE)
 
     # MakeAvailable = Populate + add_subdirectory; we patch sources first so
     # OpenSSL 3.5+ systems without openssl/engine.h still compile (issue #19).
@@ -40,12 +46,21 @@ function(obn_vendor_mosquitto_setup)
         obn_patch_mosquitto_openssl35_engine("${eclipse_mosquitto_SOURCE_DIR}")
         include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoTlsVerifyHost.cmake")
         obn_patch_mosquitto_tls_verify_host("${eclipse_mosquitto_SOURCE_DIR}")
+        include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoEmbedPatch.cmake")
+        obn_patch_mosquitto_common_object("${eclipse_mosquitto_SOURCE_DIR}")
     endif()
-    add_subdirectory("${eclipse_mosquitto_SOURCE_DIR}" "${eclipse_mosquitto_BINARY_DIR}")
+
+    set(_obn_saved_skip_install "${CMAKE_SKIP_INSTALL_RULES}")
+    set(CMAKE_SKIP_INSTALL_RULES TRUE)
+    add_subdirectory("${eclipse_mosquitto_SOURCE_DIR}" "${eclipse_mosquitto_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    set(CMAKE_SKIP_INSTALL_RULES "${_obn_saved_skip_install}")
 
     if(NOT TARGET libmosquitto_static)
         message(FATAL_ERROR
             "obn: bundled mosquitto did not produce target libmosquitto_static")
+    endif()
+    if(TARGET libmosquitto_common)
+        target_compile_definitions(libmosquitto_common PRIVATE LIBMOSQUITTO_STATIC)
     endif()
     # Upstream sets full include paths for libmosquitto (shared), but the
     # static target misses libcommon/common, bundled deps (utlist.h), and
@@ -61,6 +76,10 @@ function(obn_vendor_mosquitto_setup)
     target_include_directories(obn_mosquitto_iface INTERFACE
         "${eclipse_mosquitto_SOURCE_DIR}/include"
     )
+    # Our sources include <mosquitto.h> but link libmosquitto_static. Without
+    # LIBMOSQUITTO_STATIC, MSVC emits __declspec(dllimport) calls and the plugin
+    # DLL gets an import table entry for libmosquitto.dll (LoadLibrary error 126).
+    target_compile_definitions(obn_mosquitto_iface INTERFACE LIBMOSQUITTO_STATIC)
     target_link_libraries(obn_mosquitto_iface INTERFACE
         obn_vendor_cjson_iface
         libmosquitto_static
@@ -68,6 +87,17 @@ function(obn_vendor_mosquitto_setup)
         OpenSSL::Crypto
         Threads::Threads
     )
+    if(WIN32)
+        # libmosquitto_static links PThreads4W privately; propagate so the
+        # final bambu_networking.dll resolves pthread symbols at link time.
+        if(TARGET PThreads4W::PThreads4W)
+            target_link_libraries(obn_mosquitto_iface INTERFACE PThreads4W::PThreads4W)
+        endif()
+    endif()
+    # We only embed the static archive; do not build the unused shared lib.
+    if(TARGET libmosquitto)
+        set_target_properties(libmosquitto PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
     if(UNIX AND NOT APPLE AND NOT ANDROID)
         find_library(_obn_vendor_librt NAMES rt)
         if(_obn_vendor_librt)

@@ -1007,7 +1007,7 @@ std::string ensure_ftp(Tunnel* t)
     cfg.username = t->url.user.empty() ? "bblp" : t->url.user;
     cfg.password = t->url.passwd;
     if (!obn::lan_tls::skip_verify_from_env()) {
-        if (const char* ca = std::getenv(obn::lan_tls::kEnvCaFile)) {
+        if (const char* ca = obn::lan_tls::resolve_lan_ca_file()) {
             cfg.ca_file = ca;
         }
         if (const char* serial = obn::lan_tls::wait_env_serial(

@@ -915,7 +915,7 @@ std::string Agent::bambu_ca_bundle_path() const
     //   printer.cer        - BBL CA bundle (root/intermediates). LAN trust file.
     //                        Device leaf issuers (e.g. BBL Device CA N7-V2) may be
     //                        absent; LAN verify also uses install_device_cert snapshot.
-    std::string path = folder + "/printer.cer";
+    std::string path = (std::filesystem::path(folder) / "printer.cer").string();
     std::error_code ec;
     if (std::filesystem::is_regular_file(path, ec)) return path;
     return {};

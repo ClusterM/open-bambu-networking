@@ -30,4 +30,10 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
 std::string merged_trust_bundle_path(const std::string& ca_file,
                                      const std::string& peer_cert_file);
 
+// Process env (OBN_LAN_TLS_CA_FILE) — IPC from libbambu_networking.
+const char* resolve_lan_ca_file();
+
+// Process env (OBN_LAN_TLS_PEER_<ip>) — IPC from libbambu_networking.
+const char* resolve_lan_peer_cert(const char* ip, const char* serial);
+
 } // namespace obn::lan_tls

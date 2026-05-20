@@ -39,7 +39,9 @@ bool set_env_var(const char* key, const char* value)
 {
     if (!key) return false;
     if (!value) value = "";
-    return SetEnvironmentVariableA(key, value) != 0;
+    const bool ok = ::SetEnvironmentVariableA(key, value) != 0;
+    (void)::_putenv_s(key, value); // best-effort CRT sync for legacy getenv callers
+    return ok;
 }
 #else
 bool set_env_var(const char* key, const char* value)
@@ -85,6 +87,23 @@ void warn_skip_once()
 }
 
 } // namespace
+
+const char* env_var_get(const char* key)
+{
+    if (!key || !*key) return nullptr;
+#if defined(_WIN32)
+    thread_local std::string buf;
+    buf.assign(32768, '\0');
+    const DWORD n = ::GetEnvironmentVariableA(
+        key, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n == 0 || n >= buf.size()) return nullptr;
+    buf.resize(n);
+    return buf.c_str();
+#else
+    const char* v = std::getenv(key);
+    return (v && *v) ? v : nullptr;
+#endif
+}
 
 bool verify_enabled()
 {
@@ -209,6 +228,16 @@ std::optional<std::string> registry_lookup_serial(const std::string& ip)
     auto it = g_ip_to_serial.find(ip);
     if (it == g_ip_to_serial.end()) return std::nullopt;
     return it->second;
+}
+
+const char* resolve_lan_ca_file()
+{
+    return env_var_get(kEnvCaFile);
+}
+
+const char* resolve_lan_peer_cert(const char* ip, const char* /*serial*/)
+{
+    return peer_cert_path_for_ip(ip);
 }
 
 } // namespace obn::lan_tls
