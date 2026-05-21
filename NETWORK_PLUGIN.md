@@ -522,6 +522,33 @@ The Studio-side call order after `create_agent` is deterministic and lives in `G
 
 The plugin must tolerate this exact order (in particular, no networking work should happen before `start()`).
 
+#### 6.1.1. Certificate files (`set_cert_file`)
+
+Studio ships **two PEM files** next to each other under `<resources>/cert/` inside the AppImage / install tree:
+
+| File | What it is (observed) | Used by the **open** plugin today |
+|------|------------------------|-----------------------------------|
+| **`slicer_base64.cer`** | BBL / RapidSSL-style bundle for **Bambu cloud** hostnames (`*.bambulab.com`, MakerWorld HTTPS, etc.). This is the file Studio **names** in the ABI call. | **LAN: no.** **Linux cloud MQTT/HTTPS: no** (system CA store). **Windows cloud MQTT only:** passed to Mosquitto as a PEM file because static OpenSSL has no default trust dir — with `tls_skip_chain_verify` (MVP workaround; see `agent.cpp` `connect_cloud`). **Future:** proper Windows cloud TLS verify may use this file or another anchor. |
+| **`printer.cer`** | BBL **CA** bundle (root + intermediate CAs such as `BBL CA`, `BBL CA2 RSA/ECC`). **Not** the printer's device leaf. Observed **5** CA certs in Studio v02.07.0.55; **does not** include per-model device issuers such as `BBL Device CA N7-V2`. | **LAN TLS verify:** loaded as `OBN_LAN_TLS_CA_FILE` for MQTT (8883), FTPS (990), RTSPS (322), MJPEG (6000). Same folder is remembered from `set_cert_file(folder, …)`; the **filename argument is ignored** for LAN — we always open `folder/printer.cer`. |
+
+**Why Studio passes `slicer_base64.cer` in the API if we ignore it on LAN:** the stock closed-source plugin uses that second argument as its cloud trust bundle. The ABI is fixed; Studio always calls `set_cert_file(resources_dir()+"/cert", "slicer_base64.cer")`. We store `folder` + `filename` for ABI compatibility and for the Windows cloud path above.
+
+**LAN TLS — what the printer sends (verified on P2S, firmware 02.07.x):**
+
+- TLS handshake carries **one certificate**: the **device leaf** (`subject=CN=<serial>`, e.g. `CN=22E8BJ610801473`).
+- **No DNS/IP SAN** on the leaf; clients connect by LAN IP but must check **CN = serial** (SNI is set to the serial).
+- Leaf **issuer** on N7/P2S: `CN=BBL Device CA N7-V2` (other models may use other `BBL Device CA …` names).
+- **`printer.cer` alone does not chain-verify** that leaf on N7/P2S — the issuer CA is missing from the Studio bundle (confirmed with `openssl s_client` / `openssl verify`).
+
+**How LAN verify actually works in the open plugin:**
+
+1. Load **`printer.cer`** into the OpenSSL trust store (best-effort; needed when/if the issuer **is** present in a future Studio bundle or on other models).
+2. After `install_device_cert`, also load the **snapshotted leaf** from `<config_dir>/certs/<serial>.pem` (env `OBN_LAN_TLS_PEER_<a_b_c_d>`). The snapshot is taken once per session over MQTT :8883 with verify disabled purely to capture the PEM. With `X509_V_FLAG_PARTIAL_CHAIN`, trusting that leaf PEM makes “this exact cert is OK” work even when the intermediate CA is not shipped.
+3. Check **CN = serial** after the handshake (`X509_check_host` / Mosquitto hostname hook).
+4. Escape hatch: `OBN_SKIP_TLS_VERIFY=1` disables LAN verify (debug only).
+
+**Plain-language summary:** `slicer_base64.cer` = **cloud** (mostly unused on Linux today). `printer.cer` = **intended LAN CA pack** from Bambu, but on current N7 firmware the signing CA is **not** in that pack, so we also **pin the device leaf** we snapshot locally. That is weaker than full PKI to a public root, but it still detects a **wrong/random** cert on the wire (MITM must present the same leaf or break CN=serial).
+
 ### 6.2. Callbacks (registration)
 
 All take a `void* agent` and an `std::function<…>`:
@@ -1843,7 +1870,7 @@ There are no concurrent CTRL requests on the same tunnel: `PrinterFileSystem::Ru
 Bambu firmware ships a stripped-down vsftpd / busybox-ftpd hybrid (the exact image varies across O1S / X1 / P1 / P2S / A-series) that deviates from RFC 959 / 4217 in several ways. None of these quirks are documented anywhere in the stock plugin or Studio source, so a fresh implementation needs to know all of them up front:
 
 - **Implicit TLS, TCP/990.** The TLS handshake starts immediately after the TCP `connect()`; there is no `AUTH TLS` upgrade dance. A plaintext FTP client that opens 990 and waits for a `220` banner gets nothing — the server is already in TLS mode.
-- **Self-signed cert with no usable SAN.** The certificate Bambu's FTPS daemon presents has no SAN that matches the printer's LAN IP, so OpenSSL hostname verification always fails. Run with `SSL_VERIFY_NONE` (the same compromise the stock plugin makes for MQTT against the same printer). Pinning against the bundled `printer.cer` chain works on some firmwares but not all.
+- **Device cert CN = serial, no SAN.** The leaf certificate uses `CN=<serial>` (e.g. `22E8BJ610801473`) with **no** DNS/IP SAN entries. Clients connect by LAN IP but must verify hostname against the serial. On observed N7/P2S firmware the printer sends **only that leaf** in TLS; issuer is `BBL Device CA N7-V2`, which is **not** present in Studio's `printer.cer` bundle (v02.07) — see §6.1.1. The open plugin loads `printer.cer` plus an optional **snapshotted leaf** (`install_device_cert` → `<config_dir>/certs/<serial>.pem`, env `OBN_LAN_TLS_PEER_<ip>`) and checks CN=serial on LAN MQTT (8883), FTPS (990), RTSPS (322), and MJPEG (6000). Set env `OBN_SKIP_TLS_VERIFY=1` to disable verify for debugging. **Stock plugin LAN TLS policy is unknown** — do not assume it skips verification.
 - **Login is `USER bblp` + `PASS <printer-access-code>`.** The 8-character code shown on the printer screen is the FTPS password. There is no anonymous mode, and no other usernames are accepted.
 - **Mandatory post-login sequence.** After `230` the client *must* issue `TYPE I` → `PBSZ 0` → `PROT P` in that order before any data-channel command. Skipping `PROT P` (or sending it before `PBSZ`) makes the next `PASV` reply `425`/`431` depending on firmware.
 - **PASV only — `PORT` is not implemented.** The daemon either ignores `PORT` outright or replies `500 Unknown command`. Active mode is not negotiable.
@@ -1907,7 +1934,7 @@ A few practical contracts that the Studio code path enforces but does not docume
 
 1. **Sanity entry point for debugging**: immediately after `create_agent` Studio makes the exact sequence of calls documented in § 6.1 ("Initialization sequence"). Observing those in order is the shortest way to confirm that the ABI is wired correctly.
 2. `QueueOnMainFn` is critical: nearly every UI-touching callback must be dispatched through this lambda — wxWidgets is not thread-safe, and direct calls from the plugin's worker threads will race.
-3. **Client certificates**: the file `<resources>/cert/slicer_base64.cer` is the root CA bundle Bambu uses for TLS/MQTT. It is handed to the plugin via `bambu_network_set_cert_file`.
+3. **Certificate files (`set_cert_file`)** — full detail in §6.1.1. Short version: Studio passes `(<resources>/cert, slicer_base64.cer)`. The open plugin uses **`printer.cer`** from that folder for LAN (`OBN_LAN_TLS_CA_FILE`) and **`slicer_base64.cer`** only on **Windows cloud MQTT** (OpenSSL has no system store in our static build). **`slicer_base64.cer` is not used for LAN.** BambuSource reads `OBN_LAN_TLS_CA_FILE`, per-IP serial env vars, and optional `OBN_LAN_TLS_PEER_<ip>` (snapshotted device leaf).
 4. **ABI/STL compatibility** is the single biggest foot-gun of this contract: the plugin has to be built with the exact same toolchain that built Bambu Studio (matching MSVC runtime on Windows, matching libstdc++ ABI on Linux, matching Xcode/libc++ on macOS). Any mismatch is undefined behaviour the moment a `std::string` / `std::map` crosses the library boundary.
 
 ---

@@ -17,14 +17,12 @@ bool ensure_parent_dir(const std::string& file_path);
 
 // Opens a short-lived TLS connection to `host:port`, captures the peer
 // certificate leaf and writes it as PEM to `out_pem_path`. No chain
-// verification is performed (printers ship self-signed certs with no
-// hostname in SAN). Returns true on success.
-//
-// Intended to be called from Agent::install_device_cert(). Uses SNI with
-// `host` and a soft timeout of `timeout_ms` for both connect and handshake.
+// verification is performed (TOFU bootstrap snapshot only).
+// `tls_sni` is sent as SNI when non-empty (use dev_id/serial); otherwise `host`.
 bool capture_peer_cert_pem(const std::string& host,
                            int                port,
                            int                timeout_ms,
-                           const std::string& out_pem_path);
+                           const std::string& out_pem_path,
+                           const std::string& tls_sni = {});
 
 } // namespace obn::cert_store

@@ -27,7 +27,11 @@ function(obn_vendor_cjson_setup)
         GIT_SHALLOW TRUE
         GIT_PROGRESS TRUE
     )
-    FetchContent_MakeAvailable(cjson)
+    FetchContent_GetProperties(cjson)
+    if(NOT cjson_POPULATED)
+        FetchContent_Populate(cjson)
+        add_subdirectory("${cjson_SOURCE_DIR}" "${cjson_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    endif()
 
     if(NOT TARGET cjson)
         message(FATAL_ERROR "obn: FetchContent cJSON did not produce target cjson")

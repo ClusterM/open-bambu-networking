@@ -17,6 +17,7 @@
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/ssdp.hpp"
+#include "obn/lan_tls.hpp"
 
 namespace obn {
 
@@ -52,10 +53,14 @@ int Agent::connect_printer(std::string dev_id,
     // Studio calls connect_printer() again when the user switches to a
     // different printer or re-enters the access code. Tear down any prior
     // session cleanly so we don't leak MQTT threads.
+    bool switching_printer = false;
     {
         std::unique_ptr<LanSession> prev;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (lan_session_ && lan_session_->dev_id() != dev_id) {
+                switching_printer = true;
+            }
             prev = std::move(lan_session_);
         }
         // prev.reset() happens outside the lock; destructor joins the MQTT
@@ -63,15 +68,39 @@ int Agent::connect_printer(std::string dev_id,
         // mu_.
     }
 
-    // Clearing the certified-devices cache so that if Studio re-binds to the
-    // same printer (e.g. after a firmware reboot or an access-code change)
-    // we snapshot its cert again on the very next install_device_cert() tick.
-    {
+    if (switching_printer) {
         std::lock_guard<std::mutex> lk(mu_);
         certified_devs_.clear();
     }
 
     std::string ca_file = bambu_ca_bundle_path();
+    obn::lan_tls::registry_set_ca_file(ca_file);
+    obn::lan_tls::registry_put_ip_serial(dev_ip, dev_id);
+    {
+        std::string cfg_dir = config_dir();
+        if (!cfg_dir.empty()) {
+            std::string peer = cert_store::device_cert_path(cfg_dir, dev_id);
+            std::error_code ec;
+            bool have_peer = std::filesystem::is_regular_file(peer, ec);
+            if (use_ssl && obn::lan_tls::verify_enabled() && !have_peer) {
+                OBN_INFO("connect_printer: snapshot device cert before LAN MQTT");
+                if (cert_store::capture_peer_cert_pem(
+                        dev_ip, 8883, /*timeout_ms=*/3000, peer, dev_id)) {
+                    have_peer = std::filesystem::is_regular_file(peer, ec);
+                    if (have_peer) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        certified_devs_.insert(dev_id);
+                    }
+                } else {
+                    OBN_WARN("connect_printer: device cert snapshot failed");
+                }
+            }
+            if (std::filesystem::is_regular_file(peer, ec)) {
+                obn::lan_tls::registry_set_peer_cert(dev_ip, peer);
+            }
+        }
+    }
+
     auto session = std::make_unique<LanSession>(std::move(dev_id),
                                                 std::move(dev_ip),
                                                 std::move(username),
@@ -808,6 +837,7 @@ void Agent::set_config_dir(std::string dir)
     // once during plugin init, before any user-facing ABI.
     std::string cfg = config_dir();
     if (!cfg.empty()) {
+        obn::lan_tls::registry_set_config_dir(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
         hydrate_session();
@@ -816,9 +846,12 @@ void Agent::set_config_dir(std::string dir)
 
 void Agent::set_cert_file(std::string folder, std::string filename)
 {
-    std::lock_guard<std::mutex> lk(mu_);
-    cert_folder_   = std::move(folder);
-    cert_filename_ = std::move(filename);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cert_folder_   = std::move(folder);
+        cert_filename_ = std::move(filename);
+    }
+    obn::lan_tls::registry_set_ca_file(bambu_ca_bundle_path());
 }
 
 void Agent::set_country_code(std::string code)
@@ -878,11 +911,12 @@ std::string Agent::bambu_ca_bundle_path() const
     char last = folder.back();
     if (last == '/' || last == '\\') folder.pop_back();
     // Studio ships two cert files in resources/cert/:
-    //   slicer_base64.cer  - RapidSSL leaf for *.bambulab.com (cloud only)
-    //   printer.cer        - BBL Root/Intermediate CA bundle that signs the
-    //                        printer's device cert (CN=<serial>, issuer=
-    //                        BBL Device CA N7-V2). This one is what we want.
-    std::string path = folder + "/printer.cer";
+    //   slicer_base64.cer  - cloud bundle (*.bambulab.com); stored for Windows
+    //                        cloud MQTT MVP (see connect_cloud). Not used for LAN.
+    //   printer.cer        - BBL CA bundle (root/intermediates). LAN trust file.
+    //                        Device leaf issuers (e.g. BBL Device CA N7-V2) may be
+    //                        absent; LAN verify also uses install_device_cert snapshot.
+    std::string path = (std::filesystem::path(folder) / "printer.cer").string();
     std::error_code ec;
     if (std::filesystem::is_regular_file(path, ec)) return path;
     return {};
@@ -994,6 +1028,28 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         return;
     }
 
+    const std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(out_path, ec)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            certified_devs_.insert(dev_id);
+            if (!ip.empty()) {
+                obn::lan_tls::registry_set_peer_cert(ip, out_path);
+            }
+            return;
+        }
+    }
+
+    // Do not open a second TLS session to :8883 while LAN MQTT is up — the
+    // printer drops one of them (seen as mqtt rc=7 / rc=5 on Orca reconnect).
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id) {
+            return;
+        }
+    }
+
     // Claim the inflight slot and launch the worker. cert_snapshot_inflight_
     // is cleared by the worker on exit, certified_devs_ only on success,
     // cooldown only on failure.
@@ -1007,12 +1063,13 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         OBN_INFO("install_device_cert dev=%s ip=%s: snapshotting to %s",
                  dev_id.c_str(), ip.c_str(), out_path.c_str());
         bool ok = cert_store::capture_peer_cert_pem(
-            ip, 8883, /*timeout_ms=*/3000, out_path);
+            ip, 8883, /*timeout_ms=*/3000, out_path, dev_id);
         std::lock_guard<std::mutex> lk(mu_);
         cert_snapshot_inflight_.erase(dev_id);
         if (ok) {
             certified_devs_.insert(dev_id);
             cert_snapshot_cooldown_.erase(dev_id);
+            obn::lan_tls::registry_set_peer_cert(ip, out_path);
         } else {
             OBN_WARN("install_device_cert dev=%s: snapshot failed, cooldown 60s",
                      dev_id.c_str());
@@ -1062,6 +1119,10 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     if (!root) return;
     std::string ip = trim_ip_string(root->find("dev_ip").as_string());
     if (ip.empty()) return;
+    const std::string dev_id = root->find("dev_id").as_string();
+    if (!dev_id.empty()) {
+        obn::lan_tls::registry_put_ip_serial(ip, dev_id);
+    }
     std::lock_guard<std::mutex> lk(mu_);
     ssdp_json_by_ip_[ip] = json;
 }

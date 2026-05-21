@@ -57,6 +57,7 @@
 #if OBN_FT_FTPS_FASTPATH
 #include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #endif
 
@@ -317,10 +318,10 @@ std::string tunnel_ensure_ftp(FT_Tunnel* t)
     cfg.username = t->lan.user.empty() ? std::string{"bblp"} : t->lan.user;
     cfg.password = t->lan.password;
     cfg.use_tls  = ftp_tls;
-    // We don't have Agent's CA bundle visible from the C ABI; the
-    // printer's self-signed cert can't be verified without it anyway.
-    // Same trade-off the print job makes when no cert folder is set.
-    cfg.ca_file  = {};
+    cfg.ca_file  = obn::lan_tls::registry_ca_file();
+    if (auto serial = obn::lan_tls::registry_lookup_serial(t->lan.ip)) {
+        cfg.tls_verify_hostname = *serial;
+    }
 
     auto c = std::make_unique<obn::ftps::Client>();
     if (std::string err = c->connect(cfg); !err.empty()) {

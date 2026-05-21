@@ -1,5 +1,7 @@
 #include "obn/cover_cache.hpp"
 
+#include "obn/lan_tls.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -98,6 +100,9 @@ bool download_ftps_file(const std::string& host,
     cfg.password = password;
     cfg.ca_file  = ca_file;
     cfg.use_tls  = use_ssl_for_ftp;
+    if (auto serial = obn::lan_tls::registry_lookup_serial(host)) {
+        cfg.tls_verify_hostname = *serial;
+    }
 
     obn::ftps::Client c;
     if (std::string err = c.connect(cfg); !err.empty()) {

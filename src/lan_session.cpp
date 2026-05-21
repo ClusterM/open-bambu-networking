@@ -1,5 +1,6 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -91,10 +92,11 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
             if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
         } else {
             OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
-                     rc, mqtt::Client::err_str(rc));
+                     rc, obn::mqtt::Client::connack_str(rc));
             if (on_connected_)
                 on_connected_(BBL::ConnectStatusFailed,
-                              std::string("mqtt connect rc=") + mqtt::Client::err_str(rc));
+                              std::string("mqtt connect rc=")
+                                  + obn::mqtt::Client::connack_str(rc));
         }
     });
 
@@ -117,20 +119,32 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     }
 
     mqtt::ConnectConfig cfg;
-    cfg.host         = dev_ip_;
-    cfg.port         = use_ssl_ ? 8883 : 1883;
-    cfg.username     = username_;
-    cfg.password     = password_;
-    cfg.use_tls      = use_ssl_;
-    cfg.ca_file      = ca_file_;
-    // Printers use their serial as cert CN, so hostname check never matches
-    // when we connect by IP. Keep insecure=true even with ca_file set.
-    cfg.tls_insecure = true;
-    cfg.keepalive_s  = 60;
+    cfg.host                = dev_ip_;
+    cfg.port                = use_ssl_ ? 8883 : 1883;
+    cfg.username            = username_;
+    cfg.password            = password_;
+    cfg.use_tls             = use_ssl_;
+    cfg.ca_file             = ca_file_;
+    cfg.tls_verify_hostname = dev_id_;
+    cfg.tls_insecure        = !obn::lan_tls::verify_enabled();
+    cfg.keepalive_s         = 60;
 
-    OBN_INFO("LanSession tls=%d ca_file=%s",
+    if (use_ssl_ && obn::lan_tls::verify_enabled()) {
+        if (ca_file_.empty()) {
+            OBN_ERROR("LanSession: TLS verify enabled but printer.cer missing");
+            return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+        }
+        if (dev_id_.empty()) {
+            OBN_ERROR("LanSession: TLS verify enabled but dev_id empty");
+            return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+        }
+    }
+
+    OBN_INFO("LanSession tls=%d ca_file=%s verify_host=%s insecure=%d",
              use_ssl_ ? 1 : 0,
-             ca_file_.empty() ? "<none, accepting any>" : ca_file_.c_str());
+             ca_file_.empty() ? "<none>" : ca_file_.c_str(),
+             dev_id_.c_str(),
+             cfg.tls_insecure ? 1 : 0);
 
     int rc = client_->connect(cfg);
     if (rc != 0) {

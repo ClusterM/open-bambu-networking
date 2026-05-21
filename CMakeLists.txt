@@ -158,17 +158,12 @@ if(DEFINED OBN_PATCH_STUDIO_CONF AND NOT DEFINED CACHE{OBN_PATCH_CLIENT_CONF})
         "Edit the slicer's conf file after install" FORCE)
 endif()
 
-# When ON, pkg-config resolves libmosquitto with --static (Libs.private,
-# transitive deps). Ignored when OBN_VENDOR_MOSQUITTO is ON.
-option(OBN_STATIC_MOSQUITTO "Link libmosquitto via pkg-config --static" OFF)
-
-# Fetch and build eclipse/mosquitto as a static PIC library — no libmosquitto-dev
-# or libmosquitto.a on the host. Requires Git and network at configure time.
-option(OBN_VENDOR_MOSQUITTO "Bundle libmosquitto via FetchContent (static PIC)" OFF)
+# Bundled libmosquitto (static + PIC) via FetchContent — always embedded in
+# libbambu_networking.so. Requires Git and uthash headers at configure time.
 set(OBN_MOSQUITTO_GIT_TAG "v2.1.2"
-    CACHE STRING "Git tag for eclipse/mosquitto when OBN_VENDOR_MOSQUITTO is ON")
+    CACHE STRING "Git tag for eclipse/mosquitto (FetchContent)")
 set(OBN_CJSON_GIT_TAG "v1.7.18"
-    CACHE STRING "Git tag for DaveGamble/cJSON when OBN_VENDOR_MOSQUITTO is ON")
+    CACHE STRING "Git tag for DaveGamble/cJSON (FetchContent)")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -229,14 +224,9 @@ endif()
 # --------------------------------------------------------------------------
 
 # Dependency resolution:
-#   - Linux uses pkg-config to discover libcurl / libmosquitto from the host
-#     distribution; OpenSSL/zlib via CMake config modules.
-#   - Windows uses vcpkg manifest mode (vcpkg.json at repo root): all four
-#     dependencies are resolved through vcpkg's CMake config files. Mosquitto
-#     in vcpkg ships as 'unofficial-mosquitto' with target
-#     unofficial::mosquitto::mosquitto. CURL has a real find module bundled
-#     with CMake plus a CONFIG package via vcpkg.
-#   - macOS is treated like Linux (Homebrew installs pkg-config-able libs).
+#   - Linux/macOS: pkg-config for libcurl; OpenSSL/zlib via CMake.
+#   - Windows: vcpkg manifest for curl/openssl/zlib; mosquitto is always
+#     vendored via FetchContent (same as Linux).
 if(WIN32)
     find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
     find_package(ZLIB REQUIRED)
@@ -247,62 +237,8 @@ else()
     find_package(ZLIB REQUIRED)
 endif()
 
-if(OBN_VENDOR_MOSQUITTO AND OBN_STATIC_MOSQUITTO)
-    message(WARNING
-        "OBN_VENDOR_MOSQUITTO and OBN_STATIC_MOSQUITTO are both ON — "
-        "using the bundled mosquitto build; system static libmosquitto is ignored.")
-endif()
-
-if(OBN_VENDOR_MOSQUITTO)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
-    obn_vendor_mosquitto_setup()
-elseif(WIN32)
-    # vcpkg ships mosquitto under the 'unofficial-mosquitto' package
-    # exporting unofficial::mosquitto::mosquitto for the C client. We do
-    # not honor OBN_STATIC_MOSQUITTO on Windows: vcpkg picks shared vs
-    # static based on the selected triplet (x64-windows vs x64-windows-static).
-    find_package(unofficial-mosquitto CONFIG REQUIRED)
-    add_library(obn_mosquitto_iface INTERFACE)
-    target_link_libraries(obn_mosquitto_iface INTERFACE
-        unofficial::mosquitto::mosquitto)
-elseif(OBN_STATIC_MOSQUITTO)
-    pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
-    set(_obn_prev_lib_suffix "${CMAKE_FIND_LIBRARY_SUFFIXES}")
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-    find_library(MOSQUITTO_STATIC_ARCHIVE NAMES mosquitto
-        PATHS ${MOSQUITTO_LIBRARY_DIRS}
-        NO_DEFAULT_PATH)
-    if(NOT MOSQUITTO_STATIC_ARCHIVE)
-        find_library(MOSQUITTO_STATIC_ARCHIVE NAMES mosquitto)
-    endif()
-    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_obn_prev_lib_suffix}")
-    if(NOT MOSQUITTO_STATIC_ARCHIVE OR NOT MOSQUITTO_STATIC_ARCHIVE MATCHES "\\.a$")
-        message(FATAL_ERROR
-            "OBN_STATIC_MOSQUITTO is ON but libmosquitto.a was not found "
-            "(resolved '${MOSQUITTO_STATIC_ARCHIVE}'). Many distros ship only "
-            "the shared library in libmosquitto-dev — build mosquitto with "
-            "BUILD_SHARED_LIBS=OFF or pass -DOBN_STATIC_MOSQUITTO=OFF.")
-    endif()
-    execute_process(
-        COMMAND "${PKG_CONFIG_EXECUTABLE}" --static --libs libmosquitto
-        OUTPUT_VARIABLE _obn_mosq_ldflags
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE _obn_mosq_ld_rc)
-    if(NOT _obn_mosq_ld_rc EQUAL 0)
-        message(FATAL_ERROR "pkg-config --static --libs libmosquitto failed (code ${_obn_mosq_ld_rc})")
-    endif()
-    string(REGEX REPLACE "-lmosquitto(\\s|$)" "${MOSQUITTO_STATIC_ARCHIVE}\\1"
-        _obn_mosq_ldflags "${_obn_mosq_ldflags}")
-    separate_arguments(_obn_mosq_link UNIX_COMMAND "${_obn_mosq_ldflags}")
-    message(STATUS "obn: linking libmosquitto statically (${MOSQUITTO_STATIC_ARCHIVE})")
-    add_library(obn_mosquitto_iface INTERFACE)
-    target_include_directories(obn_mosquitto_iface INTERFACE ${MOSQUITTO_INCLUDE_DIRS})
-    target_link_libraries(obn_mosquitto_iface INTERFACE ${_obn_mosq_link})
-else()
-    pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
-    add_library(obn_mosquitto_iface INTERFACE)
-    target_link_libraries(obn_mosquitto_iface INTERFACE PkgConfig::MOSQUITTO)
-endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
+obn_vendor_mosquitto_setup()
 
 # CURL imported target: PkgConfig::CURL on POSIX, CURL::libcurl on Windows
 # (vcpkg's CURLConfig.cmake exports that name). We expose a unified alias
@@ -351,6 +287,7 @@ add_library(bambu_networking SHARED
     src/json_lite.cpp
     src/print_params_ftp_prefs.cpp
     src/lan_session.cpp
+    src/lan_tls.cpp
     src/log.cpp
     src/mqtt_client.cpp
     src/os_compat.cpp
@@ -459,6 +396,7 @@ set(_obn_bambusource_sources
     stubs/rtsp_passthrough.cpp
     src/ftps.cpp
     src/json_lite.cpp
+    src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp
     src/zip_reader.cpp
@@ -704,6 +642,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     add_executable(ftps_live_test tests/ftps_live_test.cpp
         src/ftps.cpp
+        src/lan_tls.cpp
         src/log.cpp
         src/os_compat.cpp)
     target_include_directories(ftps_live_test PRIVATE include)
@@ -731,6 +670,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/http_client.cpp
         src/json_lite.cpp
         src/lan_session.cpp
+        src/lan_tls.cpp
         src/log.cpp
         src/mqtt_client.cpp
         src/print_params_ftp_prefs.cpp

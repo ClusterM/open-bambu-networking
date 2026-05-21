@@ -41,9 +41,12 @@ struct ConnectConfig {
     // (plain FTP, typically port 21); ca_file is ignored.
     bool        use_tls    = true;
 
-    // Path to a CA bundle (PEM). If empty, TLS verification is disabled
-    // (matching the behaviour we already use for MQTT against printers
-    // that present a self-signed cert without a matching SAN).
+    // Hostname for TLS verify + SNI (printer serial / dev_id). TCP still uses
+    // `host` (LAN IP). Empty with verify enabled -> connect fails closed.
+    std::string tls_verify_hostname;
+
+    // Path to printer.cer (BBL device CA bundle). Required when TLS verify is
+    // enabled (default). Empty with verify on -> fail closed.
     std::string ca_file;
 
     // Seconds for individual read/write syscalls on the control

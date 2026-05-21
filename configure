@@ -15,13 +15,6 @@ WORKAROUNDS=ON
 FTPS_FASTPATH=ON
 TESTS=OFF
 PATCH_CONF=ON
-STATIC_MOSQUITTO=OFF
-VENDOR_MOSQUITTO=OFF
-# Tracks whether the user passed --[no-]vendor-mosquitto explicitly. We
-# auto-enable --vendor-mosquitto for Flatpak Orca installs (sandbox
-# usually hides libmosquitto from the plugin) but only when the user
-# did not opt out of it.
-VENDOR_MOSQUITTO_SET=0
 EXTRA_CMAKE_ARGS=""
 
 usage() {
@@ -37,10 +30,7 @@ Client selection:
                            orca_slicer
                          The value drives default --prefix, version
                          auto-detection, the .so file name and which
-                         conf file 'make install' patches. When the
-                         resolved prefix is the slicer's Flatpak config
-                         dir, --vendor-mosquitto is enabled by default
-                         (override with --no-vendor-mosquitto).
+                         conf file 'make install' patches.
 
 Install paths:
   --prefix=DIR           Install prefix; where 'make install' copies the
@@ -95,18 +85,6 @@ Optional features:
                              conf file (BambuStudio.conf or
                              OrcaSlicer.conf). Use this for staging or
                              if you manage the conf yourself.
-  --enable-static-mosquitto  Link the system libmosquitto.a (pkg-config
-                             --static). Only for the non-vendor build; if
-                             you pass --vendor-mosquitto you do not need this
-                             (vendor already embeds a static libmosquitto).
-  --disable-static-mosquitto Link the host libmosquitto.so (default without
-                             --vendor-mosquitto).
-  --vendor-mosquitto         Fetch/build eclipse/mosquitto and embed its
-                             static library (cmake ignores --enable-static-
-                             mosquitto when this is on). Needs git, network,
-                             and utlist.h (usually from uthash-dev /
-                             uthash-devel). cJSON is bundled automatically.
-  --no-vendor-mosquitto      Use mosquitto from pkg-config only (default).
 
 Other:
   --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
@@ -136,10 +114,6 @@ for arg in "$@"; do
         --enable-tests)            TESTS=ON ;;
         --no-conf-patch)           PATCH_CONF=OFF ;;
         --with-conf-patch)         PATCH_CONF=ON ;;
-        --enable-static-mosquitto)  STATIC_MOSQUITTO=ON ;;
-        --disable-static-mosquitto) STATIC_MOSQUITTO=OFF ;;
-        --vendor-mosquitto)        VENDOR_MOSQUITTO=ON;  VENDOR_MOSQUITTO_SET=1 ;;
-        --no-vendor-mosquitto)     VENDOR_MOSQUITTO=OFF; VENDOR_MOSQUITTO_SET=1 ;;
         --video-backend=*)
             printf 'configure: --video-backend is deprecated and ignored '\
 '(libBambuSource now passes raw H.264 straight to gstbambusrc, '\
@@ -154,10 +128,9 @@ for arg in "$@"; do
     esac
 done
 
-if [ "$VENDOR_MOSQUITTO" = ON ] && [ "$STATIC_MOSQUITTO" = ON ]; then
-    printf '%s\n' \
-        'configure: warning: --vendor-mosquitto and --enable-static-mosquitto are both set;' \
-        '               the bundled mosquitto build is used (pkg-config static path ignored).' >&2
+if ! command -v git >/dev/null 2>&1; then
+    echo "configure: git is required (vendored libmosquitto FetchContent)" >&2
+    exit 1
 fi
 
 case "$CLIENT_TYPE" in
@@ -171,11 +144,6 @@ esac
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "configure: cmake is required but was not found in \$PATH" >&2
-    exit 1
-fi
-
-if [ "$VENDOR_MOSQUITTO" = ON ] && ! command -v git >/dev/null 2>&1; then
-    echo "configure: --vendor-mosquitto requires git, but it was not found in \$PATH" >&2
     exit 1
 fi
 
@@ -194,9 +162,9 @@ has_utlist_header() {
     return 1
 }
 
-if [ "$VENDOR_MOSQUITTO" = ON ] && ! has_utlist_header; then
+if ! has_utlist_header; then
     cat >&2 <<'EOF'
-configure: --vendor-mosquitto requires utlist.h (uthash development headers), but it was not found.
+configure: utlist.h (uthash development headers) is required for the vendored libmosquitto build, but it was not found.
 
 Install the package and run configure again:
   Debian/Ubuntu: sudo apt install uthash-dev
@@ -261,21 +229,6 @@ if [ -z "$PREFIX" ]; then
             PREFIX="$client_mac_dir"
             ;;
     esac
-fi
-
-# Auto-enable --vendor-mosquitto when installing into the Flatpak data
-# dir of either slicer. Flatpak's runtime usually does not expose
-# libmosquitto to the plugin, so the host's libmosquitto.so cannot be
-# dlopen'd from inside the sandbox. Vendoring it sidesteps the whole
-# problem. This triggers regardless of whether PREFIX was auto-detected
-# or passed via --prefix= -- if the user is targeting the Flatpak dir,
-# they will hit the same runtime issue. Honours an explicit
-# --no-vendor-mosquitto.
-if [ -n "$PREFIX" ] && [ "$PREFIX" = "$client_flatpak_dir" ] \
-   && [ "$VENDOR_MOSQUITTO_SET" = 0 ]; then
-    VENDOR_MOSQUITTO=ON
-    echo "configure: Flatpak $client_label install detected; defaulting to --vendor-mosquitto"
-    echo "configure: (override with --no-vendor-mosquitto if your runtime exposes libmosquitto)"
 fi
 
 # Auto-detect the plugin version from the slicer's conf file when the user
@@ -375,9 +328,7 @@ set -- "$@" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
     -DOBN_FT_FTPS_FASTPATH="$FTPS_FASTPATH" \
     -DOBN_BUILD_TESTS="$TESTS" \
-    -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF" \
-    -DOBN_STATIC_MOSQUITTO="$STATIC_MOSQUITTO" \
-    -DOBN_VENDOR_MOSQUITTO="$VENDOR_MOSQUITTO"
+    -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF"
 # shellcheck disable=SC2086
 [ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
 

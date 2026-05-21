@@ -1117,7 +1117,8 @@ int Client::start(const Url& url, int connect_timeout_ms)
 
     if (url.tls) {
         if (obn::tls::dial_tls(url.host, url.port, connect_timeout_ms,
-                               &I.fd, &I.ssl) != 0) {
+                               &I.fd, &I.ssl,
+                               url.device.empty() ? nullptr : url.device.c_str()) != 0) {
             log_fmt(I.logger, I.log_ctx, "rtsp: TLS dial failed: %s",
                     obn::source::get_last_error());
             return -1;
