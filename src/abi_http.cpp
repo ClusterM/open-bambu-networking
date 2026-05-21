@@ -229,13 +229,13 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
                     std::string perr;
                     auto root = obn::json::parse(resp.body, &perr);
                     if (root && !root->find("devices").is_null()) {
-                        // Filter out BETA firmware entries unless the user has
+                        // Filter out beta firmware entries unless the user has
                         // opted into beta firmware via their account settings.
-                        // When firmware_beta_open is false, only RELEASE entries
+                        // When firmware_beta_open is false, only release entries
                         // are shown so Studio doesn't offer unsolicited beta updates.
                         if (!s.firmware_beta_open) {
                             // Rebuild the JSON omitting any entry whose "status"
-                            // field is "BETA". We do a full parse-and-emit since
+                            // field is "beta". We do a full parse-and-emit since
                             // the cloud body is already structured JSON; the
                             // parse cost here is negligible (called once per
                             // device per Studio launch).
@@ -258,7 +258,14 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
                                     first_fw = false;
                                     out << entry.dump();
                                 }
-                                out << "]}";
+                                out << "]";
+                                // Preserve the ams array so Studio's AMS firmware
+                                // display continues to work. Beta filtering of
+                                // ams[].firmware entries is not applied (rare in
+                                // practice; ams firmware seldom has a beta track).
+                                auto ams_v = dev.find("ams");
+                                out << ",\"ams\":" << (ams_v.is_null() ? "[]" : ams_v.dump());
+                                out << "}";
                             }
                             out << "]}";
                             body = out.str();

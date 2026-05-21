@@ -166,6 +166,7 @@ ProfileResult get_profile(const std::string& region,
     return r;
 }
 
+#if 0 // NOT YET WIRED - kept as documentation; application_token derivation unconfirmed
 DeviceCertResult fetch_device_cert(const std::string& region,
                                    const std::string& access_token,
                                    const std::string& application_token,
@@ -180,11 +181,13 @@ DeviceCertResult fetch_device_cert(const std::string& region,
     //   GET /v1/iot-service/api/user/applications/{token}/cert?aes256={key}&ver=1
     // The client generates a random 32-byte AES key, base64url-encodes it, and
     // passes it here so the server can encrypt the returned private key with it.
+    const std::string encoded_token = obn::http::url_encode(application_token);
+    const std::string encoded_key   = obn::http::url_encode(aes256_key);
     std::string url = api_host(region)
         + "/v1/iot-service/api/user/applications/"
-        + application_token
+        + encoded_token
         + "/cert?aes256="
-        + aes256_key
+        + encoded_key
         + "&ver=1";
     std::map<std::string, std::string> hdrs{
         {"Authorization", "Bearer " + access_token},
@@ -226,5 +229,6 @@ DeviceCertResult fetch_device_cert(const std::string& region,
     if (!r.ok) r.error_message = "cert field missing in response";
     return r;
 }
+#endif // NOT YET WIRED
 
 } // namespace obn::cloud

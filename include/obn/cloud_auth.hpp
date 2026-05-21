@@ -73,6 +73,10 @@ AuthResult refresh_token(const std::string& region,
 ProfileResult get_profile(const std::string& region,
                           const std::string& access_token);
 
+// NOT YET WIRED - the following struct and function document the cloud MQTT
+// mTLS certificate endpoint. The implementation in cloud_auth.cpp is gated
+// with #if 0. See agent.cpp install_device_cert for the integration plan.
+//
 // Result of fetching the cloud MQTT client certificate for a device.
 // The cert chain contains three PEM blocks: device leaf, per-device
 // intermediate CA named "{dev_uid}.bambulab.com", and the root CA.
