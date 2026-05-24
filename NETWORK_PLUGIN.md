@@ -10,7 +10,7 @@ The reference is derived from three independent sources, none of them involving 
 
 Where a claim originates from MITM or matrix runs rather than Studio source it is marked accordingly (see "Evidence" tags in §6.10.2 and the per-field tables in §6.8.2). Behaviour that has not been confirmed against either source is flagged as such.
 
-All source references point at the current BambuStudio tree.
+**Source path convention:** every `src/slic3r/…` path below is relative to the upstream [bambulab/BambuStudio](https://github.com/bambulab/BambuStudio) tree. These files are **not** vendored in open-bambu-networking (`3rd_party/` is gitignored local tooling). [SoftFever/OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) shares almost all of the same paths; camera-widget and Windows back-end divergences are called out inline (§7.4).
 
 ---
 
@@ -341,7 +341,7 @@ It is a plain native dynamic library with C exports. The calling convention is `
 
 - The main module is **`bambu_networking`** — it implements the entire networking API (`bambu_network_*`) and the file-transfer ABI (`ft_*`). **Both symbol sets live in the same library**: immediately after loading, `NetworkAgent::initialize_network_module` calls `InitFTModule(networking_module)` (`src/slic3r/Utils/NetworkAgent.cpp:276`).
 - Optional companion modules Studio knows how to pick up:
-  - `BambuSource` — the wrapper for the printer camera stream. Loaded separately through `NetworkAgent::get_bambu_source_entry()` (`src/slic3r/Utils/NetworkAgent.cpp:511-562`); if it fails to load, `m_networking_compatible = false` is set and the user sees "please update the plugin" (`src/slic3r/GUI/GUI_App.cpp:3430-3437`).
+  - `BambuSource` — the wrapper for the printer camera stream. Loaded separately through `NetworkAgent::get_bambu_source_entry()` (`src/slic3r/Utils/NetworkAgent.cpp:523-575`); if it fails to load, `m_networking_compatible = false` is set and the user sees "please update the plugin" (`src/slic3r/GUI/GUI_App.cpp:3430-3437`).
   - `live555` — the classic RTSP library used internally by `BambuSource`. Studio never calls it directly but requires it to be present in the OTA cache (see § 3.3).
 
 The ZIP is usually a few MiB. Studio imposes no formal size limit; `install_plugin` simply extracts every file through `miniz` (`mz_zip_…`).
@@ -677,20 +677,17 @@ The `PrintParams` struct (`src/slic3r/Utils/bambu_networking.hpp:192-241`) carri
 |--------|-----------|
 | `bambu_network_start_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — cloud |
 | `bambu_network_start_local_print_with_record` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — LAN + metadata upload |
-| `bambu_network_start_send_gcode_to_sdcard` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` |
+| `bambu_network_start_send_gcode_to_sdcard` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — also used for the FTPS **`verify_job`** storage probe when `project_name=="verify_job"` (§6.14.3) |
 | `bambu_network_start_local_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn)` — LAN only |
 | `bambu_network_start_sdcard_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn)` |
 
 Print-job stages — the `SendingPrintJobStage` enum (`bambu_networking.hpp:146-156`): `Create=0, Upload=1, Waiting=2, Sending=3, Record=4, WaitPrinter=5, Finished=6, ERROR=7, Limit=8`.
 
-#### 6.8.1. Cloud upload flow in the plugin (what actually happens)
+#### 6.8.1. Cloud upload flow (stock plugin, MITM)
 
-Both cloud-facing print entry points converge into the same implementation path:
+Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. **How the open plugin maps these ABI symbols internally** (`Agent::run_cloud_print_job`, FTPS vs `:6000`, planned LAN-only refactor) is documented in [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation), not here.
 
-- `bambu_network_start_print` -> `Agent::run_cloud_print_job(..., use_lan_channel=false)`
-- `bambu_network_start_local_print_with_record` -> `Agent::run_cloud_print_job(..., use_lan_channel=true)`
-
-The cloud side of the upload then follows this sequence:
+Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
 1. `POST /v1/iot-service/api/user/project`  
    returns `project_id`, `model_id`, `profile_id`, plus the first presigned `upload_url` and `upload_ticket`.
@@ -755,8 +752,8 @@ The print-job submission ends with a single MQTT command published to the printe
 | `param` | string | derived from `plate_index` | Always `Metadata/plate_<N>.gcode`; resolves to a path inside the uploaded 3mf. |
 | `project_id`, `profile_id`, `task_id`, `subtask_id` | strings | cloud task IDs from `POST /v1/user-service/my/task` (cloud) or `"0"` placeholder (LAN / Developer Mode) | Sent as **strings**, not numbers. |
 | `subtask_name` | string | `project_name` (falls back to `task_name`) | Shown on the printer screen. |
-| `file` | string | `opts.file_path` | Filename (LAN: full FTP path of the uploaded 3mf; cloud: object name in the presigned bucket). |
-| `url` / `url_enc` | string | `opts.url` | The printer needs to know where to fetch the 3mf from. Two mutually exclusive shapes: `url` is the cleartext source (`ftp://<path>` for LAN, presigned `https://…` for cloud); `url_enc` is the same URL encrypted with AES under a per-print key, the AES key in turn wrapped with RSA-OAEP against the printer's device certificate, and the result Base64-encoded. Stock-firmware printers outside Developer Mode require `url_enc`; Developer Mode disables that check and accepts plain `url`. |
+| `file` | string | `opts.file_path` | Basename or path of the `.3mf` on the printer side. Usually mirrors the trailing segment of `url` (without the scheme). See **URL schemes** below. |
+| `url` / `url_enc` | string | `opts.url` | Tells firmware **how to locate** the `.3mf`. Cleartext `url` uses one of several schemes (`ftp://`, `brtc://emmc/`, `file://`, presigned `https://…` for cloud); `url_enc` is the same URL encrypted (AES + RSA-OAEP). Non-Developer-Mode firmware requires `url_enc`; Developer Mode accepts plain `url`. Full scheme semantics: see **URL schemes** below. |
 | `md5` | string | `opts.md5` (uppercase hex) | Printer cross-checks the 3mf integrity before slicing it. |
 | `bed_type` | string | `task_bed_type` (defaults to `"auto"`) | One of the `MachineBedTypeString` values. |
 | `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams` | bool | matching `task_*` flags | Per-print toggles from the `SelectMachineDialog` checkboxes. |
@@ -768,6 +765,21 @@ The print-job submission ends with a single MQTT command published to the printe
 | `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it is omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01`. |
 | `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. Cross-ABI confirmation: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"`; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — a future capture showing e.g. `"1"`, `"2"` or `"5"` would identify another flag's meaning. |
 | `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**: setting `auto_flow_cali=1` flips `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+
+##### URL schemes for model location (`file` / `url`)
+
+The MQTT command is always `project_file`; there is **no** separate `storage: emmc|udisk` field that selects where the model lives. Instead, firmware interprets the **`url` prefix** (and the matching `file` basename/path). Observed / reverse-engineered on **P2S** (May 2026):
+
+| URL prefix | Example | Firmware behaviour (inferred) |
+|---|---|---|
+| `ftp://` | `ftp://skadis_spool-Body.gcode.3mf` | **Legacy LAN print.** Observed on classic `start_local_print` / cloud `_with_record` FTPS legs on N7-class hardware in older captures. P2S Send-to-Printer print-start in recent stock traffic uses `brtc://emmc/` instead (see row above). Current open-plugin behaviour per entry point: [STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation). |
+| `brtc://emmc/` | `brtc://emmc/skadis_spool-Body.gcode.3mf` | **Send-to-Printer model-cache lookup.** Despite the `emmc` token in the scheme, resolution mirrors the dual-volume upload path in §6.14.2: the firmware searches the **external (udisk) model cache first**, then the **internal (emmc) cache** — first hit wins, external has priority. No absolute path is required; only the filename after the prefix matters. |
+| `file://` | `file:///media/usb0/cache/skadis_spool-Body.gcode.3mf` | **Explicit filesystem path.** No cache heuristics — open exactly that file. Typical for **Print from Device** when the `.3mf` is already on storage. Paths observed under `/media/usb0/` with or without a `/cache/` segment (e.g. `file:///media/usb0/skadis_spool-Body.gcode.3mf`). |
+| `https://` | presigned object URL | **Cloud print.** Printer downloads from Bambu object storage; unrelated to local emmc/udisk caches. |
+
+**Upload vs print-start:** choosing Cache vs External in Send to Printer sets `dest_storage` (`"emmc"` / `"udisk"`) in the `:6000` `cmdtype=5` upload (§6.14.2) — that decides **where the file is written**. The `url` scheme at print-start decides **how firmware finds** the file afterward (`brtc://emmc/` = search both caches; `file://` = fixed path).
+
+**Not model storage:** the `cfg` bitmask (`"4"` when `task_timelapse_use_internal=true`) and the `ipcam_get_media_info` preflight (§6.8.3) govern **timelapse video recording** destination, not which `.3mf` is printed.
 
 Sibling `header` object the stock plugin wraps the command in (cloud and LAN alike when paired against signature-checking firmware):
 
@@ -1164,12 +1176,13 @@ Semantically, this ABI describes a "tunnel + job" bus: open a connection to the 
 
 Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the same **BambuTunnelLocal** framing as Device → Files (§7.5.1.1): TLS `:6000`, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289).
 
-**Send to Printer uses only `:6000`, not FTPS.** On P2S, LAN tcpdump of stock Studio during Send to Printer → Cache shows all upload bytes on TCP **:6000**; there are **zero** packets on **:990** for that flow. FTPS remains a separate fallback path in our plugin (`OBN_FT_FTPS_FALLBACK`) when `:6000` is unavailable.
+**Send to Printer model upload is `:6000`, not FTPS.** The `.3mf` body goes over **`ft_*` / TLS :6000** (§6.14.2). Stock does touch FTPS :990 first in some flows, but only for a **tiny `verify_job` write probe** (§6.14.3) — then `QUIT`, session closed, never reused. Our earlier tcpdump of *cache-only* Send to Printer saw zero :990 packets because that UI path may skip the probe when the target storage is already known (`emmc` / `udisk` via `cmd_type=7`).
 
 | `ft_job` `cmd_type` | Wire `cmdtype` | Request (after framing) | Response → `ft_job_result.json` |
 |---------------------|------------------|-------------------------|----------------------------------|
 | `7` (media ability) | `0x0007` | `{"cmdtype":7,"sequence":N,"req":{"peer":"studio","api_version":2}}` | JSON **array of storage labels**, e.g. `["emmc","udisk"]` on P2S |
 | `5` (upload) | `0x0005` | **Chunked** upload — see §6.14.2 (not the legacy one-shot `{path,file,size,md5}` shape) | `resp_ec=0` on success; progress via `msg_cb({"progress":N})` while sending |
+| `4` (observed) | `0x0004` (`FILE_DOWNLOAD`) | Frida on stock: `{"cmd_type":4,"is_mem_file":true,"path":"mem:/26","target_path":""}` — likely in-memory thumbnail / partial fetch during print UI | Stock issues it during print UI; open-plugin coverage: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin) |
 
 Manual probes:
 
@@ -1179,7 +1192,7 @@ Manual probes:
 | [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Repeated delete-free pipeline uploads on one or many sessions (regression harness) |
 | [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of wire variants (confirms P2S rejects one-shot / per-chunk-ACK multi-chunk) |
 
-Our open plugin implements this path when `OBN_FT_TUNNEL_LOCAL=ON` (default), with FTPS `:990` as fallback (`OBN_FT_FTPS_FALLBACK=ON`). Implementation: `src/abi_ft.cpp` (`run_upload_job_native`), `src/tunnel_local.cpp` (framing + send helpers).
+Open-plugin implementation of this wire path: [STATUS.md §6.14.1–6.14.2](STATUS.md#6141-native-6000-vs-ftps-fallback).
 
 #### 6.14.2. P2S `FILE_UPLOAD` (`cmdtype` 5) — chunked pipeline (May 2026)
 
@@ -1237,15 +1250,13 @@ Stock tcpdump (2.6 MiB `.3mf`, Studio → P2S): **~0.75 s** on the wire, **t
 | Rule | Why |
 |------|-----|
 | **Send every chunk back-to-back without `recv` between them** | Waiting for an ACK after chunk 0 on files **> 255 KiB** yields `result:-9203` on the first chunk reply |
-| **Do not call `SSL_read` / frame poll after each chunk send** | Our first implementation polled the socket after every chunk; the first poll blocked ~10 s, the printer timed out the upload session, and the final reply was `-9203` even though Studio showed 100 % sent bytes |
+| **Do not call `SSL_read` / frame poll after each chunk send** | Per-chunk recv or post-send SSL poll mid-pipeline yields `-9203` on P2S for files **> 255 KiB** (REPL + tcpdump) |
 | **Read exactly one terminal reply** after the last chunk | Matches stock behaviour; intermediate `result:1` progress replies are absent in pipelined mode on P2S |
 | Files **≤ 261 120 bytes** fit in a single chunk | Single-chunk uploads succeed even with per-chunk ACK in REPL experiments; the threshold is the firmware chunk size, not a separate code path |
 
-Implementation note: `Session::send_abi_json_with_binary(…, poll_rx_after_send=false)` during the chunk loop; a single `recv_wire_json(…, cmdtype=5, sequence=N)` after the loop.
-
 ##### Do **not** send proactive `FILE_DEL` (`cmdtype` 3)
 
-Early open-plugin attempts deleted the destination name before every upload. That is **wrong** for P2S:
+Delete-before-upload is **wrong** for P2S Send-to-Printer:
 
 - **Unnecessary** — init with `result:19` already means “file exists; continue uploading”.
 - **Harmful** — extra round-trip on a **reused** `ft_*` tunnel races with the upload init; we observed init receiving a stale **delete** reply (`cmdtype:3`, `result:0`) instead of the upload init reply, which surfaced as `-9203` or a false success path.
@@ -1257,12 +1268,7 @@ Use `FILE_DEL` only when Studio's file-browser UI explicitly deletes a file, not
 
 Unlike the file-browser path in `libBambuSource` (strictly one request in flight), `ft_*` keeps one TLS `:6000` session open across **`cmd_type=7` ability** and **`cmd_type=5` upload** jobs. The printer may still have JSON replies buffered from a prior job, or deliver them out of order relative to a naive single-`recv` client.
 
-Open-plugin mitigations (`src/abi_ft.cpp`):
-
-1. **`drain_pending_wire_json()`** immediately before upload init — log and discard already-framed JSON sitting in the session recv buffer.
-2. **`recv_wire_json(…, want_cmdtype, want_seq)`** — accept only replies whose wire `cmdtype` and `sequence` match the outstanding upload step; log and skip anything else (e.g. a belated delete or ability reply).
-
-Always validate **`cmdtype:5` + matching `sequence`** for both init and final replies. Never treat a bare `result:0` on the wrong `cmdtype` as upload success.
+Any client on a reused tunnel must drain or filter stale JSON before upload init and must match replies on **`cmdtype` + `sequence`**, not bare `result:0`. Open-plugin mitigations: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin).
 
 ##### Storage labels (`dest_storage` in `ft_job_create`)
 
@@ -1273,7 +1279,7 @@ P2S `REQUEST_MEDIA_ABILITY` returns `["emmc","udisk"]` (not legacy `sdcard` / `u
 | `"emmc"` | **Cache** (internal model cache) | `LIST_INFO` `type:model` shows uploaded `.3mf` on printer screen |
 | `"udisk"` | **External** (USB-side cache when stick present) | Same wire protocol; storage label selects mount |
 
-MQTT capability flags (`print.fun` / `print.fun2`) govern which tabs Studio **shows** (e.g. model internal storage); they are orthogonal to the upload wire format.
+MQTT capability flags (`print.fun` / `print.fun2`) govern which tabs Studio **shows** (e.g. model internal storage); they are orthogonal to the upload wire format. After upload, print-start uses `project_file` with a `url` scheme (§6.8.2 **URL schemes**) — typically `brtc://emmc/<name>` for cache-resident Send-to-Printer jobs, not a repeat of the `:6000` `storage` label.
 
 ##### Legacy one-shot upload (rejected by P2S)
 
@@ -1283,15 +1289,87 @@ Orca/Bambu Studio sources also describe a **single-frame** upload:
 {"cmdtype":5,"sequence":N,"req":{"path":"/emmc/","file":"…","size":N,"md5":"…","peer":"studio","api_version":3}}
 ```
 
-followed by `\n\n` + entire file. P2S firmware **rejects** this for multi-megabyte Send-to-Printer jobs (connection reset or `-9203`). Keep the chunked init + `frag_id` / `offset` / `size` / `file_md5` path documented above. The one-shot builder remains in `tunnel_local.hpp` for tests and older models only.
+followed by `\n\n` + entire file. P2S firmware **rejects** this for multi-megabyte Send-to-Printer jobs (connection reset or `-9203`). Stock Send-to-Printer on P2S uses the chunked init + `frag_id` / `offset` / `size` / `file_md5` path documented above.
 
 ##### Error code `-9203`
 
-Not listed in Studio's `PrinterFileSystem.h` success enum (§7.5.3). On P2S we consistently saw `-9203` when violating the pipeline rules (per-chunk recv, or post-send SSL poll mid-pipeline). Fixing send/read ordering resolved Send-to-Printer failures without changing JSON field values.
+Not listed in Studio's `PrinterFileSystem.h` success enum (§7.5.3). On P2S we consistently saw `-9203` when violating the pipeline rules (per-chunk recv, or post-send SSL poll mid-pipeline).
 
-##### Progress reporting to Studio
+##### Progress reporting (`msg_cb`)
 
-During pipeline send, the plugin reports `msg_cb` progress from **bytes written** (`offset / total`), not from per-chunk wire ACKs (there are none until the final reply). Set socket I/O timeout generously for the final blocking recv after a large pipelined send (~120 s in our implementation).
+During pipelined send, stock reports upload progress from **bytes written** (`offset / total`), not from per-chunk wire ACKs (there are none until the final reply). Open-plugin timeout and callback details: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin).
+
+#### 6.14.3. FTPS `verify_job` probe (external-storage preflight, May 2026)
+
+Stock `libbambu_networking.so` opens **FTPS :990** briefly in some **Send to Printer / external-target** flows. This is **not** where the `.3mf` lands — it is a legacy **writeability probe** that uploads a tiny stub file named `verify_job`, then **always closes the FTPS session** (`QUIT`). All subsequent model bytes use **`:6000` chunked upload** (§6.14.2).
+
+##### How Studio triggers it
+
+Studio reuses `bambu_network_start_send_gcode_to_sdcard` for two distinct purposes:
+
+| `PrintParams.project_name` | Meaning |
+|----------------------------|---------|
+| `"verify_job"` | Preflight probe only — upload tiny temp file as `/verify_job` on FTPS root |
+| anything else | Full "Send to SD card" path (legacy FTPS `STOR` of the whole `.3mf`) |
+
+For the probe, Studio passes a small temp file; the plugin uploads it under the bare name `verify_job` at the printer FTPS root (`/`), not under `/timelapse/` or `/emmc/`.
+
+##### Observed FTPS transcript (decrypted, P2S)
+
+```text
+220 (vsFTPd 3.0.5)
+USER bblp
+331 Please specify the password.
+PASS <access_code>
+230 Login successful.
+PBSZ 0
+200 PBSZ set to 0.
+PROT P
+200 PROT now Private.
+PWD
+257 "/" is the current directory
+EPSV
+229 Entering Extended Passive Mode (|||50077|)
+TYPE I
+200 Switching to Binary mode.
+STOR verify_job
+150 Ok to send data.          ← external storage writable; probe continues on data channel
+… tiny payload …
+226 Transfer complete.
+QUIT
+221 Goodbye.
+```
+
+When external storage is **absent or not writable**, `STOR verify_job` fails (no `150 Ok to send data.`). Stock Studio treats that as "no external target" and **does not** attempt the follow-up test upload on the passive data port. Either way, **`QUIT` follows and FTPS is done** for this job.
+
+##### Where this sits in the full LAN send flow
+
+Observed port ordering in a **local LAN tcpdump** (P2S, stock `libbambu_networking.so`, Send + print with external USB target, May 2026 — capture not checked into this repo):
+
+```text
+:6000  (session A) — early tunnel traffic (ability / setup)
+:6000  (session B) — may overlap with UI prep
+:990   (~0.7 s)     — FTPS verify_job STOR + QUIT only (~19 packets total)
+:6000  (session C) — ft_* cmd_type=5 chunked .3mf upload (bulk ~262 KiB frames)
+:6000  (session D) — further ft_* / tunnel work
+MQTT :8883          — project_file / print start (outside ft_*)
+```
+
+Packet counts from that session: **19** on `:990`, **220** on `:6000`; largest `:6000` PSH payloads ≈ **262 144 B** (chunk frames).
+
+So: **FTPS is a short side trip, not the upload transport.** Do not implement full Send-to-Printer by `STOR`ing the `.3mf` on :990 when `:6000` works — stock does not do that on P2S for cache send.
+
+Open-plugin coverage of this flow: [STATUS.md §6.14.2–6.14.3](STATUS.md#6142-chunked-6000-upload-open-plugin).
+
+##### Related tools
+
+| Tool | Role |
+|------|------|
+| `tcpdump` / Wireshark on `<printer-ip>` | Reproduce the `:990` probe → `:6000` bulk ordering above (`ip.addr==<printer> && tcp.port in {990,6000,8883}`) |
+| `SSLKEYLOGFILE` + Wireshark | Decrypt FTPS control/data on :990 during a Studio run |
+| [`tools/frida_ft_attach.sh`](../tools/frida_ft_attach.sh) | Hook `ft_job_create` / result callbacks — ABI JSON even when TLS is opaque |
+
+**Do not conflate with Device → Files.** Stock file browsing on P2S stays on `:6000` only. FTPS :990 during Device → Files is a separate topic (§7.5.1); Send to Printer uses `ft_*` in `libbambu_networking.so` (§6.14).
 
 ### 6.15. Filament Manager (cloud spool catalogue)
 
@@ -1454,21 +1532,21 @@ The complete list of error values the plugin is expected to return through `int`
 
 This second module is the one Studio talks to whenever the user opens a printer's **camera live view** or the **on-printer file browser** (under "Device" → "SD Card / USB"). It has nothing in common with `bambu_networking` apart from packaging — different symbol prefix (`Bambu_*`), different loader, different per-platform back-ends. Bambu's stock shipment puts it at the same `<data_dir>/plugins/` path as the main networking plugin, but a missing or stub `libBambuSource` does not stop Studio from starting; only camera/file-browser features get disabled.
 
-This entire section is reverse-engineered from Studio's own source tree; references below all point at the OrcaSlicer subtree (`3rd_party/OrcaSlicer/src/...`), which is used as the ground-truth checkout.
+Reverse-engineered from the upstream BambuStudio tree (see **Source path convention** at the top). OrcaSlicer keeps the same logic under the same file names except the `dlopen` helper: Orca names it `BBLNetworkPlugin::get_source_module()` in `src/slic3r/Utils/BBLNetworkPlugin.cpp` (Orca tree only — that file does not exist in BambuStudio).
 
 ### 7.1. Loading and discovery
 
-Studio resolves `libBambuSource` lazily, on the first time a camera or file-browser tab is shown:
+Bambu Studio resolves `libBambuSource` lazily, on the first time a camera or file-browser tab is shown:
 
-```272:311:3rd_party/OrcaSlicer/src/slic3r/Utils/BBLNetworkPlugin.cpp
+```523:575:src/slic3r/Utils/NetworkAgent.cpp
 #if defined(_MSC_VER) || defined(_WIN32)
-HMODULE BBLNetworkPlugin::get_source_module()
+HMODULE NetworkAgent::get_bambu_source_entry()
 #else
-void* BBLNetworkPlugin::get_source_module()
+void* NetworkAgent::get_bambu_source_entry()
 #endif
 {
-    if ((m_source_module) || (!m_networking_module))
-        return m_source_module;
+    if ((source_module) || (!networking_module))
+        return source_module;
 
     std::string library;
     std::string data_dir_str = data_dir();
@@ -1478,7 +1556,7 @@ void* BBLNetworkPlugin::get_source_module()
 #if defined(_MSC_VER) || defined(_WIN32)
     library = plugin_folder.string() + "/" + std::string(BAMBU_SOURCE_LIBRARY) + ".dll";
     ...
-    m_source_module = LoadLibrary(lib_wstr);
+    source_module = LoadLibrary(lib_wstr);
     ...
 #else
 #if defined(__WXMAC__)
@@ -1486,10 +1564,10 @@ void* BBLNetworkPlugin::get_source_module()
 #else
     library = plugin_folder.string() + "/" + std::string("lib") + std::string(BAMBU_SOURCE_LIBRARY) + ".so";
 #endif
-    m_source_module = dlopen(library.c_str(), RTLD_LAZY);
+    source_module = dlopen(library.c_str(), RTLD_LAZY);
 #endif
 
-    return m_source_module;
+    return source_module;
 }
 ```
 
@@ -1503,13 +1581,13 @@ So the resolved file names are:
 
 Notable side effects:
 
-- The function early-returns `nullptr` when `m_networking_module == nullptr`, so `libBambuSource` is **never** loaded standalone — `bambu_networking` must be loaded first.
+- The function early-returns `nullptr` when `networking_module == nullptr`, so `libBambuSource` is **never** loaded standalone — `bambu_networking` must be loaded first.
 - There is no signature check on this module, no version-prefix gate, no fall-back to `<data_dir>/plugins/backup/`. Studio either gets a non-null module, fishes out C symbols via `dlsym`/`GetProcAddress` (§7.2), and never touches it again, or it falls back to a `Fake_Bambu_Create` stub (§7.2) and the whole feature surface is disabled.
-- The single public accessor is `Slic3r::NetworkAgent::get_bambu_source_entry()` (`src/slic3r/Utils/NetworkAgent.cpp:67-75`); it is the entry point the camera UI and the file browser both call when they want to talk to this library.
+- The single public accessor is `Slic3r::NetworkAgent::get_bambu_source_entry()` (`src/slic3r/Utils/NetworkAgent.cpp:523-575`); the camera UI and the file browser both call it when they need this library.
 
 ### 7.2. C ABI surface (`Bambu_*`)
 
-The header lives at `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/BambuTunnel.h` and ships **both** as a static-link header (`#define BAMBU_DYNAMIC` off) and as a dlopen function-pointer table (`BAMBU_DYNAMIC` on, `typedef struct __BambuLib { ... } BambuLib`). Studio uses the dlopen path: `PrinterFileSystem.cpp` defines
+The header lives at `src/slic3r/GUI/Printer/BambuTunnel.h` and ships **both** as a static-link header (`#define BAMBU_DYNAMIC` off) and as a dlopen function-pointer table (`BAMBU_DYNAMIC` on, `typedef struct __BambuLib { ... } BambuLib`). Studio uses the dlopen path: `PrinterFileSystem.cpp` defines
 
 ```cpp
 class PrinterFileSystem : ..., BambuLib { ... };
@@ -1517,7 +1595,7 @@ class PrinterFileSystem : ..., BambuLib { ... };
 
 i.e. it inherits the function-pointer table directly into the file-browser object. The pointers are wired up by `StaticBambuLib`:
 
-```1819:1855:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp
+```1831:1867:src/slic3r/GUI/Printer/PrinterFileSystem.cpp
 StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
 {
     static StaticBambuLib lib;
@@ -1597,7 +1675,7 @@ Studio's two consumers each build their own URL.
 
 Built in `MediaPlayCtrl::Play` (`src/slic3r/GUI/MediaPlayCtrl.cpp:307-318`) and `MediaPlayCtrl::ToggleStream` (`...:551-559`):
 
-```307:318:3rd_party/OrcaSlicer/src/slic3r/GUI/MediaPlayCtrl.cpp
+```307:318:src/slic3r/GUI/MediaPlayCtrl.cpp
         std::string url;
         if (m_lan_proto == MachineObject::LVL_Local)
             url = "bambu:///local/" + m_lan_ip + ".?port=6000&user=" + m_lan_user + "&passwd=" + m_lan_passwd;
@@ -1624,7 +1702,7 @@ The trailing query parameters (`device`, `net_ver`, `dev_ver`, `cli_id`, `cli_ve
 
 #### 7.3.2. File browser
 
-Built in `PrinterFileSystem::Reconnect` via `MediaFilePanel`. Studio uses the same **URL shape** as the MJPEG camera (`bambu:///local/<ip>.?port=6000&user=<u>&passwd=<p>&...`) — same TCP port — but stock `libBambuSource` instantiates **`BambuTunnelLocal`** for LAN file browsing, **not** the MJPEG 80-byte auth path from [`video.md`](../3rd_party/OpenBambuAPI/video.md). After `Bambu_Open` (TLS only) Studio calls `Bambu_StartStreamEx(tunnel, 0x3001)`, which runs a multi-step wire handshake (§7.5.1.1) before any `LIST_INFO` JSON appears on the wire. On printers that lack `StartStreamEx` (older firmwares), Studio falls back to `Bambu_StartStream(tunnel, false)` (`PrinterFileSystem.cpp:1739`).
+Built in `PrinterFileSystem::Reconnect` via `MediaFilePanel`. Studio uses the same **URL shape** as the MJPEG camera (`bambu:///local/<ip>.?port=6000&user=<u>&passwd=<p>&...`) — same TCP port — but stock `libBambuSource` instantiates **`BambuTunnelLocal`** for LAN file browsing, **not** the MJPEG 80-byte auth path from [`video.md`](https://github.com/Doridian/OpenBambuAPI/blob/master/video.md). After `Bambu_Open` (TLS only) Studio calls `Bambu_StartStreamEx(tunnel, 0x3001)`, which runs a multi-step wire handshake (§7.5.1.1) before any `LIST_INFO` JSON appears on the wire. On printers that lack `StartStreamEx` (older firmwares), Studio falls back to `Bambu_StartStream(tunnel, false)` (`PrinterFileSystem.cpp:1747-1748`).
 
 ### 7.4. Per-platform camera back-end (the critical part)
 
@@ -1651,7 +1729,7 @@ The subsections below describe each back-end. §7.4.1 (Linux gstbambusrc) and §
 
 `wxMediaCtrl2::wxMediaCtrl2()` (`src/slic3r/GUI/wxMediaCtrl2.cpp:44-68`, in the `__LINUX__` branch) registers a custom GStreamer element after the underlying `wxMediaCtrl` has spun up its own playbin:
 
-```44:68:3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp
+```44:68:src/slic3r/GUI/wxMediaCtrl2.cpp
 #ifdef __LINUX__
     auto playbin = reinterpret_cast<wxGStreamerMediaBackend *>(m_imp)->m_playbin;
     GstElement* video_sink = nullptr;
@@ -1670,11 +1748,11 @@ The subsections below describe each back-end. §7.4.1 (Linux gstbambusrc) and §
 
 `gstbambusrc_register` lives in `src/slic3r/GUI/Printer/gstbambusrc.c` — it is **statically linked into Studio's binary** (no plugin search path involved). The element handles the `bambu://` URI scheme; internally it calls the generic accessor `bambulib_get()`, which in turn returns the same `StaticBambuLib` pointer table used by the file browser:
 
-```67:67:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/gstbambusrc.c
+```67:67:src/slic3r/GUI/Printer/gstbambusrc.c
 BambuLib *bambulib_get();
 ```
 
-```1871:1872:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp
+```1883:1884:src/slic3r/GUI/Printer/PrinterFileSystem.cpp
 extern "C" BambuLib *bambulib_get() {
     return &StaticBambuLib::get(); }
 ```
@@ -1694,7 +1772,7 @@ Note: this is the path **OrcaSlicer** and pre-`94d91be60` BambuStudio take on Wi
 
 `wxMediaCtrl2::Load` (the Windows branch) drops `wxURI("bambu:...")` into `wxMediaCtrl::Load`, which uses wxWidgets's `wxMediaBackendDirectShow`. wxWidgets resolves the URL by looking up `HKCR\bambu\Source Filter` in the registry to find the CLSID that handles `bambu:` URLs, then `CoCreateInstance`s that CLSID and asks the resulting filter to load the URL via `IFileSourceFilter::Load`. Studio expects a custom **DirectShow source filter** to be COM-registered against the URL scheme `bambu:`:
 
-```95:138:3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp
+```95:138:src/slic3r/GUI/wxMediaCtrl2.cpp
 #define CLSID_BAMBU_SOURCE L"{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}"
 ...
         wxRegKey key11(wxRegKey::HKCU, L"SOFTWARE\\Classes\\CLSID\\" CLSID_BAMBU_SOURCE L"\\InProcServer32");
@@ -1731,7 +1809,7 @@ Stock filter internals are closed source. Studio-side contract inferred from `wx
 
 On macOS Studio does **not** use wxMediaCtrl's GStreamer/AVFoundation back-end. Instead, `wxMediaCtrl2.mm` reaches directly into `libBambuSource.dylib` and looks up an Objective-C class by the synthetic name `OBJC_CLASS_$_BambuPlayer`:
 
-```67:85:3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.mm
+```67:85:src/slic3r/GUI/wxMediaCtrl2.mm
 void wxMediaCtrl2::create_player()
 {
     auto module = Slic3r::NetworkAgent::get_bambu_source_entry();
@@ -1754,7 +1832,7 @@ void wxMediaCtrl2::create_player()
 
 The expected interface is documented in `src/slic3r/GUI/BambuPlayer/BambuPlayer.h:14-28`:
 
-```14:28:3rd_party/OrcaSlicer/src/slic3r/GUI/BambuPlayer/BambuPlayer.h
+```14:28:src/slic3r/GUI/BambuPlayer/BambuPlayer.h
 @interface BambuPlayer : NSObject
 
 + (void) initialize;
@@ -1818,13 +1896,13 @@ In every case the file-browser path uses **only** the `Bambu_*` C ABI plus the C
 
 When Studio opens a file browser, it uses the same `Bambu_Create` / `Bambu_Open` URL as the LAN camera, then calls `Bambu_StartStreamEx(tunnel, CTRL_TYPE = 0x3001)`:
 
-```32:32:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h
+```32:32:src/slic3r/GUI/Printer/PrinterFileSystem.h
     static const int CTRL_TYPE     = 0x3001;
 ```
 
 On LAN, stock `libBambuSource` routes this through **`BambuTunnelLocal`** (`createBambuTunnelLocal` in the plugin binary): `Bambu_Open` is TLS connect only; `Bambu_StartStreamEx(0x3001)` sends the subchannel login + `mtype` 12291 setup frames documented in §7.5.1.1. Only after that handshake completes does the tunnel accept framed CTRL JSON (`mtype` 12289) for `LIST_INFO` / `SUB_FILE` / …
 
-```1738:1750:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp
+```1747:1758:src/slic3r/GUI/Printer/PrinterFileSystem.cpp
                 do{
                     ret = Bambu_StartStreamEx ? Bambu_StartStreamEx(tunnel, CTRL_TYPE) : Bambu_StartStream(tunnel, false);
                     if (ret == Bambu_would_block)
@@ -1863,9 +1941,17 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 
 **Multiple clients.** Unlike an earlier working assumption, the printer **does allow several simultaneous TLS :6000 sessions** (verified with two independent REPL connections while Studio also had Files open). There is no exclusive lock on the port.
 
-**Do not conflate with FTPS :990.** The printer's implicit FTPS service (§7.6.3) is a **fallback** for our open `ft_*` plugin and is used for some LAN print flows. Stock **Send to Printer → Cache** on P2S goes over **TLS :6000 only** (§6.14.2); stock Device → Files browsing also stays on :6000 (see §7.6.1.1 for what FTPS exports on that model).
+**Do not conflate with FTPS :990.** Three distinct uses of FTPS on P2S:
 
-**Do not conflate with MJPEG auth.** The 80-byte `0x3000` auth block in [`video.md`](../3rd_party/OpenBambuAPI/video.md) applies to **MJPEG live view on A1 / P1 / P1P** (`BambuTunnelLocal` is still used on some paths, but the camera stream uses different post-auth bytes). Sending that 80-byte packet on a P2S file-browser session yields a 24-byte `0x0003013f` ack and the peer closes — it is the wrong handshake.
+| Use | Library | When | Upload transport |
+|-----|---------|------|------------------|
+| Device → Files browse (external USB) | `libBambuSource` (stock: `:6000`; our workaround: FTPS) | File browser tab | N/A (lists/downloads only) |
+| **`verify_job` preflight** | `libbambu_networking` | Send to Printer when stock needs external write test | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
+| Legacy LAN print / SD send | `libbambu_networking` | `start_local_print`, non-probe `start_send_gcode_to_sdcard` | Full `.3mf` over FTPS `STOR` (older path; P2S cache send prefers `:6000`) |
+
+Stock **Send to Printer → cache** on P2S: **`verify_job` FTPS probe (optional) + `:6000` chunked upload** — not a full FTPS model transfer.
+
+**Do not conflate with MJPEG auth.** The 80-byte `0x3000` auth block in [`video.md`](https://github.com/Doridian/OpenBambuAPI/blob/master/video.md) applies to **MJPEG live view on A1 / P1 / P1P** (`BambuTunnelLocal` is still used on some paths, but the camera stream uses different post-auth bytes). Sending that 80-byte packet on a P2S file-browser session yields a 24-byte `0x0003013f` ack and the peer closes — it is the wrong handshake.
 
 Internal timelapse **recording** during print (`task_timelapse_use_internal` → MQTT `project_file` `"cfg":"4"`) is handled by **`libbambu_networking`**, not the file-browser CTRL path documented here.
 
@@ -1954,7 +2040,7 @@ This is the JSON **inside** `libBambuSource` before the plugin adds `"mtype":122
 
 The serialiser is in `PrinterFileSystem::SendRequest` (`src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1431-1458`):
 
-```1431:1458:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp
+```1431:1458:src/slic3r/GUI/Printer/PrinterFileSystem.cpp
 boost::uint32_t PrinterFileSystem::SendRequest(int type, json const &req, callback_t2 const &callback,const std::string& param)
 {
     ...
@@ -2032,7 +2118,7 @@ Asynchronous notifications (printer-initiated, no preceding `Bambu_SendMessage`)
 
 The full set of `cmdtype` values is in `PrinterFileSystem.h:34-45`:
 
-```34:45:3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h
+```34:45:src/slic3r/GUI/Printer/PrinterFileSystem.h
     enum {
         LIST_INFO             = 0x0001,
         SUB_FILE              = 0x0002,
@@ -2076,7 +2162,7 @@ Older Studio builds also used logical labels **`sdcard`** / **`usb`** in `REQUES
 
 #### 7.6.1.1. Observed FTPS filesystem layout (LAN probe)
 
-FTPS :990 on the printer is a separate service from the stock file browser (§7.5.1). Layout below is from direct `CWD`/`LIST` probes against the printer's FTPS daemon — relevant for LAN print upload and `ft_*` traffic, not for stock Device → Files on P2S.
+FTPS :990 on the printer is a separate service from the stock file browser (§7.5.1). Layout below is from direct `CWD`/`LIST` probes against the printer's FTPS daemon — relevant for **`verify_job` preflight** (§6.14.3), legacy LAN print `STOR`, and our `libBambuSource` FTPS browsing workaround. **Not** where P2S cache Send-to-Printer uploads the `.3mf` (that is `:6000`, §6.14.2).
 
 **P2S (May 2026):**
 
@@ -2132,7 +2218,7 @@ Bambu firmware ships a stripped-down vsftpd / busybox-ftpd hybrid (the exact ima
 A few practical contracts that the Studio code path enforces but does not document:
 
 - **Tunnel ownership**. Studio creates one tunnel per UI tab. The camera tab and the file-browser tab live on different `Bambu_Tunnel` handles even though they target the same printer IP. The plugin must not share state across them.
-- **`Bambu_would_block` is not an error**. Both `Bambu_Open` and `Bambu_StartStream*` are expected to be polled (`PrinterFileSystem.cpp:1738-1749`, `gstbambusrc.c` does the same). Studio retries with a 100 ms backoff for up to 3-5 seconds, then gives up.
+- **`Bambu_would_block` is not an error**. Both `Bambu_Open` and `Bambu_StartStream*` are expected to be polled (`PrinterFileSystem.cpp:1747-1758`, `gstbambusrc.c` does the same). Studio retries with a 100 ms backoff for up to 3-5 seconds, then gives up.
 - **`Bambu_ReadSample` controls the wakeup cadence**. On the file-browser tunnel the worker calls `Bambu_ReadSample` with no separate condvar — it relies on the plugin returning `Bambu_would_block` instead of blocking forever. A plugin that blocks indefinitely freezes the tab.
 - **Negative return values are fatal**. Anything outside `{0, Bambu_stream_end, Bambu_would_block, Bambu_buffer_limit}` makes Studio call `Bambu_Close` + `Bambu_Destroy` and try to re-open the tunnel from scratch. (`PrinterFileSystem.cpp:1577-1593`.)
 - **Logger callback is signal-safe**. `Bambu_SetLogger` is invoked from arbitrary threads; the receiving callback inside Studio (`bambu_log` in `wxMediaCtrl3.cpp` for current Windows/Linux Studio, `bambu_log` in `wxMediaCtrl2.mm` for macOS, `DumpLog` in `PrinterFileSystem.cpp` for the file browser everywhere) is wrapped to be reentrant. The plugin must not assume the callback runs on a particular thread. On Windows the logger receives `wchar_t const*` strings (a UTF-16 buffer), on POSIX it receives `char const*` (UTF-8); the plugin must allocate accordingly because Studio frees each message with `Bambu_FreeLogMsg`.
@@ -2142,21 +2228,21 @@ A few practical contracts that the Studio code path enforces but does not docume
 
 | Topic | File:lines |
 |-------|------------|
-| C ABI declarations / function-pointer table | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/BambuTunnel.h` |
-| Loader (`StaticBambuLib`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1817-1872` |
-| `dlopen`/`LoadLibrary` of `libBambuSource` | `3rd_party/OrcaSlicer/src/slic3r/Utils/BBLNetworkPlugin.cpp:272-311` |
-| Public accessor `get_bambu_source_entry` | `3rd_party/OrcaSlicer/src/slic3r/Utils/NetworkAgent.cpp:67-75` |
-| Linux/Windows camera widget — current Studio (FFmpeg-based) | `3rd_party/BambuStudio/src/slic3r/GUI/wxMediaCtrl3.{cpp,h}`, `AVVideoDecoder.{cpp,h}` |
-| Linux camera back-end (gstbambusrc, used by Orca / legacy Studio) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/gstbambusrc.c`, `gstbambusrc.h` |
-| Windows camera back-end (DirectShow filter, COM CLSID — Orca / legacy Studio only) | `3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
-| macOS camera (`BambuPlayer` Objective-C) | `3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.mm:67-141`, `BambuPlayer/BambuPlayer.h` |
-| Camera URL formats (`bambu:///local/`, `rtsps___`, `rtsp___`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/MediaPlayCtrl.cpp:307-318, 551-559` |
-| File-browser `CTRL_TYPE` constant | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h:32` |
-| File-browser command codes (`LIST_INFO` etc.) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h:34-45` |
-| File-browser error codes | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h:48-72` |
-| CTRL JSON envelope (`cmdtype`/`sequence`/`req`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1431-1458` |
-| CTRL response dispatch | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1567-1596` |
-| Camera UI panel and state machine | `3rd_party/OrcaSlicer/src/slic3r/GUI/MediaPlayCtrl.cpp` |
+| C ABI declarations / function-pointer table | `src/slic3r/GUI/Printer/BambuTunnel.h` |
+| Loader (`StaticBambuLib`) | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1831-1877` |
+| `dlopen`/`LoadLibrary` of `libBambuSource` | `src/slic3r/Utils/NetworkAgent.cpp:523-575` |
+| Public accessor `get_bambu_source_entry` | `src/slic3r/Utils/NetworkAgent.cpp:523-575` |
+| Linux/Windows camera widget — current Studio (FFmpeg-based) | `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}`, `AVVideoDecoder.{cpp,h}` |
+| Linux camera back-end (gstbambusrc, used by Orca / legacy Studio) | `src/slic3r/GUI/Printer/gstbambusrc.c`, `gstbambusrc.h` |
+| Windows camera back-end (DirectShow filter, COM CLSID — Orca / legacy Studio only) | `src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
+| macOS camera (`BambuPlayer` Objective-C) | `src/slic3r/GUI/wxMediaCtrl2.mm:67-141`, `BambuPlayer/BambuPlayer.h` |
+| Camera URL formats (`bambu:///local/`, `rtsps___`, `rtsp___`) | `src/slic3r/GUI/MediaPlayCtrl.cpp:307-318, 551-559` |
+| File-browser `CTRL_TYPE` constant | `src/slic3r/GUI/Printer/PrinterFileSystem.h:32` |
+| File-browser command codes (`LIST_INFO` etc.) | `src/slic3r/GUI/Printer/PrinterFileSystem.h:34-45` |
+| File-browser error codes | `src/slic3r/GUI/Printer/PrinterFileSystem.h:48-72` |
+| CTRL JSON envelope (`cmdtype`/`sequence`/`req`) | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1431-1458` |
+| CTRL response dispatch | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1567-1596` |
+| Camera UI panel and state machine | `src/slic3r/GUI/MediaPlayCtrl.cpp` |
 
 ---
 
@@ -2196,8 +2282,8 @@ A few practical contracts that the Studio code path enforces but does not docume
 | UI install job | `src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp:16-146` |
 | "Downloading Bambu Network Plug-in" dialog | `src/slic3r/GUI/DownloadProgressDialog.cpp` |
 | `libBambuSource` C ABI | `src/slic3r/GUI/Printer/BambuTunnel.h` |
-| `libBambuSource` loader | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1817-1872` |
-| `libBambuSource` `dlopen`/`LoadLibrary` | `src/slic3r/Utils/BBLNetworkPlugin.cpp:272-311` |
+| `libBambuSource` loader | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1831-1877` |
+| `libBambuSource` `dlopen`/`LoadLibrary` | `src/slic3r/Utils/NetworkAgent.cpp:523-575` |
 | Camera URL formats | `src/slic3r/GUI/MediaPlayCtrl.cpp:307-318, 551-559` |
 | File-browser CTRL command set | `src/slic3r/GUI/Printer/PrinterFileSystem.h:32-72` |
 | File-browser CTRL JSON envelope | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1431-1458` |
