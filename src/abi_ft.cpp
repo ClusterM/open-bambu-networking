@@ -29,6 +29,7 @@
 #include <thread>
 
 #include "obn/abi_export.hpp"
+#include "obn/ft_tunnel_local_env.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/tunnel_upload.hpp"
@@ -69,7 +70,7 @@ using ft_job_msg_cb        = void (*)(void* user, ft_job_msg msg);
 namespace {
 
 constexpr const char* kUnsupportedMsg =
-    "FileTransfer over TCP is not implemented by the open-source plugin. "
+    "FileTransfer for this URL is not supported (non-LAN / cloud TUTK). "
     "Studio will fall back to FTP (see README)";
 
 constexpr int kCmdTypeUpload       = 5;
@@ -88,20 +89,9 @@ struct LanUrl {
     std::string net_ver;
 };
 
-bool env_truthy(const char* name, bool default_val)
-{
-    const char* v = std::getenv(name);
-    if (!v || !*v) return default_val;
-    return v[0] != '0';
-}
-
 bool ft_tunnel_local_enabled()
 {
-#if OBN_FT_TUNNEL_LOCAL
-    return env_truthy("OBN_FT_TUNNEL_LOCAL", true);
-#else
-    return env_truthy("OBN_FT_TUNNEL_LOCAL", false);
-#endif
+    return obn::ft_tunnel_local::runtime_enabled();
 }
 
 std::string percent_decode(const std::string& s)

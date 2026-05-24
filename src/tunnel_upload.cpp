@@ -206,10 +206,6 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
     const std::size_t buffer_size =
         static_cast<std::size_t>(chunk_size_kb) * 1024;
 
-    if (offset > 0) {
-        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    }
-
     std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> md5_ctx(
         EVP_MD_CTX_new(),
         [](EVP_MD_CTX* c) { if (c) EVP_MD_CTX_free(c); });
@@ -220,6 +216,31 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
     }
 
     std::vector<char> buffer(buffer_size);
+
+    if (offset > 0) {
+        in.seekg(0, std::ios::beg);
+        std::uint64_t hashed = 0;
+        while (hashed < offset) {
+            const std::size_t want = static_cast<std::size_t>(
+                std::min<std::uint64_t>(offset - hashed, buffer_size));
+            in.read(buffer.data(), static_cast<std::streamsize>(want));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) {
+                out.error = "read error hashing resume prefix";
+                if (obn::os::socket_valid(fd)) obn::tls::clear_socket_io_timeout(fd);
+                return out;
+            }
+            const auto read_size = static_cast<std::size_t>(got);
+            if (EVP_DigestUpdate(md5_ctx.get(), buffer.data(), read_size) != 1) {
+                out.error = "md5 update failed";
+                if (obn::os::socket_valid(fd)) obn::tls::clear_socket_io_timeout(fd);
+                return out;
+            }
+            hashed += read_size;
+        }
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    }
+
     std::uint32_t frag_id = 0;
     int last_reported_pct = -1;
     std::string digest_lower;

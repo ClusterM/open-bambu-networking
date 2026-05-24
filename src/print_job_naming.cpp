@@ -1,5 +1,7 @@
 #include "obn/print_job.hpp"
 
+#include "obn/ft_tunnel_local_env.hpp"
+
 #include <cstring>
 #include <string>
 
@@ -71,12 +73,7 @@ std::string strip_leading_slash(const std::string& s)
 
 bool use_brtc_cache_upload(const BBL::PrintParams& p)
 {
-#if OBN_FT_TUNNEL_LOCAL
-    return p.try_emmc_print;
-#else
-    (void)p;
-    return false;
-#endif
+    return p.try_emmc_print && obn::ft_tunnel_local::runtime_enabled();
 }
 
 std::string build_brtc_emmc_url(const std::string& remote_name)

@@ -41,6 +41,18 @@ typedef ft_err (*fn_set_msg_cb)(FT_JobHandle*, void (*)(void*, ft_job_msg), void
 typedef void (*fn_release_tunnel)(FT_TunnelHandle*);
 typedef void (*fn_release_job)(FT_JobHandle*);
 
+static const char* default_plugin_path(void)
+{
+    const char* home = getenv("HOME");
+    static char path[512];
+    if (home && home[0]) {
+        snprintf(path, sizeof(path),
+                 "%s/.config/BambuStudio/plugins/libbambu_networking.so", home);
+        return path;
+    }
+    return "libbambu_networking.so";
+}
+
 static const char* env_or(const char* name)
 {
     const char* v = getenv(name);
@@ -87,8 +99,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    const char* so = argc > 1 ? argv[1]
-                            : "/home/cluster/.config/BambuStudio/plugins/libbambu_networking.so";
+    const char* so = argc > 1 ? argv[1] : default_plugin_path();
     const char* path = argc > 2 ? argv[2] : "/tmp/obn_test_upload.bin";
 
     char url[512];

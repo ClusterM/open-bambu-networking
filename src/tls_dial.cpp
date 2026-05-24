@@ -44,11 +44,10 @@ thread_local std::string g_last_error;
 
 void set_error(const char* msg)
 {
-    if (g_error_sink) {
-        g_error_sink(msg ? msg : "");
-        return;
-    }
     g_last_error = msg ? msg : "";
+    if (g_error_sink) {
+        g_error_sink(g_last_error.c_str());
+    }
 }
 
 void init_once()

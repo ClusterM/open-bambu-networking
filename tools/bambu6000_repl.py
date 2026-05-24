@@ -280,11 +280,13 @@ class LocalCtrlSession:
 
     @contextmanager
     def _sync_recv(self) -> Iterator[None]:
-        self._sync_depth += 1
+        with self._lock:
+            self._sync_depth += 1
         try:
             yield
         finally:
-            self._sync_depth -= 1
+            with self._lock:
+                self._sync_depth -= 1
 
     def _pop_json_frame(self, timeout: float) -> Optional[dict[str, Any]]:
         deadline = time.monotonic() + timeout
@@ -344,7 +346,9 @@ class LocalCtrlSession:
         # Do not hold _lock across recv: handshake/send paths need the same lock.
         self._ssl.settimeout(1.0)
         while not self._stop.is_set():
-            if self._sync_depth > 0:
+            with self._lock:
+                sync_active = self._sync_depth > 0
+            if sync_active:
                 time.sleep(0.02)
                 continue
             try:

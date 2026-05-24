@@ -69,10 +69,8 @@ const char* ssl_fail_reason(SSL* ssl)
         ERR_error_string_n(err, buf, sizeof(buf));
         return buf;
     }
-    if (!ssl) return "ssl=null";
-    const int e = SSL_get_error(ssl, -1);
-    std::snprintf(buf, sizeof(buf), "SSL_get_error=%d", e);
-    return buf;
+    (void)ssl;
+    return "SSL I/O error (no OpenSSL error queued)";
 }
 
 } // namespace
