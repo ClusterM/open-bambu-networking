@@ -129,6 +129,15 @@ static void test_ft_wire_helpers()
     CHECK(bin.size() == 3u);
 }
 
+static void test_build_file_download_abi()
+{
+    const std::string abi = obn::tunnel_local::build_file_download_abi(
+        9, "mem:/26", 0, "");
+    CHECK(abi.find("\"cmdtype\":4") != std::string::npos);
+    CHECK(abi.find("\"path\":\"mem:/26\"") != std::string::npos);
+    CHECK(abi.find("is_mem_file") == std::string::npos);
+}
+
 int main()
 {
     test_frame_header();
@@ -136,6 +145,7 @@ int main()
     test_consume_frames();
     test_login_payload();
     test_ft_wire_helpers();
+    test_build_file_download_abi();
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
         return 1;

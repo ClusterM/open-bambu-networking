@@ -816,9 +816,14 @@ function installHooks() {
     try {
       const sslN = hookGlobalSsl(mod);
       if (!sslN) {
-        emit('[!] SSL_write/SSL_read not found — stock plugin uses static stripped OpenSSL');
+        const stockLikely = mod.size > 8 * 1024 * 1024;
+        emit('[!] SSL_write/SSL_read not found — ' +
+             (stockLikely
+               ? 'stock plugin (~31MB): OpenSSL is static-linked and stripped'
+               : 'OpenSSL symbols missing in this build'));
+        emit('[!] ABI hooks still log ft_job JSON; wire plaintext needs exported SSL_* or FRIDA_FT_SSL_*_OFF');
         emit('[!] syscall hooks see TLS ciphertext (17 03 03), not JSON plaintext');
-        emit('[*] options: SSLKEYLOGFILE + Wireshark, or FRIDA_FT_SSL_WRITE_OFF=0x... after RE');
+        emit('[*] options: open plugin for wire, SSLKEYLOGFILE + Wireshark, or FRIDA_FT_SSL_WRITE_OFF=0x... after RE');
       }
       hookGlobalWrite();
     } catch (e) {

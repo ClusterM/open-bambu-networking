@@ -70,9 +70,10 @@ std::string wrap_ctrl_abi_with_binary(const std::string& abi_json,
 bool split_json_prefix(const std::uint8_t* data, std::size_t len,
                        std::string* json_out, std::vector<std::uint8_t>* bin_out);
 
-constexpr int kCmdMediaAbility = 7;
-constexpr int kCmdFileUpload   = 5;
-constexpr int kCmdFileDel      = 3;
+constexpr int kCmdMediaAbility  = 7;
+constexpr int kCmdFileUpload    = 5;
+constexpr int kCmdFileDownload  = 4;
+constexpr int kCmdFileDel       = 3;
 
 std::string build_media_ability_abi(std::uint32_t sequence);
 // Legacy one-shot upload (rejected by P2S firmware; kept for tests / older models).
@@ -91,6 +92,14 @@ std::string build_file_upload_init_abi(std::uint32_t sequence,
 std::string build_file_delete_abi(std::uint32_t sequence,
                                   const std::string& dest_storage,
                                   const std::string& dest_name);
+
+// FILE_DOWNLOAD init (PrinterFileSystem::DownloadFiles / DownloadRamFile).
+// Note: Studio ABI has is_mem_file; wire uses path=mem:/N + offset only (see
+// PrinterFileSystem::DownloadRamFile — no is_mem_file on wire).
+std::string build_file_download_abi(std::uint32_t sequence,
+                                    const std::string& path,
+                                    std::uint64_t offset = 0,
+                                    const std::string& target_path = {});
 
 // Chunked upload phase 2: one fragment + optional file_md5 on the last chunk.
 std::string build_file_upload_chunk_abi(std::uint32_t sequence,
@@ -118,6 +127,9 @@ int parse_upload_progress(const std::string& wire_json, int* result_code);
 
 // Wire "result" field (-1 when JSON missing / unparsable).
 int parse_wire_result(const std::string& wire_json);
+
+// Inner "reply" object serialized; empty when absent.
+std::string parse_wire_reply_json(const std::string& wire_json);
 
 // Wire envelope fields (-1 when JSON missing / unparsable).
 int parse_wire_cmdtype(const std::string& wire_json);

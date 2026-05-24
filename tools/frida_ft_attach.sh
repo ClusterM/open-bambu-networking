@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# Attach Frida logger for libbambu_networking.so (Send to Printer / ft_*).
+# Attach Frida logger for libbambu_networking.so (Send to Printer / ft_* / Printer Preview).
 #
-# Before capture, install the stock plugin:
-#   cp ~/.config/BambuStudio/plugins/backup/libbambu_networking.so \
-#      ~/.config/BambuStudio/plugins/libbambu_networking.so
-# Restart Bambu Studio, then run this script and repeat Send to Printer.
-#
-# Wire capture (default ON): SSL_write/SSL_read plaintext when found; ABI JSON always -> ft_wire.log
-# Stock plugin: static stripped OpenSSL — syscall read/write is TLS ciphertext (off by default).
+# Captures ft_* ABI: cmd_type 5 upload, 7 ability, 4 mem download (mem:/26 preview).
+# Stock plugin (~31 MB): static stripped OpenSSL — SSL_write/SSL_read often missing;
+# ABI hooks still log ft_job JSON. For plaintext wire use open plugin, SSLKEYLOGFILE,
+# or tools/bambu6000_repl.py /download.
 #
 #   ./tools/frida_ft_attach.sh              # ABI + wire (JSON in log via ABI hooks)
 #   ./tools/frida_ft_attach.sh --safe       # ABI only (if Studio crashes)

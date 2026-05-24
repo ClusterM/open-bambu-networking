@@ -1,5 +1,7 @@
 #include "obn/tunnel_upload.hpp"
 
+#include "obn/json_lite.hpp"
+
 #include "obn/bambu_networking.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
@@ -8,6 +10,8 @@
 #include "obn/tunnel_local.hpp"
 
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <random>
 
@@ -141,6 +145,152 @@ void drain_stale_wire_json(obn::tunnel_local::Session* session, const char* phas
     for (const auto& pending : session->drain_pending_wire_json()) {
         OBN_WARN("tunnel_upload (%s): drain buffered reply: %.200s",
                  phase, pending.c_str());
+    }
+}
+
+int download_progress_pct(const std::string& wire_json)
+{
+    std::string perr;
+    const auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return -1;
+    const auto reply = root->find("reply");
+    if (!reply.is_object()) return -1;
+    const double total = reply.find("total").as_number(-1.0);
+    if (total <= 0.0) return -1;
+    const double offset = reply.find("offset").as_number(0.0);
+    const double size   = reply.find("size").as_number(0.0);
+    const double pct    = (offset + size) * 100.0 / total;
+    if (pct < 0.0) return 0;
+    if (pct > 100.0) return 100;
+    return static_cast<int>(pct);
+}
+
+bool reply_has_mem_dl_param(const std::string& wire_json)
+{
+    std::string perr;
+    const auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return false;
+    const auto reply = root->find("reply");
+    if (!reply.is_object()) return false;
+    return reply.find("mem_dl_param_size").is_number() &&
+           reply.find("mem_dl_param_size").as_number(0.0) > 0.0;
+}
+
+void log_download_magic(const std::vector<std::uint8_t>& data)
+{
+    if (data.empty()) {
+        OBN_DEBUG("tunnel_upload: download payload empty");
+        return;
+    }
+    char magic[32];
+    const std::size_t n = std::min(data.size(), std::size_t{16});
+    std::snprintf(magic, sizeof(magic), "%02x", data[0]);
+    for (std::size_t i = 1; i < n; ++i) {
+        char tmp[8];
+        std::snprintf(tmp, sizeof(tmp), " %02x", data[i]);
+        std::strncat(magic, tmp, sizeof(magic) - std::strlen(magic) - 1);
+    }
+    OBN_DEBUG("tunnel_upload: download payload %zu bytes, magic: %s",
+             data.size(), magic);
+}
+
+void maybe_dump_download(const std::vector<std::uint8_t>& data)
+{
+    const char* path = std::getenv("OBN_FT_DUMP_DOWNLOAD");
+    if (!path || !*path || data.empty()) return;
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        OBN_WARN("tunnel_upload: OBN_FT_DUMP_DOWNLOAD open failed: %s", path);
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(data.data()),
+              static_cast<std::streamsize>(data.size()));
+    OBN_DEBUG("tunnel_upload: dumped download -> %s (%zu bytes)", path,
+             data.size());
+}
+
+DownloadOutcome run_download(obn::tunnel_local::Session* session,
+                             SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
+                             const DownloadRequest& req, DownloadCallbacks cb)
+{
+    DownloadOutcome out;
+    if (req.path.empty()) {
+        out.error = "missing download path";
+        return out;
+    }
+
+    drain_stale_wire_json(session, "pre-download");
+
+    const std::string abi = obn::tunnel_local::build_file_download_abi(
+        seq, req.path, /*offset=*/0, req.target_path);
+    OBN_DEBUG("tunnel_upload: download req path=%s wire=%.200s",
+             req.path.c_str(), abi.c_str());
+    if (session->send_abi_json(ssl, abi, io_mu) != 0) {
+        out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+        return out;
+    }
+
+    std::string last_json;
+    int         frames = 0;
+    for (;;) {
+        if (cb.cancelled && cb.cancelled()) {
+            out.error = "cancelled";
+            return out;
+        }
+
+        std::vector<std::uint8_t> payload;
+        for (;;) {
+            const int rc = session->recv_payload(ssl, &payload, io_mu);
+            if (rc == 0) break;
+            if (rc < 0) {
+                out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+                return out;
+            }
+            if (wait_ssl_readable(ssl, 100) < 0) {
+                out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+                return out;
+            }
+        }
+
+        std::string wire_json;
+        std::vector<std::uint8_t> chunk;
+        if (!obn::tunnel_local::split_json_prefix(payload.data(), payload.size(),
+                                                  &wire_json, &chunk)) {
+            wire_json.assign(reinterpret_cast<const char*>(payload.data()),
+                             payload.size());
+        }
+        last_json = wire_json;
+        ++frames;
+
+        const int result = obn::tunnel_local::parse_wire_result(wire_json);
+        out.wire_result  = result;
+
+        OBN_DEBUG("tunnel_upload: download frame=%d result=%d chunk=%zu wire=%.300s",
+                 frames, result, chunk.size(), wire_json.c_str());
+
+        if (!chunk.empty() && !reply_has_mem_dl_param(wire_json)) {
+            out.data.insert(out.data.end(), chunk.begin(), chunk.end());
+        } else if (!chunk.empty()) {
+            OBN_DEBUG("tunnel_upload: download skip mem_dl_param chunk (%zu bytes)",
+                     chunk.size());
+        }
+
+        if (cb.progress) {
+            const int pct = download_progress_pct(wire_json);
+            if (pct >= 0) cb.progress(pct);
+        }
+
+        if (result == 1) continue;
+        if (result == 0) {
+            out.ok = true;
+            out.json_body = obn::tunnel_local::parse_wire_reply_json(wire_json);
+            if (out.json_body.empty()) out.json_body = std::move(last_json);
+            log_download_magic(out.data);
+            maybe_dump_download(out.data);
+            return out;
+        }
+        out.error = "download failed wire result=" + std::to_string(result);
+        return out;
     }
 }
 
@@ -475,6 +625,27 @@ UploadOutcome Connection::query_media_ability()
     out.ok = true;
     out.json_body = std::move(body);
     return out;
+}
+
+DownloadOutcome Connection::download(const DownloadRequest& req, DownloadCallbacks cb)
+{
+    DownloadOutcome out;
+    if (!is_connected()) {
+        out.error = "not connected";
+        return out;
+    }
+
+    std::uint32_t seq = 0;
+    SSL* ssl = nullptr;
+    obn::tunnel_local::Session* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(impl_->io_mu);
+        seq = impl_->wire_seq++;
+        ssl = impl_->ssl;
+        session = impl_->session.get();
+    }
+
+    return run_download(session, ssl, &impl_->io_mu, seq, req, cb);
 }
 
 int upload_file(const ConnectParams& connect,

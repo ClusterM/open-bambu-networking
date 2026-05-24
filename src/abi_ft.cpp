@@ -27,6 +27,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "obn/abi_export.hpp"
 #include "obn/ft_tunnel_local_env.hpp"
@@ -73,6 +74,7 @@ constexpr const char* kUnsupportedMsg =
     "FileTransfer for this URL is not supported (non-LAN / cloud TUTK). "
     "Studio will fall back to FTP (see README)";
 
+constexpr int kCmdTypeDownload     = 4;
 constexpr int kCmdTypeUpload       = 5;
 constexpr int kCmdTypeMediaAbility = 7;
 
@@ -209,12 +211,16 @@ struct FT_Job {
     int                     res_ec{0};
     int                     resp_ec{0};
     std::string             res_json;
+    std::vector<std::uint8_t> res_bin;
 
 #if OBN_FT_TUNNEL_LOCAL
     int         cmd_type     = 0;
     std::string dest_storage;
     std::string dest_name;
     std::string file_path;
+    std::string download_path;
+    std::string target_path;
+    bool        is_mem_file  = false;
     std::string raw_params;
 #endif
 };
@@ -286,7 +292,8 @@ OBN_ABI ft_err ft_tunnel_set_status_cb(FT_TunnelHandle* h, ft_tunnel_status_cb c
 
 namespace {
 
-void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body)
+void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body,
+                    std::vector<std::uint8_t> bin)
 {
     {
         std::lock_guard<std::mutex> lk(j->mu);
@@ -294,6 +301,7 @@ void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body)
         j->res_ec   = ec;
         j->resp_ec  = resp_ec;
         j->res_json = std::move(json_body);
+        j->res_bin  = std::move(bin);
     }
     j->cv.notify_all();
     if (j->result_cb) {
@@ -301,15 +309,26 @@ void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body)
         r.ec      = ec;
         r.resp_ec = resp_ec;
         std::string body;
+        const std::uint8_t* bin_ptr = nullptr;
+        std::uint32_t bin_len = 0;
         {
             std::lock_guard<std::mutex> lk(j->mu);
             body = j->res_json;
+            if (!j->res_bin.empty()) {
+                bin_ptr = j->res_bin.data();
+                bin_len = static_cast<std::uint32_t>(j->res_bin.size());
+            }
         }
         r.json     = body.c_str();
-        r.bin      = nullptr;
-        r.bin_size = 0;
+        r.bin      = bin_ptr;
+        r.bin_size = bin_len;
         j->result_cb(j->result_user, r);
     }
+}
+
+void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body)
+{
+    deliver_result(j, ec, resp_ec, std::move(json_body), {});
 }
 
 void deliver_progress(FT_Job* j, double percent)
@@ -346,43 +365,47 @@ std::string connect_lan_tunnel(FT_Tunnel* t)
 
 void run_ability_job(FT_Tunnel* t, FT_Job* j)
 {
-    std::lock_guard<std::mutex> lk(t->lan_mu);
-    if (t->ability_probed) {
-        OBN_INFO("ft: ability (cached): %s", t->ability_cache.c_str());
-        deliver_result(j, 0, 0, t->ability_cache);
-        return;
+    std::string ability_json;
+    bool        use_cache = false;
+    int         ec = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (t->ability_probed) {
+            OBN_INFO("ft: ability (cached): %s", t->ability_cache.c_str());
+            ability_json = t->ability_cache;
+            use_cache    = true;
+        } else {
+            if (std::string err = connect_lan_tunnel(t); !err.empty()) {
+                ec = FT_EIO;
+            } else {
+                auto outcome = t->conn->query_media_ability();
+                if (!outcome.ok) {
+                    OBN_WARN("ft: ability failed: %s", outcome.error.c_str());
+                    ec = FT_EIO;
+                } else {
+                    t->ability_cache  = outcome.json_body;
+                    t->ability_probed = true;
+                    ability_json      = t->ability_cache;
+                    OBN_INFO("ft: ability: %s", t->ability_cache.c_str());
+                }
+            }
+        }
     }
 
-    if (std::string err = connect_lan_tunnel(t); !err.empty()) {
-        deliver_result(j, FT_EIO, 0, {});
+    if (use_cache || !ability_json.empty()) {
+        deliver_result(j, 0, 0, std::move(ability_json));
         return;
     }
-
-    auto outcome = t->conn->query_media_ability();
-    if (!outcome.ok) {
-        OBN_WARN("ft: ability failed: %s", outcome.error.c_str());
-        deliver_result(j, FT_EIO, 0, {});
-        return;
-    }
-    t->ability_cache  = outcome.json_body;
-    t->ability_probed = true;
-    OBN_INFO("ft: ability: %s", t->ability_cache.c_str());
-    deliver_result(j, 0, 0, t->ability_cache);
+    deliver_result(j, ec != 0 ? ec : FT_EIO, 0, {});
 }
 
 void run_upload_job(FT_Tunnel* t, FT_Job* j)
 {
-    std::lock_guard<std::mutex> lk(t->lan_mu);
-    if (std::string err = connect_lan_tunnel(t); !err.empty()) {
-        OBN_WARN("ft: upload: connect failed: %s", err.c_str());
-        deliver_result(j, FT_EIO, 0, {});
-        return;
-    }
-
     obn::tunnel_upload::UploadRequest req;
-    req.local_path    = j->file_path;
-    req.dest_storage  = j->dest_storage;
-    req.dest_name     = j->dest_name;
+    req.local_path   = j->file_path;
+    req.dest_storage = j->dest_storage;
+    req.dest_name    = j->dest_name;
 
     obn::tunnel_upload::UploadCallbacks cb;
     cb.cancelled = [j] {
@@ -392,7 +415,19 @@ void run_upload_job(FT_Tunnel* t, FT_Job* j)
         deliver_progress(j, static_cast<double>(pct));
     };
 
-    auto outcome = t->conn->upload(req, cb);
+    obn::tunnel_upload::UploadOutcome outcome;
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
+            OBN_WARN("ft: upload: connect failed: %s", err.c_str());
+            deliver_result(j, FT_EIO, 0, {});
+            return;
+        }
+        outcome = t->conn->upload(req, cb);
+    }
+
+    // Never call result_cb under lan_mu — Studio's FileTransferObject invokes
+    // ft_tunnel_shutdown() from the result callback (one-shot mem download).
     if (outcome.ok) {
         deliver_result(j, 0, outcome.wire_result, {});
         return;
@@ -405,6 +440,49 @@ void run_upload_job(FT_Tunnel* t, FT_Job* j)
     deliver_result(j, FT_EIO, outcome.wire_result >= 0 ? outcome.wire_result : 0, {});
 }
 
+void run_download_job(FT_Tunnel* t, FT_Job* j)
+{
+    obn::tunnel_upload::DownloadRequest req;
+    req.path        = j->download_path;
+    req.is_mem_file = j->is_mem_file;
+    req.target_path = j->target_path;
+
+    obn::tunnel_upload::DownloadCallbacks cb;
+    cb.cancelled = [j] {
+        return j->cancelled.load(std::memory_order_acquire);
+    };
+    cb.progress = [j](int pct) {
+        deliver_progress(j, static_cast<double>(pct));
+    };
+
+    obn::tunnel_upload::DownloadOutcome outcome;
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
+            OBN_WARN("ft: download: connect failed: %s", err.c_str());
+            deliver_result(j, FT_EIO, 0, {});
+            return;
+        }
+        outcome = t->conn->download(req, cb);
+    }
+
+    if (outcome.ok) {
+        OBN_DEBUG("ft: download ok path=%s bytes=%zu reply=%.200s",
+                 req.path.c_str(), outcome.data.size(),
+                 outcome.json_body.c_str());
+        deliver_result(j, 0, outcome.wire_result, std::move(outcome.json_body),
+                       std::move(outcome.data));
+        return;
+    }
+    if (outcome.error == "cancelled") {
+        deliver_result(j, FT_ECANCELLED, 0, {});
+        return;
+    }
+    OBN_WARN("ft: download failed path=%s: %s",
+             req.path.c_str(), outcome.error.c_str());
+    deliver_result(j, FT_EIO, outcome.wire_result >= 0 ? outcome.wire_result : 0, {});
+}
+
 void spawn_job(FT_Tunnel* t, FT_Job* j)
 {
     retain(t);
@@ -413,6 +491,7 @@ void spawn_job(FT_Tunnel* t, FT_Job* j)
         switch (j->cmd_type) {
         case kCmdTypeMediaAbility: run_ability_job(t, j); break;
         case kCmdTypeUpload:       run_upload_job(t, j);  break;
+        case kCmdTypeDownload:     run_download_job(t, j); break;
         default:
             OBN_WARN("ft: unknown cmd_type=%d (raw=%.200s)",
                      j->cmd_type, j->raw_params.c_str());
@@ -516,6 +595,9 @@ OBN_ABI ft_err ft_job_create(const char* params_json, FT_JobHandle** out)
             j->dest_storage = root->find("dest_storage").as_string();
             j->dest_name    = root->find("dest_name").as_string();
             j->file_path    = root->find("file_path").as_string();
+            j->download_path = root->find("path").as_string();
+            j->target_path   = root->find("target_path").as_string();
+            j->is_mem_file   = root->find("is_mem_file").as_bool(false);
         } else {
             OBN_WARN("ft_job_create: bad params json: %s", perr.c_str());
         }
@@ -596,6 +678,8 @@ OBN_ABI ft_err ft_job_get_result(FT_JobHandle* h, uint32_t timeout_ms, ft_job_re
     out->ec      = j->res_ec;
     out->resp_ec = j->resp_ec;
     out->json    = j->res_json.empty() ? nullptr : j->res_json.c_str();
+    out->bin     = j->res_bin.empty() ? nullptr : j->res_bin.data();
+    out->bin_size = static_cast<std::uint32_t>(j->res_bin.size());
     return FT_OK;
 }
 

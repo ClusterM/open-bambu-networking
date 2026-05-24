@@ -340,8 +340,8 @@ For `bambu:///local/*` URLs the plugin serves `ft_*` over **native TLS :6000** (
 | `ft_tunnel_start_connect` | ✨ | LAN: TLS :6000 handshake; fires callback synchronously. |
 | `ft_tunnel_sync_connect` | ✨ | LAN: same as start_connect. |
 | `ft_tunnel_shutdown` | ✅ | Closes TLS :6000 session. |
-| `ft_job_create` | ✅ | Parses `cmd_type` / `dest_storage` / `dest_name` / `file_path` out of the params JSON. |
-| `ft_tunnel_start_job` | ✨ | `cmd_type=7` → wire REQUEST_MEDIA_ABILITY; `cmd_type=5` → FILE_UPLOAD + binary + progress. |
+| `ft_job_create` | ✅ | Parses `cmd_type` / upload fields / download `path` / `is_mem_file` / `target_path` from params JSON. |
+| `ft_tunnel_start_job` | ✨ | `cmd_type=7` ability; `cmd_type=5` upload; `cmd_type=4` mem download (Printer Preview). |
 | `ft_job_cancel` | ✅ | Sets cancel flag; upload aborts with `FT_ECANCELLED`. |
 | `ft_job_try_get_msg` / `get_msg` | ❌ | Progress via `msg_cb` only. |
 
@@ -351,6 +351,7 @@ Stock `libbambu_networking.so` serves LAN `ft_*` over **TLS :6000** with the sam
 
 - `cmd_type=7` → wire `REQUEST_MEDIA_ABILITY` (`0x0007`); firmware reply mapped to a JSON array for Studio (may include `"emmc"` on P2S).
 - `cmd_type=5` → wire chunked `FILE_UPLOAD` (`0x0005`) — see §6.14.2 below and [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026) for the wire format.
+- `cmd_type=4` → wire `FILE_DOWNLOAD` (`0x0004`) for **Printer Preview** (`mem:/26` JPEG) — see §6.14.4 and [NETWORK_PLUGIN.md §6.14.4](NETWORK_PLUGIN.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview).
 
 Runtime override: `OBN_FT_TUNNEL_LOCAL=0|1`.
 
@@ -364,7 +365,7 @@ Source: [src/tunnel_upload.cpp](src/tunnel_upload.cpp), [src/abi_ft.cpp](src/abi
 | --- | :--: | --- |
 | `cmd_type=5` chunked pipeline | ✅ | Init → pipelined chunks → one final recv; matches stock tcpdump on P2S |
 | Legacy one-shot upload builder | ⚠️ | `build_file_upload_abi()` in `tunnel_local.hpp` — **not used in production**; P2S rejects multi-MiB one-shot frames (`-9203` / reset). Kept for [tests/tunnel_local_test.cpp](tests/tunnel_local_test.cpp) and REPL experiments only |
-| `cmd_type=4` mem download | ❌ | Stock issues `{"cmd_type":4,"is_mem_file":true,"path":"mem:/N",…}` during print UI; we return `ft: unknown cmd_type=4` |
+| `cmd_type=4` mem download | ✅ | Printer Preview (`MediaPlayCtrl` → `DownloadMemFile("mem:/26")`); wire verified on P2S May 2026 — see §6.14.4 |
 | Stale reply handling on reused tunnel | ✅ | `drain_pending_wire_json()` before upload init; `recv_wire_json(…, want_cmdtype, want_seq)` skips belated delete/ability replies |
 | Proactive `FILE_DEL` before upload | ❌ (removed) | Early versions deleted the dest name first — caused `-9203` / false success on reused tunnels; wire doc: [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#do-not-send-proactive-file_del-cmdtype-3) |
 
@@ -373,6 +374,28 @@ Source: [src/tunnel_upload.cpp](src/tunnel_upload.cpp), [src/abi_ft.cpp](src/abi
 **Progress.** `msg_cb({"progress":N})` from **bytes written** (`offset / total`), not per-chunk wire ACKs. Final recv uses a generous socket timeout (~120 s) after a large pipelined send.
 
 Wire-format reference: [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026).
+
+### 6.14.4. `cmd_type=4` mem download (Printer Preview)
+
+Source: [src/tunnel_upload.cpp](src/tunnel_upload.cpp) (`run_download`), [src/abi_ft.cpp](src/abi_ft.cpp) (`run_download_job`), [src/tunnel_local.cpp](src/tunnel_local.cpp) (`build_file_download_abi`).
+
+| Piece | Status | Notes |
+| --- | :--: | --- |
+| Studio ABI → wire mapping | ✅ | ABI has `is_mem_file`; wire uses `{path, offset}` only (matches `PrinterFileSystem::DownloadRamFile`) |
+| `mem_dl_param` first frame | ✅ | Firmware sends 12-byte metadata JSON in frame 1; must **not** append to image bytes |
+| Chunked JPEG recv | ✅ | ~20 KiB fragments + final chunk with `file_md5`; `result=1` → continue, `result=0` → done |
+| `ft_job_result.bin` | ✅ | Concatenated JPEG only; Studio `wxImage` parses `ff d8 ff … JFIF` |
+| `ft_job_result.json` | ✅ | Inner `reply` object (offset/total/size/file_md5), not full wire envelope |
+| `result_cb` vs `lan_mu` | ✅ | **Must not** invoke `result_cb` under `lan_mu` — Studio calls `ft_tunnel_shutdown()` from the download callback (`FileTransferObject::reset_locked`) |
+| Debug dump | ✅ | `OBN_FT_DUMP_DOWNLOAD=/path/to/file.jpg` writes payload after successful job |
+
+**Caller (Studio).** Not Send to Printer. When liveview is idle, `MediaPlayCtrl::start_device_image_flow()` opens an `ft_*` tunnel and calls `FileTransferObject::DownloadMemFile("mem:/26", "")`. Slot `26` is hard-coded in Studio master.
+
+**Why preview failed initially.** Early builds (a) appended the `mem_dl_param` binary chunk to the JPEG, and (b) called `result_cb` while holding `lan_mu`, deadlocking when Studio invoked `ft_tunnel_shutdown()` from the callback (~50% depending on `request_id` / timing).
+
+**Logging.** At `OBN_LOG_LEVEL=info`, each printer reply is logged as `tunnel_upload: download frame=N … wire=…`; success logs JPEG magic bytes.
+
+Wire reference: [NETWORK_PLUGIN.md §6.14.4](NETWORK_PLUGIN.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview). Manual probe: `python3 tools/bambu6000_repl.py <ip> <code>` → `/download mem:/26 out.jpg`.
 
 ### 6.14.3. `start_send_gcode_to_sdcard` (open plugin)
 

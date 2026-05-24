@@ -252,6 +252,25 @@ std::string build_file_delete_abi(std::uint32_t sequence,
     return obn::json::Value(std::move(root)).dump();
 }
 
+std::string build_file_download_abi(std::uint32_t sequence,
+                                    const std::string& path,
+                                    std::uint64_t offset,
+                                    const std::string& target_path)
+{
+    obn::json::Object req;
+    req["path"]   = obn::json::Value(path);
+    req["offset"] = obn::json::Value(static_cast<double>(offset));
+    if (!target_path.empty()) {
+        req["target_path"] = obn::json::Value(target_path);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileDownload));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
 std::string build_file_upload_chunk_abi(std::uint32_t sequence,
                                         std::uint32_t frag_id,
                                         std::uint64_t offset,
@@ -407,6 +426,16 @@ int parse_wire_result(const std::string& wire_json)
     auto root = obn::json::parse(wire_json, &perr);
     if (!root) return -1;
     return static_cast<int>(root->find("result").as_int(-1));
+}
+
+std::string parse_wire_reply_json(const std::string& wire_json)
+{
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return {};
+    const auto reply = root->find("reply");
+    if (!reply.is_object()) return {};
+    return obn::json::Value(reply).dump();
 }
 
 int parse_wire_cmdtype(const std::string& wire_json)

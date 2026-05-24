@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace obn::tunnel_upload {
 
@@ -41,6 +42,25 @@ struct UploadOutcome {
     std::string   json_body;  // media ability reply array
 };
 
+struct DownloadRequest {
+    std::string path;
+    bool        is_mem_file = false;
+    std::string target_path;
+};
+
+struct DownloadCallbacks {
+    std::function<bool()>    cancelled;
+    std::function<void(int)> progress;  // 0..100, optional
+};
+
+struct DownloadOutcome {
+    bool                      ok = false;
+    std::vector<std::uint8_t> data;
+    int                       wire_result = 0;
+    std::string               error;
+    std::string               json_body;  // final wire reply JSON
+};
+
 class Connection {
 public:
     Connection();
@@ -58,6 +78,9 @@ public:
 
     // cmd_type=7 media ability; returns JSON array string on success.
     UploadOutcome query_media_ability();
+
+// cmd_type=4 FILE_DOWNLOAD (mem:/N printer preview). See NETWORK_PLUGIN.md §6.14.4.
+    DownloadOutcome download(const DownloadRequest& req, DownloadCallbacks cb = {});
 
     std::uint32_t next_wire_seq();
 

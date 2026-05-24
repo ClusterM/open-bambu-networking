@@ -15,6 +15,7 @@ compile_commands.json
 *.dylib
 *.dll
 *.a
+*.pyc
 .vscode/
 .idea/
 patches/

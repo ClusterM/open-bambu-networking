@@ -1333,14 +1333,14 @@ Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the same **BambuTunne
 | `ft_job` `cmd_type` | Wire `cmdtype` | Request (after framing) | Response → `ft_job_result.json` |
 |---------------------|------------------|-------------------------|----------------------------------|
 | `7` (media ability) | `0x0007` | `{"cmdtype":7,"sequence":N,"req":{"peer":"studio","api_version":2}}` | JSON **array of storage labels**, e.g. `["emmc","udisk"]` on P2S |
+| `4` (mem preview) | `0x0004` (`FILE_DOWNLOAD`) | Wire: `{"cmdtype":4,"sequence":N,"req":{"path":"mem:/26","offset":0}}` — **no** `is_mem_file` on wire | `ft_job_result.bin` = JPEG; `json` = final `reply` (`file_md5`, …). See §6.14.4 |
 | `5` (upload) | `0x0005` | **Chunked** upload — see §6.14.2 (not the legacy one-shot `{path,file,size,md5}` shape) | `resp_ec=0` on success; progress via `msg_cb({"progress":N})` while sending |
-| `4` (observed) | `0x0004` (`FILE_DOWNLOAD`) | Frida on stock: `{"cmd_type":4,"is_mem_file":true,"path":"mem:/26","target_path":""}` — likely in-memory thumbnail / partial fetch during print UI | Stock issues it during print UI; open-plugin coverage: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin) |
 
 Manual probes:
 
 | Tool | Role |
 |------|------|
-| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive `:6000` client — `/ability`, `/upload <local> <storage> <name>` (pipelined chunks) |
+| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive `:6000` client — `/ability`, `/upload …`, `/download mem:/26 out.jpg` |
 | [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Repeated delete-free pipeline uploads on one or many sessions (regression harness) |
 | [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of wire variants (confirms P2S rejects one-shot / per-chunk-ACK multi-chunk) |
 
@@ -1450,6 +1450,71 @@ Not listed in Studio's `PrinterFileSystem.h` success enum (§7.5.3). On P2S we c
 ##### Progress reporting (`msg_cb`)
 
 During pipelined send, stock reports upload progress from **bytes written** (`offset / total`), not from per-chunk wire ACKs (there are none until the final reply). Open-plugin timeout and callback details: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin).
+
+#### 6.14.4. P2S `FILE_DOWNLOAD` (`cmdtype` 4) — mem preview (Printer Preview)
+
+Reverse-engineered on **P2S** (`02.07.00.99` firmware, May 2026) with open-plugin wire logging and [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py). This is **not** Send to Printer and **not** Device → Files (those use `libBambuSource.so` for file-browser CTRL, or `ft_*` upload for cache).
+
+##### Studio caller
+
+When the device liveview is not playing, **`MediaPlayCtrl::start_device_image_flow()`** (BambuStudio master) fetches a static snapshot:
+
+```
+FileTransferObject::DownloadMemFile("mem:/26", "")
+  → ft_job_create({"cmd_type":4,"is_mem_file":true,"path":"mem:/26","target_path":""})
+  → ft_tunnel_start_job
+```
+
+Studio displays the result with `wxImage` on **`ft_job_result.bin` only** — `json` is not used for rendering. The final wire frame carries `reply.file_md5` for client-side integrity checks (see `PrinterFileSystem::DownloadRamFile` in BambuStudio).
+
+Sources: [`FileTransferObject.cpp`](https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/Utils/FileTransferObject.cpp), [`MediaPlayCtrl.cpp`](https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/MediaPlayCtrl.cpp) (~line 834).
+
+##### ABI vs wire (important)
+
+| Layer | Fields |
+|-------|--------|
+| **`ft_job` ABI** (`FileTransferObject`) | `cmd_type`, `path`, `is_mem_file`, `target_path` |
+| **Wire `:6000`** (`PrinterFileSystem::DownloadRamFile` for the same command) | `path` (e.g. `"mem:/26"`), `offset` (usually `0`) — **no `is_mem_file`** |
+
+Do not copy ABI-only fields onto the wire unless firmware documentation says otherwise.
+
+##### Wire shape (one `sequence`, streaming download)
+
+Same framing as §6.14.2: `{"mtype":12289,…}` inside 16-byte header (`magic=0x0102013f`), optional `\n\n` + binary in the same frame body.
+
+**Request (JSON only):**
+
+```json
+{"cmdtype":4,"sequence":1,"req":{"path":"mem:/26","offset":0}}
+```
+
+**Responses (P2S, observed May 2026)** — five frames for a ~73 KiB JPEG:
+
+| Frame | `result` | `reply` highlights | Binary |
+|------:|---------|-------------------|--------|
+| 1 | `1` (`CONTINUE`) | `mem_dl_param_size`: 12, `total`: ~73320, `size`: 0 | 12 B metadata JSON — **skip** (not part of image) |
+| 2–4 | `1` | `frag_id` 0…2, `offset` / `size` 20480, `total` | JPEG fragments |
+| 5 | `0` (`SUCCESS`) | `file_md5`, final `offset`/`size` | last JPEG fragment |
+
+Example frame 1 (wire JSON after framing unwrap):
+
+```json
+{"cmdtype":4,"frag_id":0,"mtype":12289,"reply":{"mem_dl_param_size":12,"offset":0,"size":0,"total":73320},"result":1,"sequence":1}
+```
+
+Example final frame:
+
+```json
+{"cmdtype":4,"frag_id":3,"mtype":12289,"reply":{"file_md5":"f45eccc85859a540ef9e837065355335","offset":61440,"size":11880,"total":73320},"result":0,"sequence":1}
+```
+
+Accumulated binary starts with **`ff d8 ff e0`** (JFIF JPEG). Typical size **~70–75 KiB** on P2S.
+
+##### Frida / stock wire capture
+
+Stock `libbambu_networking.so` (~31 MB) links OpenSSL **statically and stripped** — Frida often finds **no** exported `SSL_write`/`SSL_read`, so plaintext wire does not appear in `/tmp/ft_wire.log`. ABI hooks still log `ft_job_create` / `result_cb`. Options: use **open plugin** for SSL hooks, `SSLKEYLOGFILE` + Wireshark, or [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) `/download`. See [`tools/frida_ft_attach.sh`](../tools/frida_ft_attach.sh).
+
+Status table: [STATUS.md §6.14.4](STATUS.md#6144-cmd_type4-mem-download-printer-preview).
 
 #### 6.14.3. `start_send_gcode_to_sdcard` (FTPS upload, no print)
 

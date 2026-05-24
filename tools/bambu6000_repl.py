@@ -13,7 +13,7 @@ Frida tutk_third_SSL_write shows only channel-0x02 traffic after the session is 
 the login + 12291 handshake happen earlier inside Bambu_Open / Bambu_StartStreamEx.
 
 Send to Printer uses libbambu_networking.so (ft_*), not BambuSource — sniff with
-tools/frida_ft_attach.sh (stock plugin) or probe upload here with /upload.
+tools/frida_ft_attach.sh (stock plugin) or probe upload/download here with /upload /download.
 
 Usage:
     python3 tools/bambu6000_repl.py 10.13.1.30 ABCD1234
@@ -25,10 +25,13 @@ REPL commands:
     /quit, /exit          — close session
     /ability              — REQUEST_MEDIA_ABILITY (cmdtype 7)
     /upload <local> <storage> <remote_name> — FILE_UPLOAD (cmdtype 5)
+    /download <mem_path> <out_file>       — FILE_DOWNLOAD mem preview (cmdtype 4, e.g. mem:/26)
     /hex 404142...        — send raw bytes (even length hex string)
     /file path.bin        — send file contents
     /raw on|off           — send typed lines as raw bytes (no framing)
     /nl on|off            — append \\n to each typed line (default off)
+
+Command history: Up/Down arrows (readline); persisted in ~/.bambu6000_repl_history
 
 Requires: Python 3.10+, stdlib only.
 """
@@ -36,7 +39,10 @@ from __future__ import annotations
 
 import hashlib
 import argparse
+import atexit
+import errno
 import json
+import os
 import random
 import socket
 import ssl
@@ -53,6 +59,33 @@ MAGIC_CTRL = 0x0102013F
 
 MTYPE_CTRL_SETUP = 12291  # 0x3003 — StartStreamEx handshake
 MTYPE_CTRL_JSON = 12289   # 0x3001 — file browser RPC
+
+DEFAULT_HISTORY_FILE = os.path.expanduser("~/.bambu6000_repl_history")
+
+
+def setup_readline(*, history_file: str | None = None, enabled: bool = True) -> None:
+    """Enable Up/Down command history when readline is available (TTY on Unix)."""
+    if not enabled or not sys.stdin.isatty():
+        return
+    try:
+        import readline
+    except ImportError:
+        return
+
+    path = history_file or DEFAULT_HISTORY_FILE
+    try:
+        readline.read_history_file(path)
+    except OSError:
+        pass
+    readline.set_history_length(1000)
+
+    def _save_history() -> None:
+        try:
+            readline.write_history_file(path)
+        except OSError:
+            pass
+
+    atexit.register(_save_history)
 
 
 def build_mjpeg_auth_packet(username: str, password: str) -> bytes:
@@ -103,17 +136,34 @@ def wrap_ctrl_json(obj: dict[str, Any]) -> bytes:
     return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
 
+def consume_frames(data: bytes) -> tuple[list[bytes], int]:
+    """Parse complete frames only (matches C++ consume_frames). Returns bodies + bytes consumed."""
+    bodies: list[bytes] = []
+    i = 0
+    while i + 16 <= len(data):
+        pl = struct.unpack_from("<I", data, i)[0]
+        frame_len = 16 + pl
+        if i + frame_len > len(data):
+            break
+        bodies.append(data[i + 16 : i + 16 + pl])
+        i += frame_len
+    return bodies, i
+
+
 def parse_frames(data: bytes) -> list[tuple[int, int, int, bytes]]:
-    frames: list[tuple[int, int, int, bytes]] = []
+    """Legacy helper: all complete frames with metadata (for display)."""
+    out: list[tuple[int, int, int, bytes]] = []
     i = 0
     while i + 16 <= len(data):
         pl = struct.unpack_from("<I", data, i)[0]
         magic = struct.unpack_from("<I", data, i + 4)[0]
         seq = struct.unpack_from("<I", data, i + 8)[0]
-        body = data[i + 16 : i + 16 + pl]
-        frames.append((pl, magic, seq, body))
-        i += 16 + pl
-    return frames
+        frame_len = 16 + pl
+        if i + frame_len > len(data):
+            break
+        out.append((pl, magic, seq, data[i + 16 : i + 16 + pl]))
+        i += frame_len
+    return out
 
 
 def _json_prefix_end(data: bytes) -> Optional[int]:
@@ -230,6 +280,7 @@ class LocalCtrlSession:
         self._sync_depth = 0
         self._rx_buf = bytearray()
         self._lock = threading.Lock()
+        self._rx_cv = threading.Condition(self._lock)
         self._reader = threading.Thread(target=self._recv_loop, daemon=True)
 
     @property
@@ -289,35 +340,32 @@ class LocalCtrlSession:
                 self._sync_depth -= 1
 
     def _pop_json_frame(self, timeout: float) -> Optional[dict[str, Any]]:
+        obj, _bin = self._pop_body_frame(timeout)
+        return obj
+
+    def _pop_body_frame(self, timeout: float) -> tuple[Optional[dict[str, Any]], bytes]:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            with self._lock:
-                frames = parse_frames(bytes(self._rx_buf))
-                if frames:
-                    pl, _magic, _seq, body = frames[0]
-                    del self._rx_buf[: 16 + pl]
-                    text, _bin = split_text_and_binary(body)
-                    if text:
-                        try:
-                            obj = json.loads(text)
-                        except json.JSONDecodeError:
-                            return None
-                        if isinstance(obj, dict):
-                            return obj
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            with self._lock:
-                self._ssl.settimeout(min(1.0, remaining))
-                try:
-                    chunk = self._ssl.recv(65536)
-                except socket.timeout:
-                    chunk = b""
-                finally:
-                    self._ssl.settimeout(None)
-            if chunk:
-                self._rx_buf.extend(chunk)
-        return None
+        with self._rx_cv:
+            while time.monotonic() < deadline:
+                if len(self._rx_buf) >= 16:
+                    pl = struct.unpack_from("<I", self._rx_buf, 0)[0]
+                    frame_len = 16 + pl
+                    if len(self._rx_buf) >= frame_len:
+                        body = bytes(self._rx_buf[16:frame_len])
+                        del self._rx_buf[:frame_len]
+                        text, binary = split_text_and_binary(body)
+                        if text:
+                            try:
+                                obj = json.loads(text)
+                            except json.JSONDecodeError:
+                                return None, binary
+                            if isinstance(obj, dict):
+                                return obj, binary
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._rx_cv.wait(timeout=min(1.0, remaining))
+        return None, b""
 
     def handshake(self, username: str, access_code: str) -> None:
         login = build_login_payload(username, access_code)
@@ -343,21 +391,20 @@ class LocalCtrlSession:
         self._send_frame(MAGIC_CTRL, body)
 
     def _recv_loop(self) -> None:
-        # Do not hold _lock across recv: handshake/send paths need the same lock.
+        # Single reader: append to _rx_buf; sync ops consume from the buffer.
         self._ssl.settimeout(1.0)
         while not self._stop.is_set():
-            with self._lock:
-                sync_active = self._sync_depth > 0
-            if sync_active:
-                time.sleep(0.02)
-                continue
             try:
                 data = self._ssl.recv(65536)
             except ssl.SSLWantReadError:
                 continue
+            except BlockingIOError:
+                continue
             except socket.timeout:
                 continue
             except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
                 if not self._stop.is_set():
                     print(f"<< recv error: {exc}", flush=True)
                 break
@@ -365,7 +412,12 @@ class LocalCtrlSession:
                 print("<< connection closed by peer", flush=True)
                 self._stop.set()
                 break
-            print(format_recv(data, self._recv_hex_limit), flush=True)
+            with self._rx_cv:
+                sync_active = self._sync_depth > 0
+                self._rx_buf.extend(data)
+                self._rx_cv.notify_all()
+            if not sync_active:
+                print(format_recv(data, self._recv_hex_limit), flush=True)
 
     def send_ability(self) -> None:
         self.send_ctrl_json({
@@ -428,6 +480,61 @@ class LocalCtrlSession:
                 return
             raise OSError(f"upload failed result={cr}")
 
+    def send_download_mem(self, mem_path: str, out_path: str) -> None:
+        """FILE_DOWNLOAD for mem:/N (Printer Preview wire). Skips mem_dl_param frame."""
+        with self._sync_recv():
+            seq = 2
+            self.send_ctrl_json({
+                "cmdtype": 4,
+                "sequence": seq,
+                "req": {"path": mem_path, "offset": 0},
+            })
+            data = bytearray()
+            md5 = hashlib.md5()
+            while True:
+                reply, chunk = self._pop_body_frame(30.0)
+                if reply is None:
+                    raise OSError("no download reply")
+                print(f"download reply: {reply}", flush=True)
+                resp = reply.get("reply") or {}
+                if chunk and not resp.get("mem_dl_param_size"):
+                    expect_size = resp.get("size")
+                    if expect_size is not None and len(chunk) != int(expect_size):
+                        raise OSError(
+                            f"chunk size mismatch: got {len(chunk)} want {expect_size}"
+                        )
+                    md5.update(chunk)
+                    data.extend(chunk)
+                elif chunk and resp.get("mem_dl_param_size"):
+                    print(
+                        f"skip mem_dl_param chunk ({len(chunk)} bytes)",
+                        flush=True,
+                    )
+                result = reply.get("result")
+                if result == 1:
+                    continue
+                if result == 0:
+                    expect_total = resp.get("total")
+                    if expect_total is not None and len(data) != int(expect_total):
+                        raise OSError(
+                            f"download size mismatch: got {len(data)} want {expect_total}"
+                        )
+                    expect_md5 = (resp.get("file_md5") or "").lower()
+                    got_md5 = md5.hexdigest().lower()
+                    if expect_md5 and got_md5 != expect_md5:
+                        raise OSError(
+                            f"download md5 mismatch: got {got_md5} want {expect_md5}"
+                        )
+                    with open(out_path, "wb") as fh:
+                        fh.write(data)
+                    magic = data[:4].hex(" ") if len(data) >= 4 else "(short)"
+                    print(
+                        f"download done: {len(data)} bytes md5={got_md5} -> {out_path} magic={magic}",
+                        flush=True,
+                    )
+                    return
+                raise OSError(f"download failed result={result}")
+
     def run_interactive(self) -> None:
         mode = "raw" if self._send_raw else "framed JSON (mtype 12289)"
         print(f"Connected. Mode: {mode}.  /raw /hex /quit", flush=True)
@@ -465,6 +572,18 @@ class LocalCtrlSession:
                 continue
             if low == "/ability":
                 self.send_ability()
+                continue
+            if low.startswith("/download "):
+                parts = cmd.split(maxsplit=2)
+                if len(parts) < 3:
+                    print("usage: /download <mem_path> <out_file>", flush=True)
+                    print("example: /download mem:/26 /tmp/preview.jpg", flush=True)
+                    continue
+                try:
+                    self.send_download_mem(parts[1], parts[2])
+                except OSError as exc:
+                    print(f"download failed: {exc}", flush=True)
+                    print("hint: reconnect REPL after SSL errors (/quit, restart)", flush=True)
                 continue
             if low.startswith("/hex "):
                 hex_str = "".join(cmd.split(maxsplit=1)[1].split())
@@ -558,6 +677,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--append-nl", action="store_true", help="append newline in /raw mode")
     p.add_argument("--raw", action="store_true", help="start in raw byte mode (no JSON framing)")
     p.add_argument("--recv-hex-limit", type=int, default=512)
+    p.add_argument(
+        "--no-history",
+        action="store_true",
+        help="disable readline command history",
+    )
+    p.add_argument(
+        "--history-file",
+        default=DEFAULT_HISTORY_FILE,
+        help=f"readline history file (default {DEFAULT_HISTORY_FILE})",
+    )
     return p.parse_args(argv)
 
 
@@ -616,6 +745,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
+        setup_readline(
+            history_file=args.history_file,
+            enabled=not args.no_history,
+        )
         repl.run_interactive()
     finally:
         repl.close()
