@@ -683,6 +683,122 @@ The `PrintParams` struct (`src/slic3r/Utils/bambu_networking.hpp:192-241`) carri
 
 Print-job stages — the `SendingPrintJobStage` enum (`bambu_networking.hpp:146-156`): `Create=0, Upload=1, Waiting=2, Sending=3, Record=4, WaitPrinter=5, Finished=6, ERROR=7, Limit=8`.
 
+#### 6.8.0. End-to-end print flows (Studio-side orchestration)
+
+This section documents **what Bambu Studio itself calls** when the user starts a print or upload — not what the stock/open plugin does internally ([STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation) covers our plugin). All paths below are traced from `PrintJob.cpp`, `SendJob.cpp`, `SendToPrinter.cpp`, and `SelectMachine.cpp` in upstream BambuStudio.
+
+##### UI entry points → worker classes
+
+| User action | Studio dialog / job | `PrintParams.print_type` / notes |
+|---|---|---|
+| **Slice → Print plate** (normal send) | `SelectMachineDialog` → `PrintJob` | `"from_normal"` |
+| **Device → Files → Print** on an existing `.3mf` | `SelectMachineDialog` → `PrintJob` | `"from_sdcard_view"`; `dst_file` = path on printer storage |
+| **Send to Printer** (upload to cache/USB, no print) | `SendToPrinterDialog` | Does **not** use `PrintJob`; calls `ft_*` directly (§6.14) |
+| **Send to SD card** (legacy upload-only) | `SendJob` | Upload via `start_send_gcode_to_sdcard` only |
+| **Access-code / IP validation** | Preflight inside `PrintJob` / `SendJob` | `project_name="verify_job"`, tiny temp file |
+
+Studio wraps every `bambu_network_start_*` call through `NetworkAgent::{start_print,start_local_print,…}` (`NetworkAgent.cpp:1363-1425`), which forwards to the loaded plugin unchanged.
+
+##### Decision tree: `PrintJob::process()` (`PrintJob.cpp:149-624`)
+
+After `SelectMachineDialog::on_send_print()` exports the plate `.3mf` (and, for cloud-bound printers, a config `.3mf`), it fills `PrintParams` and starts the background `PrintJob`.
+
+```mermaid
+flowchart TD
+  subgraph pre [Preflight — LAN normal print only]
+    A["connection_type==lan && from_normal"] --> B["FileTransferTunnel :6000 sync_connect\n(could_emmc_print)"]
+    A --> C["start_send_gcode_to_sdcard\nproject_name=verify_job"]
+    B --> D{emmc_ok OR ftp_ok?}
+    C --> D
+    D -->|no| E["abort: invalid access code"]
+  end
+  D -->|yes| F{m_print_type?}
+  F -->|from_sdcard_view| G["start_sdcard_print"]
+  F -->|from_normal| H{connection_type?}
+  H -->|lan| I{has_sdcard OR could_emmc_print?}
+  I -->|yes| J["start_local_print"]
+  I -->|no| K["abort: no storage"]
+  H -->|cloud / farm| L{lan_mode_only?}
+  L -->|yes| M["start_local_print_with_record"]
+  L -->|no| N{IP+password+has_sdcard?}
+  N -->|yes| O["start_local_print_with_record"]
+  O -->|fail| P["start_print — cloud fallback"]
+  N -->|no| P
+```
+
+**`connection_type`** on `MachineObject` is `"lan"` for Developer Mode / LAN-only printers, `"cloud"` for cloud-paired devices, `"farm"` for farm mode. Pure LAN mode (`AppConfig::lan_mode_only`) forces the `_with_record` path even when the device object is cloud-typed, but still requires IP + access code.
+
+##### Three upload/print channels Studio actually uses
+
+| Channel | Who calls it | Upload transport | Print start | Starts a print? |
+|---|---|---|---|:---:|
+| **`bambu_network_start_*`** | `PrintJob`, `SendJob` | Inside plugin (stock: cloud S3 + optional FTPS, or LAN FTPS / `:6000` depending on entry point — see STATUS) | Plugin publishes MQTT `project_file` (except upload-only entries) | PrintJob yes; SendJob no |
+| **`ft_*` ABI** | `SendToPrinterDialog`, `FileTransferTunnel` in `PrintJob` preflight | Studio → `ft_tunnel_*` + `ft_job_create` / `ft_tunnel_start_job` (`FileTransferUtils.cpp`) | **Never** — upload completes with `get_send_finished_event()` | No |
+| **`bambu_network_send_message_to_printer`** | `MachineObject::publish_json()` | N/A (opaque JSON passthrough) | Timelapse preflight, AMS queries, user commands — **not** the print job itself | No |
+
+**Important:** “Send to Printer” in the UI (`SendToPrinterDialog`) uploads via **`ft_*` `cmd_type=5`** and never calls `bambu_network_start_send_gcode_to_sdcard`. The latter is still used by the legacy **`SendJob`** path and by the **`verify_job`** preflight probe.
+
+##### Scenario reference
+
+| Scenario | Plugin calls (in order) | Required for firmware to start printing | Tracking / UI only |
+|---|---|---|---|
+| **LAN print** (`connection_type=="lan"`, normal) | Preflight: optional `:6000` tunnel test + `start_send_gcode_to_sdcard(verify_job)` → **`start_local_print`** | Plugin upload + MQTT `project_file` (§6.8.2) | Preflight probes; `update_fn` progress |
+| **Cloud print** (no LAN credentials) | **`start_print`** | Cloud S3 upload + signed cloud MQTT `project_file` | `wait_fn` waits for `job_id` / printing status; `Record` stage = cloud task metadata |
+| **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Same as LAN path first; cloud REST + task record if LAN leg succeeds; cloud fallback if not | `wait_fn` on hybrid path; `params.comments` records fallback reason |
+| **`lan_mode_only` config** | **`start_local_print_with_record`** only (no cloud fallback in the success path) | LAN upload + MQTT + best-effort cloud `create_task` inside plugin | Same as hybrid LAN leg |
+| **Print existing file** (`from_sdcard_view`) | **`start_sdcard_print`** | MQTT `project_file` only (`dst_file` / `url` point at on-printer path) | UI labels it “cloud service” but plugin call is the same ABI |
+| **Upload only** (`SendJob`) | `verify_job` probe → **`start_send_gcode_to_sdcard`** (full `.3mf`) | Nothing — no MQTT print command | Progress via `update_fn` |
+| **Send to Printer dialog** | `ft_tunnel_create` → `ft_tunnel_start_connect` → `ft_job` **`cmd_type=7`** → **`cmd_type=5`** | Nothing | Progress via `ft_job` `msg_cb` JSON `{"progress":N}` |
+
+##### Before `PrintJob` — Studio-side steps (no print ABI)
+
+These run in `SelectMachineDialog` **before** any `bambu_network_start_*` call:
+
+1. **Export plate `.3mf`** — `Plater::send_gcode()` packs the sliced plate (`on_send_print`, `SelectMachine.cpp:3005`).
+2. **Export config `.3mf`** — `Plater::export_config_3mf()` for **non-LAN** printers only (`SelectMachine.cpp:3026`) — feeds cloud `create_task` / project APIs inside `start_print` / `_with_record`.
+3. **AMS / nozzle mapping** — MQTT queries on `MachineObject` (e.g. `get_auto_nozzle_mapping`); results copied into `PrintParams.ams_mapping*` / `nozzle_mapping`. Not part of the print-plugin ABI.
+4. **Timelapse storage preflight** (optional) — when timelapse is enabled and `is_support_internal_timelapse`, Studio sends `camera.ipcam_get_media_info` via **`bambu_network_send_message_to_printer`** (LAN) or **`bambu_network_send_message`** (cloud) **before** `on_send_print()` (§6.8.3). Failure or timeout → print proceeds anyway.
+
+##### Callback contract Studio passes into every print job
+
+All five `bambu_network_start_*` symbols share the same callback typedefs (§6.8 above). Studio builds them in `PrintJob::process()` (`PrintJob.cpp:405-548`):
+
+| Callback | Passed to | Purpose |
+|---|---|---|
+| **`OnUpdateStatusFn update_fn`** | All print paths except `verify_job` preflight (`nullptr`) | Drive progress bar + status text. **`stage`** = `SendingPrintJobStage`; **`code`** = 0–100 upload percent when `stage==Upload` or `Record`; negative / `>100` = error code (`BAMBU_NETWORK_ERR_*`). **`info`** = auxiliary string (upload size hint, or countdown seconds on `Finished`). |
+| **`WasCancelledFn cancel_fn`** | All paths that show cancel | Polls `PrintJob::was_canceled()`. Plugin must abort and return `BAMBU_NETWORK_ERR_CANCELED`. |
+| **`OnWaitFn wait_fn`** | **`start_print`**, **`start_local_print_with_record`** only | **Not** passed to `start_local_print`, `start_sdcard_print`, or `start_send_gcode_to_sdcard`. After plugin returns success, plugin may invoke `wait_fn(state, job_info_json)`; Studio parses `job_id` and polls **`MachineObject::job_id_`** / **`print_status`** for up to `PRINT_JOB_SENDING_TIMEOUT` seconds (`PrintJob.cpp:497-547`). Pure LAN print skips this — Studio navigates away on `Finished` alone. |
+
+**Stage → progress bar mapping** (`PrintJob.cpp:392-399`): `Create=20%`, `Upload=30%`, `Waiting=70%`, `Record=75%`, `Sending=97%`, `Finished=100%`. Upload/Record sub-percent interpolates from `code`.
+
+**Success contract:** plugin returns `0` and fires `update_fn(PrintingStageFinished, 0, "<seconds>")` where `<seconds>` is the post-send countdown (stock uses `"3"`). Studio then posts `get_print_finished_event()` and jumps to the device page.
+
+##### After the job — monitoring (separate from print submission)
+
+Print submission and ongoing status are **different ABI groups**:
+
+| Need | Studio mechanism | Plugin ABI |
+|---|---|---|
+| Live progress, temperatures, HMS | `MachineObject` state updated from MQTT **`push_status`** | **`bambu_network_connect_printer`** + **`set_on_printer_connected_fn`** / **`set_on_message_fn`** (LAN), or cloud **`set_user_message_fn`** + implicit subscribe from **`get_user_print_info`** |
+| Match cloud task to printer | `wait_fn` + `job_id_` from `push_status` | Only during `start_print` / `_with_record` |
+| Thumbnail / subtask panel | **`bambu_network_get_subtask_info`** | After print starts; unrelated to `start_*` return |
+| Cancel / pause | `MachineObject::command_task_*` → **`send_message_to_printer`** | Not via print-job API |
+
+Studio opens the LAN MQTT session through **`connect_printer`** when the user selects a LAN device in the UI — not inside `PrintJob`. The print plugin must publish `project_file` on that **already-connected** session (`send_message_to_printer` under the hood on LAN).
+
+##### `PrintParams` fields Studio sets vs what the plugin must consume
+
+Studio fills `PrintParams` in `PrintJob::process()` (`PrintJob.cpp:214-386`) from the select-machine dialog checkboxes and `MachineObject` capabilities. Fields that **directly affect the print wire** end up in MQTT `project_file` (§6.8.2) or the cloud REST bodies (§6.8.1). Fields Studio sets but **does not embed in `project_file`**: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments` — they feed cloud task creation or diagnostics only.
+
+Notable special cases:
+
+- **`project_name=="verify_job"`** — not a print; tiny upload to test FTPS write access (`PrintJob.cpp:236`, `SendJob.cpp:134`).
+- **`print_type=="from_sdcard_view"`** — sets **`dst_file`** instead of local **`filename`**; triggers **`start_sdcard_print`** only.
+- **`ftp_folder`** — passed through but **never assigned by Studio** in the public tree (`PrintJob.cpp:256` reads `obj_->get_ftp_folder()` which is usually empty); stock plugin uploads to FTPS root when empty.
+- **`try_emmc_print` / `could_emmc_print`** — gates the `:6000` preflight tunnel test; does not appear on the MQTT wire.
+
+Open-plugin mapping of each ABI entry point: [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation).
+
 #### 6.8.1. Cloud upload flow (stock plugin, MITM)
 
 Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. **How the open plugin maps these ABI symbols internally** (`Agent::run_cloud_print_job`, FTPS vs `:6000`, planned LAN-only refactor) is documented in [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation), not here.
@@ -2263,6 +2379,12 @@ A few practical contracts that the Studio code path enforces but does not docume
 | API typedefs | `src/slic3r/Utils/NetworkAgent.hpp:10-115` |
 | Name constants | `src/slic3r/Utils/bambu_networking.hpp:97-100` |
 | Error codes | `src/slic3r/Utils/bambu_networking.hpp:13-94` |
+| Print-job stage enum + `PrintParams` | `src/slic3r/Utils/bambu_networking.hpp:152-241` |
+| Studio print orchestration (decision tree) | `src/slic3r/GUI/Jobs/PrintJob.cpp:149-624` |
+| Upload-only job (`SendJob`) | `src/slic3r/GUI/Jobs/SendJob.cpp:111-347` |
+| Select-machine dialog → `PrintJob` | `src/slic3r/GUI/SelectMachine.cpp:2931-3157` |
+| Send-to-Printer dialog → `ft_*` | `src/slic3r/GUI/SendToPrinter.cpp:1700-1995` |
+| `NetworkAgent` wrappers for `start_*` | `src/slic3r/Utils/NetworkAgent.cpp:1363-1425` |
 | Data structures | `src/slic3r/Utils/bambu_networking.hpp:180-275` |
 | `InitFTModule` / `UnloadFTModule` | `src/slic3r/Utils/FileTransferUtils.hpp:239-253` |
 | `ft_*` symbol resolution | `src/slic3r/Utils/FileTransferUtils.cpp:12-37` |

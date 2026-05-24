@@ -219,7 +219,7 @@ Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](includ
 
 ## 6.8. Submitting a print job
 
-Source: [src/abi_print.cpp](src/abi_print.cpp).
+Source: [src/abi_print.cpp](src/abi_print.cpp). **Studio-side orchestration** (which entry point is chosen when, preflight, callbacks): [NETWORK_PLUGIN.md §6.8.0](NETWORK_PLUGIN.md#680-end-to-end-print-flows-studio-side-orchestration).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
@@ -535,6 +535,7 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 | Reference | Location |
 | --- | --- |
 | ABI contract (canonical function list) | [NETWORK_PLUGIN.md § 6](NETWORK_PLUGIN.md#6-the-full-c-abi-contract) |
+| Studio print-start orchestration (`PrintJob`, callbacks, scenarios) | [NETWORK_PLUGIN.md § 6.8.0](NETWORK_PLUGIN.md#680-end-to-end-print-flows-studio-side-orchestration) |
 | Common cloud HTTPS transport (hosts, bearer, response envelopes) | [NETWORK_PLUGIN.md § 6.10.1](NETWORK_PLUGIN.md#6101-common-cloud-transport) |
 | Filament Manager REST shapes (MITM) | [NETWORK_PLUGIN.md § 6.15](NETWORK_PLUGIN.md#615-filament-manager-cloud-spool-catalogue) |
 | `libBambuSource` C ABI, camera URL formats, CTRL bridge | [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) |
