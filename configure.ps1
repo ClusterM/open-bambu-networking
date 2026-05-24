@@ -35,7 +35,6 @@ param(
     [ValidateSet("bambu_studio","orca_slicer")]
     [string]   $ClientType   = "bambu_studio",
     [bool]     $Workarounds   = $true,
-    [bool]     $FtpsFastpath  = $true,
     [bool]     $EnableTests   = $false,
     [bool]     $PatchConf     = $true,
     # On Windows install the DirectShow source filter (HKCU CLSID +
@@ -278,7 +277,6 @@ if ($VcpkgTriplet -like "x86-*" -and $Architecture -eq "x64") {
 # array literal, PowerShell's comma-vs-plus operator precedence ends up
 # splitting "-DFOO=" and "ON" into two adjacent elements.
 $workaroundsVal      = if ($Workarounds)        { "ON" } else { "OFF" }
-$ftpsFastpathVal     = if ($FtpsFastpath)       { "ON" } else { "OFF" }
 $enableTestsVal      = if ($EnableTests)        { "ON" } else { "OFF" }
 $patchConfVal        = if ($PatchConf)          { "ON" } else { "OFF" }
 $registerDshowVal    = if ($RegisterDShowFilter){ "ON" } else { "OFF" }
@@ -299,7 +297,6 @@ $cmakeArgs += @(
     "-DOBN_VERSION=$WithVersion",
     "-DOBN_CLIENT_TYPE=$ClientType",
     "-DOBN_ENABLE_WORKAROUNDS=$workaroundsVal",
-    "-DOBN_FT_TUNNEL_LOCAL=$ftpsFastpathVal",
     "-DOBN_BUILD_TESTS=$enableTestsVal",
     "-DOBN_PATCH_CLIENT_CONF=$patchConfVal",
     "-DOBN_REGISTER_DSHOW_FILTER=$registerDshowVal"

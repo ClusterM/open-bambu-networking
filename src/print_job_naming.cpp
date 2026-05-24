@@ -1,7 +1,6 @@
 #include "obn/print_job.hpp"
 
-#include "obn/ft_tunnel_local_env.hpp"
-
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -73,7 +72,8 @@ std::string strip_leading_slash(const std::string& s)
 
 bool use_brtc_cache_upload(const BBL::PrintParams& p)
 {
-    return p.try_emmc_print && obn::ft_tunnel_local::runtime_enabled();
+    // LAN print with eMMC cache: upload .3mf via TLS :6000, then MQTT url=brtc://emmc/…
+    return p.try_emmc_print;
 }
 
 std::string build_brtc_emmc_url(const std::string& remote_name)

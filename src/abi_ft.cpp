@@ -8,8 +8,8 @@
 //   2. The Send-to-Printer dialog (SendToPrinter.cpp), which tries tcp
 //      (port=6000) -> tutk (cloud p2p) -> ftp in that order.
 //
-// LAN URLs are served over native BambuTunnelLocal (TLS :6000) when
-// OBN_FT_TUNNEL_LOCAL is enabled (default). TUTK/cloud URLs return FT_EIO.
+// LAN URLs are served over native BambuTunnelLocal (TLS :6000), same as stock.
+// TUTK/cloud URLs return FT_EIO.
 //
 // In both modes ft_tunnel_start_connect fires its callback synchronously
 // so Studio's UI state machine never hangs waiting for a completion
@@ -30,7 +30,6 @@
 #include <vector>
 
 #include "obn/abi_export.hpp"
-#include "obn/ft_tunnel_local_env.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/tunnel_upload.hpp"
@@ -78,8 +77,6 @@ constexpr int kCmdTypeDownload     = 4;
 constexpr int kCmdTypeUpload       = 5;
 constexpr int kCmdTypeMediaAbility = 7;
 
-#if OBN_FT_TUNNEL_LOCAL
-
 struct LanUrl {
     std::string ip;
     int         port = 6000;
@@ -90,11 +87,6 @@ struct LanUrl {
     std::string cli_ver;
     std::string net_ver;
 };
-
-bool ft_tunnel_local_enabled()
-{
-    return obn::ft_tunnel_local::runtime_enabled();
-}
 
 std::string percent_decode(const std::string& s)
 {
@@ -177,8 +169,6 @@ obn::tunnel_upload::ConnectParams connect_params(const LanUrl& lan)
     return cp;
 }
 
-#endif // OBN_FT_TUNNEL_LOCAL
-
 struct FT_Tunnel {
     std::atomic<int>     refcount{1};
     ft_tunnel_connect_cb conn_cb{nullptr};
@@ -187,14 +177,12 @@ struct FT_Tunnel {
     void*                status_user{nullptr};
     std::atomic<bool>    shut_down{false};
 
-#if OBN_FT_TUNNEL_LOCAL
     bool      is_lan{false};
     LanUrl    lan;
     std::unique_ptr<obn::tunnel_upload::Connection> conn;
     std::string ability_cache;
     bool        ability_probed{false};
     std::mutex  lan_mu;  // serializes connect/query/upload on one TLS session
-#endif
 };
 
 struct FT_Job {
@@ -213,7 +201,6 @@ struct FT_Job {
     std::string             res_json;
     std::vector<std::uint8_t> res_bin;
 
-#if OBN_FT_TUNNEL_LOCAL
     int         cmd_type     = 0;
     std::string dest_storage;
     std::string dest_name;
@@ -222,7 +209,6 @@ struct FT_Job {
     std::string target_path;
     bool        is_mem_file  = false;
     std::string raw_params;
-#endif
 };
 
 void retain(FT_Tunnel* t) { if (t) t->refcount.fetch_add(1, std::memory_order_relaxed); }
@@ -255,7 +241,6 @@ OBN_ABI ft_err ft_tunnel_create(const char* url, FT_TunnelHandle** out)
     auto* t = new FT_Tunnel();
     OBN_INFO("ft_tunnel_create url=%s", url ? url : "(null)");
 
-#if OBN_FT_TUNNEL_LOCAL
     if (parse_lan_url(url, t->lan)) {
         t->is_lan = true;
         OBN_INFO("ft_tunnel_create: lan ip=%s user=%s", t->lan.ip.c_str(),
@@ -263,7 +248,6 @@ OBN_ABI ft_err ft_tunnel_create(const char* url, FT_TunnelHandle** out)
     } else {
         OBN_INFO("ft_tunnel_create: non-local URL, will stub");
     }
-#endif
 
     *out = reinterpret_cast<FT_TunnelHandle*>(t);
     return FT_OK;
@@ -287,8 +271,6 @@ OBN_ABI ft_err ft_tunnel_set_status_cb(FT_TunnelHandle* h, ft_tunnel_status_cb c
     t->status_user = user;
     return FT_OK;
 }
-
-#if OBN_FT_TUNNEL_LOCAL
 
 namespace {
 
@@ -334,6 +316,10 @@ void deliver_result(FT_Job* j, int ec, int resp_ec, std::string json_body)
 void deliver_progress(FT_Job* j, double percent)
 {
     if (!j->msg_cb) return;
+    // Never send 99 — Studio arms an upload-timeout timer on progress==99
+    // (SendToPrinter.cpp).
+    constexpr double kReservedProgress = 99.0;
+    if (percent == kReservedProgress) percent = 98.0;
     if (percent < 0.0) percent = 0.0;
     if (percent > 100.0) percent = 100.0;
 
@@ -347,9 +333,6 @@ void deliver_progress(FT_Job* j, double percent)
 
 std::string connect_lan_tunnel(FT_Tunnel* t)
 {
-    if (!ft_tunnel_local_enabled()) {
-        return "OBN_FT_TUNNEL_LOCAL disabled";
-    }
     if (!t->conn) {
         t->conn = std::make_unique<obn::tunnel_upload::Connection>();
     }
@@ -505,8 +488,6 @@ void spawn_job(FT_Tunnel* t, FT_Job* j)
 
 } // namespace
 
-#endif // OBN_FT_TUNNEL_LOCAL
-
 OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb cb, void* user)
 {
     auto* t = reinterpret_cast<FT_Tunnel*>(h);
@@ -514,7 +495,6 @@ OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb 
     t->conn_cb   = cb;
     t->conn_user = user;
 
-#if OBN_FT_TUNNEL_LOCAL
     if (t->is_lan) {
         std::lock_guard<std::mutex> lk(t->lan_mu);
         if (std::string err = connect_lan_tunnel(t); !err.empty()) {
@@ -530,7 +510,6 @@ OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb 
         if (t->status_cb) t->status_cb(t->status_user, 0, /*new=*/1, 0, "ok");
         return FT_OK;
     }
-#endif
 
     OBN_INFO("ft_tunnel_start_connect: reporting synthetic failure (stub)");
     if (cb) cb(user, /*ok=*/1, /*err=*/FT_EIO, kUnsupportedMsg);
@@ -545,7 +524,6 @@ OBN_ABI ft_err ft_tunnel_sync_connect(FT_TunnelHandle* h)
     auto* t = reinterpret_cast<FT_Tunnel*>(h);
     if (!t) return FT_EINVAL;
 
-#if OBN_FT_TUNNEL_LOCAL
     if (t->is_lan) {
         std::lock_guard<std::mutex> lk(t->lan_mu);
         OBN_INFO("ft: sync_connect: opening tunnel to %s", t->lan.ip.c_str());
@@ -557,7 +535,6 @@ OBN_ABI ft_err ft_tunnel_sync_connect(FT_TunnelHandle* h)
         OBN_WARN("ft: sync_connect: %s", err.c_str());
         return FT_EIO;
     }
-#endif
 
     OBN_INFO("ft_tunnel_sync_connect: returning FT_EIO (stub)");
     return FT_EIO;
@@ -569,12 +546,10 @@ OBN_ABI ft_err ft_tunnel_shutdown(FT_TunnelHandle* h)
     if (!t) return FT_EINVAL;
     t->shut_down.store(true, std::memory_order_release);
 
-#if OBN_FT_TUNNEL_LOCAL
     {
         std::lock_guard<std::mutex> lk(t->lan_mu);
         if (t->conn) t->conn->disconnect();
     }
-#endif
 
     return FT_OK;
 }
@@ -585,7 +560,6 @@ OBN_ABI ft_err ft_job_create(const char* params_json, FT_JobHandle** out)
     auto* j = new FT_Job();
     OBN_INFO("ft_job_create params=%.200s", params_json ? params_json : "(null)");
 
-#if OBN_FT_TUNNEL_LOCAL
     if (params_json) {
         j->raw_params = params_json;
         std::string perr;
@@ -602,7 +576,6 @@ OBN_ABI ft_err ft_job_create(const char* params_json, FT_JobHandle** out)
             OBN_WARN("ft_job_create: bad params json: %s", perr.c_str());
         }
     }
-#endif
 
     *out = reinterpret_cast<FT_JobHandle*>(j);
     return FT_OK;
@@ -642,12 +615,10 @@ OBN_ABI ft_err ft_tunnel_start_job(FT_TunnelHandle* th, FT_JobHandle* jh)
     auto* j = reinterpret_cast<FT_Job*>(jh);
     if (!t || !j) return FT_EINVAL;
 
-#if OBN_FT_TUNNEL_LOCAL
     if (t->is_lan) {
         spawn_job(t, j);
         return FT_OK;
     }
-#endif
 
     OBN_INFO("ft_tunnel_start_job: delivering FT_EIO result (stub)");
     if (j->result_cb) {

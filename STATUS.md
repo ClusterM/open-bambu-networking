@@ -323,9 +323,7 @@ Source: [src/abi_track.cpp](src/abi_track.cpp). Telemetry is intentionally not f
 
 Source: [src/abi_ft.cpp](src/abi_ft.cpp), [src/tunnel_upload.cpp](src/tunnel_upload.cpp).
 
-Statuses below assume `OBN_FT_TUNNEL_LOCAL=ON` (default). With `OFF` (`configure --disable-ftps-fastpath`), every active entry point collapses into a polite-failure stub (`FT_EIO`) and Studio transparently falls back to its internal FTP send path (`start_send_gcode_to_sdcard`).
-
-For `bambu:///local/*` URLs the plugin serves `ft_*` over **native TLS :6000** (BambuTunnelLocal — same wire as stock). Cloud / TUTK URLs return `FT_EIO`.
+Statuses below reflect stock-parity behaviour: LAN `ft_*` over **native TLS :6000** (BambuTunnelLocal). Cloud / TUTK URLs return `FT_EIO`; Studio falls back to FTPS where applicable.
 
 | Function | Status | Notes |
 | --- | :--: | --- |
@@ -347,13 +345,11 @@ For `bambu:///local/*` URLs the plugin serves `ft_*` over **native TLS :6000** (
 
 ### 6.14.1. Native :6000 wire
 
-Stock `libbambu_networking.so` serves LAN `ft_*` over **TLS :6000** with the same BambuTunnelLocal framing as Device → Files (§7.5.1.1). Our plugin implements that path when `OBN_FT_TUNNEL_LOCAL=ON` (default), shared with LAN print upload via [`tunnel_upload.cpp`](src/tunnel_upload.cpp):
+Stock `libbambu_networking.so` serves LAN `ft_*` over **TLS :6000** with the same BambuTunnelLocal framing as Device → Files (§7.5.1.1). Our plugin implements the same path, shared with LAN print upload via [`tunnel_upload.cpp`](src/tunnel_upload.cpp):
 
 - `cmd_type=7` → wire `REQUEST_MEDIA_ABILITY` (`0x0007`); firmware reply mapped to a JSON array for Studio (may include `"emmc"` on P2S).
 - `cmd_type=5` → wire chunked `FILE_UPLOAD` (`0x0005`) — see §6.14.2 below and [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026) for the wire format.
 - `cmd_type=4` → wire `FILE_DOWNLOAD` (`0x0004`) for **Printer Preview** (`mem:/26` JPEG) — see §6.14.4 and [NETWORK_PLUGIN.md §6.14.4](NETWORK_PLUGIN.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview).
-
-Runtime override: `OBN_FT_TUNNEL_LOCAL=0|1`.
 
 **Scope:** TUTK/cloud `ft_*` URLs remain `FT_EIO`. Legacy printers without `:6000` rely on Studio's `SendJob` → `start_send_gcode_to_sdcard` (FTPS).
 

@@ -33,11 +33,7 @@ int main()
 
     BBL::PrintParams p{};
     p.try_emmc_print = true;
-#if OBN_FT_TUNNEL_LOCAL
     CHECK(obn::print_job::use_brtc_cache_upload(p));
-#else
-    CHECK(!obn::print_job::use_brtc_cache_upload(p));
-#endif
     p.try_emmc_print = false;
     CHECK(!obn::print_job::use_brtc_cache_upload(p));
 

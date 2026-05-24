@@ -12,7 +12,6 @@ PREFIX=""
 OBN_VERSION=""
 CLIENT_TYPE=bambu_studio
 WORKAROUNDS=ON
-FTPS_FASTPATH=ON
 TESTS=OFF
 PATCH_CONF=ON
 EXTRA_CMAKE_ARGS=""
@@ -74,10 +73,6 @@ Optional features:
                              depend on them (P2S Send, LAN file browser,
                              SD-over-MQTT, MJPEG transcode) disappear
                              cleanly. Re-enable with --enable-workarounds.
-  --disable-ftps-fastpath    Stub out the ft_* fast path; Studio falls
-                             back to its internal FTP for 'Send to
-                             Printer'. Re-enable with
-                             --enable-ftps-fastpath.
   --enable-tests             Build probe_plugin / *_live_test smoke tests
                              (disabled by default). Disable again with
                              --disable-tests.
@@ -108,8 +103,6 @@ for arg in "$@"; do
         --client-type=*)           CLIENT_TYPE="${arg#*=}" ;;
         --disable-workarounds)     WORKAROUNDS=OFF ;;
         --enable-workarounds)      WORKAROUNDS=ON ;;
-        --disable-ftps-fastpath)   FTPS_FASTPATH=OFF ;;
-        --enable-ftps-fastpath)    FTPS_FASTPATH=ON ;;
         --disable-tests)           TESTS=OFF ;;
         --enable-tests)            TESTS=ON ;;
         --no-conf-patch)           PATCH_CONF=OFF ;;
@@ -326,7 +319,6 @@ set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 set -- "$@" \
     -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
-    -DOBN_FT_TUNNEL_LOCAL="$FTPS_FASTPATH" \
     -DOBN_BUILD_TESTS="$TESTS" \
     -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF"
 # shellcheck disable=SC2086

@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bambu6000_repl import (  # noqa: E402
     MAGIC_CTRL,
     MAGIC_LOGIN,
-    MTYPE_CTRL_JSON,
     build_ctrl_setup_json,
     build_frame_header,
     build_login_payload,

@@ -187,9 +187,13 @@ bool split_json_prefix(const std::uint8_t* data, std::size_t len,
     if (json_out) {
         json_out->assign(reinterpret_cast<const char*>(data), i);
     }
-    while (i < len && (data[i] == '\n' || data[i] == '\r' || data[i] == ' ' ||
-                       data[i] == '\t')) {
-        ++i;
+    // Binary follows optional "\n\n" (see wrap_ctrl_abi_with_binary). Do not
+    // strip arbitrary whitespace — file chunks may start with space/newline.
+    if (i + 1 < len && data[i] == '\n' && data[i + 1] == '\n') {
+        i += 2;
+    } else if (i + 3 < len && data[i] == '\r' && data[i + 1] == '\n' &&
+               data[i + 2] == '\r' && data[i + 3] == '\n') {
+        i += 4;
     }
     if (bin_out && i < len) {
         bin_out->assign(data + i, data + len);

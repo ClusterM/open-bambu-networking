@@ -656,12 +656,6 @@ int upload_file(const ConnectParams& connect,
 {
     if (out) *out = {};
 
-#if !OBN_FT_TUNNEL_LOCAL
-    (void)connect;
-    (void)upload;
-    (void)cb;
-    return err_code_on_failure;
-#else
     Connection conn;
     std::string err;
     if (conn.connect(connect, &err) != 0) {
@@ -678,7 +672,6 @@ int upload_file(const ConnectParams& connect,
         return BAMBU_NETWORK_ERR_CANCELED;
     }
     return err_code_on_failure;
-#endif
 }
 
 ConnectParams connect_params_from_print(const std::string& dev_ip,

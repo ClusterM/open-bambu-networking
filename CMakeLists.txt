@@ -109,14 +109,9 @@ if(NOT CMAKE_CROSSCOMPILING
 endif()
 
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
-# the Print job's eMMC pre-flight speaks a real transport instead of
-# reporting an immediate I/O error.
-#   OBN_FT_TUNNEL_LOCAL   — native BambuTunnelLocal over TLS :6000 (stock path)
-# With OFF every ft_* entry point is a polite-failure stub and Studio
-# falls back to its internal FTP send path.
-option(OBN_FT_TUNNEL_LOCAL "Serve ft_* over TLS :6000 (BambuTunnelLocal)" ON)
-
-# Toggles every non-stock behaviour in the plugin. With this ON the plugin
+# the Print job's eMMC pre-flight speaks native BambuTunnelLocal (TLS :6000),
+# same as stock libbambu_networking.so.
+option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
 # makes choices the original bambu_networking.so never would in order to
 # get Developer-Mode LAN printers (most notably the P2S, which has a USB
 # stick in place of an SD card) fully functional in Studio. With this
@@ -299,7 +294,6 @@ target_include_directories(bambu_networking PRIVATE include)
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
-    OBN_FT_TUNNEL_LOCAL=$<BOOL:${OBN_FT_TUNNEL_LOCAL}>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 target_link_libraries(bambu_networking PRIVATE
@@ -669,8 +663,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/print_job_naming.cpp)
     target_include_directories(print_url_test PRIVATE include)
     target_compile_definitions(print_url_test PRIVATE
-        ABI_VERSION=${OBN_ABI_VERSION_HEX}
-        OBN_FT_TUNNEL_LOCAL=$<BOOL:${OBN_FT_TUNNEL_LOCAL}>)
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
     add_test(NAME print_url COMMAND print_url_test)
 
     add_executable(tunnel_local_test tests/tunnel_local_test.cpp
