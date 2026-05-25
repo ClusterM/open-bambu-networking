@@ -161,21 +161,21 @@ function formatFrameHeader(data) {
   );
 }
 
-function bytesToLatin1(data) {
-  let s = '';
-  for (let i = 0; i < data.length; i++) {
-    s += String.fromCharCode(data[i]);
-  }
-  return s;
+const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
+
+function decodeUtf8Bytes(data) {
+  return utf8Decoder.decode(data);
 }
 
-function isLatin1Printable(data) {
-  for (let i = 0; i < data.length; i++) {
-    const b = data[i];
-    if (b === 0x0a || b === 0x0d || b === 0x09) continue;
-    if (b < 0x20 || b > 0x7e) return false;
+function looksLikeUtf8Text(data) {
+  const text = decodeUtf8Bytes(data);
+  if (text.indexOf('\uFFFD') !== -1) return null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x0a || c === 0x0d || c === 0x09) continue;
+    if (c < 0x20) return null;
   }
-  return true;
+  return text;
 }
 
 function splitTextAndBinary(data) {
@@ -183,7 +183,7 @@ function splitTextAndBinary(data) {
 
   const jend = jsonPrefixEnd(data);
   if (jend > 0) {
-    const text = bytesToLatin1(data.subarray(0, jend));
+    const text = decodeUtf8Bytes(data.subarray(0, jend));
     let tailStart = jend;
     // Studio envelope: json\n\n<binary blob>
     if (jend + 1 < data.length && data[jend] === 0x0a && data[jend + 1] === 0x0a) {
@@ -199,8 +199,9 @@ function splitTextAndBinary(data) {
     return { text: text, binary: data.subarray(tailStart) };
   }
 
-  if (isLatin1Printable(data)) {
-    return { text: bytesToLatin1(data), binary: new Uint8Array(0) };
+  const text = looksLikeUtf8Text(data);
+  if (text !== null) {
+    return { text: text, binary: new Uint8Array(0) };
   }
   return { text: null, binary: data };
 }

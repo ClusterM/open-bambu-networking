@@ -578,6 +578,13 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
         std::string file_md5;
         if (last_chunk) {
             digest_lower = md5_finalize_lower(md5_ctx.get());
+            if (digest_lower.empty()) {
+                out.error = "md5 finalize failed";
+                if (obn::os::socket_valid(fd)) {
+                    obn::tls::clear_socket_io_timeout(fd);
+                }
+                return out;
+            }
             file_md5 = digest_lower;
             md5_ctx.reset();
         }

@@ -546,7 +546,6 @@ struct Tunnel {
     std::unordered_set<int>    ctrl_cancelled;
     std::atomic<bool>          ctrl_stop{false};
     std::thread                ctrl_worker;
-    std::thread                ctrl_recv_worker;
 
     // Scratch storage for the CtrlReply currently exposed via
     // Bambu_ReadSample's `sample->buffer`. We keep it alive until the
@@ -2124,7 +2123,6 @@ void stop_ctrl_mode(Tunnel* t)
         t->ctrl_cv.notify_all();
     }
     if (t->ctrl_worker.joinable()) t->ctrl_worker.join();
-    if (t->ctrl_recv_worker.joinable()) t->ctrl_recv_worker.join();
     if (t->ftp) {
         t->ftp->quit();
         t->ftp.reset();

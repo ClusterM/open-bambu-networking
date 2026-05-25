@@ -511,14 +511,13 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         // for 99% of single-plate .3mfs.
         int plate_idx = 1;
 
-        std::string host, user, pass, ca;
+        std::string host, user, pass;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (lan_session_) {
                 host = lan_session_->dev_ip();
                 user = lan_session_->username();
                 pass = lan_session_->password();
-                ca   = lan_session_->ca_file();
             }
             synthetic_subtasks_[cover_id] =
                 SyntheticSubtask{subtask_name, plate_idx, cover_version};
@@ -537,7 +536,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
             }
         }
         if (!host.empty()) {
-            cover_cache::ensure(host, dev_id, user, pass, ca,
+            cover_cache::ensure(host, dev_id, user, pass,
                                 subtask_name, plate_idx, cover_version);
         }
     }

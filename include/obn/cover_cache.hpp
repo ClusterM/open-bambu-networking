@@ -22,7 +22,6 @@ void ensure(const std::string& host,
             const std::string& dev_id,
             const std::string& user,
             const std::string& password,
-            const std::string& ca_file,
             const std::string& subtask_name,
             int                plate_idx,
             const std::string& version = {});

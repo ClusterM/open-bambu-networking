@@ -146,7 +146,6 @@ void ensure(const std::string& host,
             const std::string& dev_id,
             const std::string& user,
             const std::string& password,
-            const std::string& ca_file,
             const std::string& subtask_name,
             int                plate_idx,
             const std::string& version)
@@ -169,7 +168,6 @@ void ensure(const std::string& host,
     cp.dev_id   = dev_id;
     cp.password = password;
     cp.username = user.empty() ? "bblp" : user;
-    (void)ca_file;
 
     std::thread(fetch_worker, std::move(cp), subtask_name, plate_idx, version,
                 std::move(key)).detach();
