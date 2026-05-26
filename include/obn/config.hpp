@@ -4,6 +4,16 @@
 #include <optional>
 #include <string>
 
+#ifndef OBN_CLOUD_API_URL_DEFAULT
+#define OBN_CLOUD_API_URL_DEFAULT ""
+#endif
+#ifndef OBN_CLOUD_WEB_URL_DEFAULT
+#define OBN_CLOUD_WEB_URL_DEFAULT ""
+#endif
+#ifndef OBN_CLOUD_MQTT_HOSTNAME_DEFAULT
+#define OBN_CLOUD_MQTT_HOSTNAME_DEFAULT ""
+#endif
+
 namespace obn::config {
 
 // Resolve config in this order of precedence: env var -> compiled default (CMake -D...)
