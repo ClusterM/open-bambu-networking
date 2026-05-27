@@ -55,6 +55,17 @@ param(
     # a Visual Studio version (e.g. "Visual Studio 16 2019").
     [string]   $Generator    = "",
     [string]   $Architecture = "x64",
+    # Cloud endpoint overrides baked in at build time. Empty = keep Bambu
+    # defaults. The matching OBN_CLOUD_* environment variable wins at
+    # runtime, so the same DLL can be redirected without rebuilding.
+    #   -CloudApiUrl       : REST API base, no trailing slash
+    #                        (e.g. https://api.example.com).
+    #   -CloudWebUrl       : web portal base, WITH trailing slash
+    #                        (e.g. https://example.com/).
+    #   -CloudMqttHostname : MQTT broker hostname, no scheme, no port.
+    [string]   $CloudApiUrl      = "",
+    [string]   $CloudWebUrl      = "",
+    [string]   $CloudMqttHostname = "",
     [string[]] $CMakeArg     = @()
 )
 
@@ -301,6 +312,9 @@ $cmakeArgs += @(
     "-DOBN_PATCH_CLIENT_CONF=$patchConfVal",
     "-DOBN_REGISTER_DSHOW_FILTER=$registerDshowVal"
 )
+$cmakeArgs += "-DOBN_CLOUD_API_URL=$CloudApiUrl"
+$cmakeArgs += "-DOBN_CLOUD_WEB_URL=$CloudWebUrl"
+$cmakeArgs += "-DOBN_CLOUD_MQTT_HOSTNAME=$CloudMqttHostname"
 if ($CMakeArg.Count -gt 0) { $cmakeArgs += $CMakeArg }
 
 Write-Note ("cmake " + ($cmakeArgs -join " "))

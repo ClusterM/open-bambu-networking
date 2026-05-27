@@ -1,5 +1,6 @@
 #include "obn/cloud_auth.hpp"
 
+#include "obn/config.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -45,16 +46,18 @@ std::string api_error(const obn::json::Value& root, long status)
 
 std::string api_host(const std::string& region)
 {
+    if (auto o = config::resolve_override("OBN_CLOUD_API_URL", OBN_CLOUD_API_URL_DEFAULT)) return *o;
     if (region == "CN" || region == "cn") return "https://api.bambulab.cn";
     return "https://api.bambulab.com";
 }
 
 std::string web_host(const std::string& region)
 {
-    // No trailing slash: Studio appends "/sign-in" (WebUserLoginDialog)
-    // and "api/sign-in/ticket?..." (bind flow) to this value.
-    if (region == "CN" || region == "cn") return "https://bambulab.cn";
-    return "https://bambulab.com";
+    if (auto o = config::resolve_override("OBN_CLOUD_WEB_URL", OBN_CLOUD_WEB_URL_DEFAULT)) return *o;
+    // Trailing slash required: Studio appends some suffixes with a
+    // leading slash ("/sign-in") and others without ("api/sign-in/..."),
+    if (region == "CN" || region == "cn") return "https://bambulab.cn/";
+    return "https://bambulab.com/";
 }
 
 AuthResult login_with_ticket(const std::string& region,
