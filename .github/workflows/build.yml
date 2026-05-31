@@ -33,8 +33,6 @@ on:
   push:
   workflow_dispatch:
   pull_request:
-  schedule:
-    - cron: '15 2 * * *'
 
 permissions:
   contents: read
@@ -44,26 +42,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast, architecture-independent check: compare the ABI surface
-  # (bambu_networking.hpp + NetworkAgent.hpp + bambu_network_* dlsym list)
-  # at the most recent bambulab/BambuStudio tag on github.com against the
-  # baseline under tools/abi_snapshot/vMM.mm.pp/ (series from the tag).
-  # See tools/check_abi_compat.sh for the full list of checks.
-  abi-compat:
-    name: abi-compat
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates curl git
-
-      - name: Check ABI against latest upstream Bambu Studio tag
-        run: tools/check_abi_compat.sh
-
   build:
     name: v${{ matrix.abi }}.xx-linux-${{ matrix.arch }}
     runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
@@ -80,6 +58,7 @@ jobs:
           - 02.05.03
           - 02.06.00
           - 02.06.01
+          - 02.07.00
         arch:
           - x64
           - aarch64
@@ -115,9 +94,9 @@ jobs:
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
-        # `abi-compat` job above compares source-side files only. This step
-        # additionally nm's the freshly built .so to confirm we did not
-        # lose any exported entry point in this architecture's toolchain.
+        # Nightly abi-compat workflow compares source-side files only.
+        # This step additionally nm's the freshly built .so to confirm we
+        # did not lose any exported entry point in this architecture's toolchain.
         run: tools/check_abi_compat.sh --so=build/libbambu_networking.so
 
       - name: Stage artifacts
@@ -152,7 +131,7 @@ jobs:
           - 02.05.02
           - 02.05.03
           - 02.06.00
-          - 02.06.01
+          - 02.07.00
 
     steps:
       - name: Checkout
@@ -230,6 +209,7 @@ jobs:
           - 02.05.03
           - 02.06.00
           - 02.06.01
+          - 02.07.00
 
     steps:
       - name: Checkout
@@ -238,7 +218,9 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eu
-          brew install pkg-config cmake openssl@3 cjson zlib uthash
+          for pkg in pkg-config cmake openssl@3 curl cjson zlib uthash; do
+            brew list "$pkg" &>/dev/null || brew install "$pkg"
+          done
           {
             echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
             PC="$(brew --prefix openssl@3)/lib/pkgconfig"

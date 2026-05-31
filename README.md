@@ -103,6 +103,7 @@ Please note:
 - Bambu Studio **02.05.03**._xx_
 - Bambu Studio **02.06.00**._xx_
 - Bambu Studio **02.06.01**._xx_
+- Bambu Studio **02.07.00**._xx_
 
 Compatibility with plugin ABI depends on the first three numbers in the version number, e.g.
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
@@ -515,7 +516,7 @@ over the file when set.
 | `cloud_mqtt_port` | `8883` | Cloud MQTT broker port. |
 | `block_cloud` | `1` | Block background cloud MQTT/REST connections. Auth, preset sync, and bind/unbind are still allowed. |
 | `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
-| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External choice in the print dialog. |
+| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
 | `bambusource_log_level` | *(unset)* | Log threshold for BambuSource (camera/file-browser library). Overridden by `OBN_BAMBUSOURCE_LOG_LEVEL`. |
 | `bambusource_log_file` | *(unset)* | Log file path for BambuSource. Overridden by `OBN_BAMBUSOURCE_LOG_FILE`. |
 
