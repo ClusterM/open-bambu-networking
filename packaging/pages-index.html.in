@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open Bambu Networking — Downloads</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-hover: #79c0ff;
+    --green: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica,
+                 Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem 1rem;
+  }
+  .container { max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin-bottom: 0.3rem; }
+  .subtitle {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    margin-bottom: 2rem;
+  }
+  .subtitle a { color: var(--accent); text-decoration: none; }
+  .subtitle a:hover { text-decoration: underline; }
+  .meta {
+    display: flex; gap: 2rem; flex-wrap: wrap;
+    margin-bottom: 1.5rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+  }
+  .meta code {
+    background: var(--surface);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 2rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--surface);
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+  }
+  td a {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  td a:hover { color: var(--accent-hover); text-decoration: underline; }
+  .size { color: var(--text-muted); font-size: 0.9rem; }
+  .instructions {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .instructions h2 {
+    font-size: 1.1rem;
+    margin-bottom: 0.75rem;
+  }
+  .instructions ol {
+    padding-left: 1.5rem;
+  }
+  .instructions li {
+    margin-bottom: 0.4rem;
+  }
+  .instructions code {
+    background: var(--bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  footer {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Open Bambu Networking</h1>
+<p class="subtitle">
+  Pre-built plugin distributions for Bambu Studio and Orca Slicer.
+  Source code on <a href="https://github.com/@REPO@">GitHub</a>.
+</p>
+
+<div class="meta">
+  <span>Commit: <code><a href="https://github.com/@REPO@/commit/@COMMIT@">@SHORT_COMMIT@</a></code></span>
+  <span>Built: @DATE@</span>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Platform</th>
+      <th>Download</th>
+      <th>Size</th>
+    </tr>
+  </thead>
+  <tbody>
+    @TABLE_ROWS@
+  </tbody>
+</table>
+
+<div class="instructions">
+  <h2>Quick install</h2>
+  <ol>
+    <li>Download the archive for your platform</li>
+    <li>Extract it anywhere</li>
+    <li><strong>Linux/macOS:</strong> run <code>./install.sh</code> (or double-click <code>install.command</code> on macOS)</li>
+    <li><strong>Windows:</strong> double-click <code>install.bat</code> (or run <code>.\install.ps1</code> in PowerShell)</li>
+    <li>The installer will ask which slicer to install for and handle the rest</li>
+  </ol>
+</div>
+
+<footer>
+  <a href="https://github.com/@REPO@">Open Bambu Networking</a> &mdash;
+  open-source replacement for Bambu Lab's proprietary network plugin
+</footer>
+
+</div>
+</body>
+</html>
