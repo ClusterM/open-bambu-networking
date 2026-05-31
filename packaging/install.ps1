@@ -26,6 +26,11 @@ function Wait-And-Exit {
 
 Write-Host ""
 Write-Host "Open Bambu Networking - Installer" -ForegroundColor White
+$VersionFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "VERSION"
+if (Test-Path $VersionFile) {
+    $VersionContent = (Get-Content -Path $VersionFile -Raw).Trim()
+    Write-Host "  Build: $VersionContent"
+}
 Write-Host ""
 Write-Host "Select your slicer:"
 Write-Host "  1) Bambu Studio"

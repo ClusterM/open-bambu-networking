@@ -1,7 +1,7 @@
 Open Bambu Networking — @PLATFORM@ distribution
 ================================================
 
-Commit:  @COMMIT@
+Build:   @VERSION_LABEL@
 Date:    @DATE@
 GitHub:  https://github.com/ClusterM/open-bambu-networking
 

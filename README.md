@@ -5,6 +5,7 @@ plugin.
 
 ## Table of contents
 
+- [Downloads](#downloads)
 - [Why this project exists](#why-this-project-exists)
 - [Supported platforms](#supported-platforms)
 - [Supported Bambu Studio versions (ABI versions)](#supported-bambu-studio-versions-abi-versions)
@@ -31,6 +32,20 @@ plugin.
   - [`libBambuSource.so` logging](#libbambusourceso-logging)
 - [License](#license)
 - [Support the Developer and the Project](#support-the-developer-and-the-project)
+
+## Downloads
+
+Pre-built plugin binaries are available for all supported platforms.
+
+**Stable releases:** [GitHub Releases](https://github.com/ClusterM/open-bamboo-networking/releases)
+— tested and tagged versions recommended for general use.
+
+**Interim builds:** [GitHub Pages](https://clusterm.github.io/open-bamboo-networking/)
+— automatically built from the latest commit on the main branch. These
+builds may include new features and bug fixes ahead of the next release, but
+they can also be unstable, contain incomplete functionality, or introduce
+breaking changes that will be revised before the next stable release. Use them
+if you want the cutting edge and are comfortable reporting issues.
 
 ## Why this project exists
 

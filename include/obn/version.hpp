@@ -1,0 +1,3 @@
+#pragma once
+
+#define OBN_PROJECT_VERSION "v1.0rc1"

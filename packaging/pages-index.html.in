@@ -112,12 +112,14 @@
 
 <h1>Open Bambu Networking</h1>
 <p class="subtitle">
-  Pre-built plugin distributions for Bambu Studio and Orca Slicer.
+  Pre-built <strong>interim</strong> plugin distributions for Bambu Studio and Orca Slicer.
+  These builds contain the latest features but may be unstable.
+  For stable releases, see <a href="https://github.com/@REPO@/releases">GitHub Releases</a>.
   Source code on <a href="https://github.com/@REPO@">GitHub</a>.
 </p>
 
 <div class="meta">
-  <span>Commit: <code><a href="https://github.com/@REPO@/commit/@COMMIT@">@SHORT_COMMIT@</a></code></span>
+  <span>Interim build, commit: <code><a href="https://github.com/@REPO@/commit/@COMMIT@">@SHORT_COMMIT@</a></code></span>
   <span>Built: @DATE@</span>
 </div>
 

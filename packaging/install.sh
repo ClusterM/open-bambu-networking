@@ -38,7 +38,12 @@ esac
 
 # ── Client selection ─────────────────────────────────────────────────────
 
-printf "\n${BOLD}Open Bambu Networking — Installer${RESET}\n\n"
+printf "\n${BOLD}Open Bambu Networking — Installer${RESET}\n"
+if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    VERSION_CONTENT=$(cat "$SCRIPT_DIR/VERSION")
+    printf "  Build: %s\n" "$VERSION_CONTENT"
+fi
+printf "\n"
 printf "Select your slicer:\n"
 printf "  ${BOLD}1${RESET}) Bambu Studio\n"
 printf "  ${BOLD}2${RESET}) Orca Slicer\n"

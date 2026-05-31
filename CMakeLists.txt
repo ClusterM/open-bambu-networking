@@ -88,6 +88,17 @@ configure_file(
     "${OBN_GENERATED_DIR}/obn_conf_default.h"
     @ONLY)
 
+option(OBN_RELEASE "Build a release (show project version instead of commit hash)" OFF)
+
+# Extract OBN_PROJECT_VERSION from the single source of truth: include/obn/version.hpp
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/obn/version.hpp" _obn_ver_hpp)
+string(REGEX MATCH "OBN_PROJECT_VERSION \"([^\"]+)\"" _obn_ver_match "${_obn_ver_hpp}")
+if(NOT _obn_ver_match)
+    message(FATAL_ERROR "Cannot parse OBN_PROJECT_VERSION from include/obn/version.hpp")
+endif()
+set(OBN_PROJECT_VERSION_STRING "${CMAKE_MATCH_1}")
+message(STATUS "obn: project version=${OBN_PROJECT_VERSION_STRING} (OBN_RELEASE=${OBN_RELEASE})")
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ObnGitInfo.cmake")
 obn_detect_git_info(OBN_GIT_COMMIT OBN_GIT_DIRTY)
 if(OBN_GIT_COMMIT)
@@ -300,9 +311,13 @@ if(OBN_GIT_COMMIT)
         list(APPEND _obn_git_compile_defs OBN_GIT_DIRTY=1)
     endif()
 endif()
+if(OBN_RELEASE)
+    list(APPEND _obn_git_compile_defs OBN_RELEASE_BUILD=1)
+endif()
 
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
+    OBN_PROJECT_VERSION_STRING="${OBN_PROJECT_VERSION_STRING}"
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
     ${_obn_git_compile_defs}
 )
