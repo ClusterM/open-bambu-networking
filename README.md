@@ -515,7 +515,7 @@ over the file when set.
 | `cloud_mqtt_port` | `8883` | Cloud MQTT broker port. |
 | `block_cloud` | `1` | Block background cloud MQTT/REST connections. Auth, preset sync, and bind/unbind are still allowed. |
 | `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
-| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External choice in the print dialog. |
+| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
 | `bambusource_log_level` | *(unset)* | Log threshold for BambuSource (camera/file-browser library). Overridden by `OBN_BAMBUSOURCE_LOG_LEVEL`. |
 | `bambusource_log_file` | *(unset)* | Log file path for BambuSource. Overridden by `OBN_BAMBUSOURCE_LOG_FILE`. |
 
