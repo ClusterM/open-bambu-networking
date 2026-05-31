@@ -14,6 +14,7 @@ CLIENT_TYPE=bambu_studio
 TESTS=OFF
 PATCH_CONF=ON
 EXTRA_CMAKE_ARGS=""
+LAN_ONLY=OFF
 
 usage() {
     cat <<'EOF'
@@ -70,6 +71,10 @@ Optional features:
   --enable-tests             Build probe_plugin / *_live_test smoke tests
                              (disabled by default). Disable again with
                              --disable-tests.
+  --lan-only                 Strip all cloud functionality at compile time.
+                             The plugin will only communicate with printers
+                             on the local network; no cloud URLs, cloud MQTT,
+                             or cloud REST calls will be compiled in.
   --no-conf-patch            'make install' will not edit the slicer's
                              conf file (BambuStudio.conf or
                              OrcaSlicer.conf). Use this for staging or
@@ -103,6 +108,7 @@ for arg in "$@"; do
             printf 'configure: --video-backend is deprecated and ignored '\
 '(libBambuSource now passes raw H.264 straight to gstbambusrc, '\
 'no transcoder backend is built into the plugin).\n' >&2 ;;
+        --lan-only)                LAN_ONLY=ON ;;
         --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
         -h|--help)                 usage; exit 0 ;;
         *)
@@ -308,6 +314,7 @@ fi
 set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 [ -n "$PREFIX" ]      && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
 [ -n "$OBN_VERSION" ] && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
+[ "$LAN_ONLY" = "ON" ] && set -- "$@" -DOBN_LAN_ONLY=ON
 set -- "$@" \
     -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
     -DOBN_BUILD_TESTS="$TESTS" \

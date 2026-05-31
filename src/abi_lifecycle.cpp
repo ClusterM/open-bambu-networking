@@ -97,6 +97,7 @@ OBN_ABI int bambu_network_start(void* agent)
     // stall and we end up never kicking off cloud MQTT. Fire it off
     // here ourselves - start() is the very last call in the plugin
     // handshake, so all callbacks are already registered.
+#ifndef OBN_LAN_ONLY
     if (auto* a = as_agent(agent); a && a->user_logged_in()) {
         if (obn::config::current().block_cloud) {
             OBN_INFO("start: user logged in but block_cloud=1, skipping auto-connect");
@@ -105,5 +106,6 @@ OBN_ABI int bambu_network_start(void* agent)
             a->connect_cloud();
         }
     }
+#endif
     return BAMBU_NETWORK_SUCCESS;
 }

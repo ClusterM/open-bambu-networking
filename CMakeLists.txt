@@ -204,6 +204,26 @@ else()
 endif()
 
 # --------------------------------------------------------------------------
+# LAN-only build option
+# --------------------------------------------------------------------------
+
+# When ON, every cloud-facing source file and the libcurl dependency are
+# removed from the build.  The resulting plugin communicates ONLY with the
+# 3D printer on the local network; no Bambu Lab server URLs, no cloud MQTT,
+# no HTTP REST calls, no MakerWorld links are compiled in.  LAN print,
+# discovery (SSDP), and MQTT-over-LAN continue to work as normal.
+#
+# Usage:
+#   cmake -DOBN_LAN_ONLY=ON ...
+#   ./configure --lan-only ...      (if the configure wrapper supports it)
+option(OBN_LAN_ONLY
+    "Remove all cloud functionality; only LAN printer communication is compiled in"
+    OFF)
+if(OBN_LAN_ONLY)
+    message(STATUS "obn: OBN_LAN_ONLY=ON — cloud code and libcurl excluded from build")
+endif()
+
+# --------------------------------------------------------------------------
 # libbambu_networking.so  (main plugin)
 # --------------------------------------------------------------------------
 
@@ -214,7 +234,9 @@ endif()
 if(WIN32)
     find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
     find_package(ZLIB REQUIRED)
-    find_package(CURL CONFIG REQUIRED)
+    if(NOT OBN_LAN_ONLY)
+        find_package(CURL CONFIG REQUIRED)
+    endif()
 else()
     find_package(PkgConfig REQUIRED)
     find_package(OpenSSL COMPONENTS SSL REQUIRED)
@@ -227,12 +249,15 @@ obn_vendor_mosquitto_setup()
 # CURL imported target: PkgConfig::CURL on POSIX, CURL::libcurl on Windows
 # (vcpkg's CURLConfig.cmake exports that name). We expose a unified alias
 # so the per-target target_link_libraries calls below stay platform-free.
+# In LAN-only mode the alias is an empty interface target (no curl needed).
 add_library(obn_curl_iface INTERFACE)
-if(WIN32)
-    target_link_libraries(obn_curl_iface INTERFACE CURL::libcurl)
-else()
-    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
-    target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)
+if(NOT OBN_LAN_ONLY)
+    if(WIN32)
+        target_link_libraries(obn_curl_iface INTERFACE CURL::libcurl)
+    else()
+        pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+        target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)
+    endif()
 endif()
 # zlib is shared between BambuSource (FTPS fallback: client-side ZIP
 # extract for file-browser thumbnails) and other zlib users in the tree.
@@ -257,16 +282,9 @@ add_library(bambu_networking SHARED
     src/auth.cpp
     src/cert_store.cpp
     src/config.cpp
-    src/cloud_auth.cpp
-    src/bind_cloud.cpp
-    src/cloud_filament.cpp
-    src/cloud_presets.cpp
-    src/cloud_print.cpp
-    src/cloud_session.cpp
     src/cover_cache.cpp
     src/cover_server.cpp
     src/ftps.cpp
-    src/http_client.cpp
     src/json_lite.cpp
     src/print_params_ftp_prefs.cpp
     src/lan_session.cpp
@@ -283,6 +301,20 @@ add_library(bambu_networking SHARED
     src/tls_dial.cpp
 )
 
+# Cloud source files are omitted entirely in LAN-only builds so that no
+# cloud URLs, tokens, or server hostnames end up in the compiled binary.
+if(NOT OBN_LAN_ONLY)
+    target_sources(bambu_networking PRIVATE
+        src/cloud_auth.cpp
+        src/bind_cloud.cpp
+        src/cloud_filament.cpp
+        src/cloud_presets.cpp
+        src/cloud_print.cpp
+        src/cloud_session.cpp
+        src/http_client.cpp
+    )
+endif()
+
 target_include_directories(bambu_networking PRIVATE include)
 set(_obn_git_compile_defs "")
 if(OBN_GIT_COMMIT)
@@ -297,6 +329,9 @@ target_compile_definitions(bambu_networking PRIVATE
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
     ${_obn_git_compile_defs}
 )
+if(OBN_LAN_ONLY)
+    target_compile_definitions(bambu_networking PRIVATE OBN_LAN_ONLY=1)
+endif()
 target_link_libraries(bambu_networking PRIVATE
     obn_mosquitto_iface
     obn_curl_iface
@@ -657,13 +692,9 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/auth.cpp
         src/cert_store.cpp
         src/config.cpp
-        src/cloud_auth.cpp
-        src/cloud_presets.cpp
-        src/cloud_session.cpp
         src/cover_cache.cpp
         src/cover_server.cpp
         src/ftps.cpp
-        src/http_client.cpp
         src/json_lite.cpp
         src/lan_session.cpp
         src/lan_tls.cpp
@@ -675,17 +706,29 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/tls_dial.cpp
         src/tunnel_local.cpp
         src/tunnel_upload.cpp)
+    if(NOT OBN_LAN_ONLY)
+        target_sources(lan_live_test PRIVATE
+            src/cloud_auth.cpp
+            src/cloud_presets.cpp
+            src/cloud_session.cpp
+            src/http_client.cpp)
+    endif()
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
+    if(OBN_LAN_ONLY)
+        target_compile_definitions(lan_live_test PRIVATE OBN_LAN_ONLY=1)
+    endif()
     target_link_libraries(lan_live_test PRIVATE
         obn_mosquitto_iface
-        obn_curl_iface
         OpenSSL::SSL
         OpenSSL::Crypto
         ZLIB::ZLIB
     )
+    if(NOT OBN_LAN_ONLY)
+        target_link_libraries(lan_live_test PRIVATE obn_curl_iface)
+    endif()
     add_test(NAME lan_live COMMAND lan_live_test)
 endif()

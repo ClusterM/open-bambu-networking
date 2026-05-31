@@ -4,7 +4,9 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#ifndef OBN_LAN_ONLY
 #include "obn/cloud_auth.hpp"
+#endif
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 
@@ -168,6 +170,10 @@ OBN_ABI int bambu_network_get_my_profile(void* agent,
 {
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)token;
+    return BAMBU_NETWORK_ERR_INVALID_RESULT;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     if (token.empty()) token = a->user_session_snapshot().access_token;
@@ -177,6 +183,7 @@ OBN_ABI int bambu_network_get_my_profile(void* agent,
     if (http_code) *http_code = static_cast<unsigned int>(r.http_status);
     if (http_body) *http_body = r.raw_body;
     return r.ok ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_INVALID_RESULT;
+#endif
 }
 
 OBN_ABI int bambu_network_get_my_token(void* agent,
@@ -186,6 +193,10 @@ OBN_ABI int bambu_network_get_my_token(void* agent,
 {
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)ticket;
+    return BAMBU_NETWORK_ERR_INVALID_RESULT;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OBN_INFO("get_my_token: ticket len=%zu", ticket.size());
@@ -195,6 +206,7 @@ OBN_ABI int bambu_network_get_my_token(void* agent,
     if (r.ok) return BAMBU_NETWORK_SUCCESS;
     OBN_WARN("get_my_token: %s", r.error_message.c_str());
     return BAMBU_NETWORK_ERR_INVALID_RESULT;
+#endif
 }
 
 OBN_ABI int bambu_network_get_user_info(void* agent, int* identifier)
@@ -223,9 +235,14 @@ OBN_ABI std::string bambu_network_get_bambulab_host(void* agent)
     // Studio uses this as the web-portal base (WebView loads
     // host + "/sign-in"; bind-ticket builds host + "api/sign-in/ticket?...").
     // Must be the PORTAL host, not the API host, and must end with '/'.
+#ifdef OBN_LAN_ONLY
+    (void)agent;
+    return {};
+#else
     if (auto* a = as_agent(agent))
         return obn::cloud::web_host(a->cloud_region());
     return "https://bambulab.com/";
+#endif
 }
 
 OBN_ABI std::string bambu_network_get_user_selected_machine(void* agent)

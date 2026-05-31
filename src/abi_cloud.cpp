@@ -13,6 +13,10 @@ using obn::as_agent;
 
 OBN_ABI int bambu_network_connect_server(void* agent)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     if (obn::config::current().block_cloud) {
@@ -22,22 +26,33 @@ OBN_ABI int bambu_network_connect_server(void* agent)
     int rc = a->connect_cloud();
     OBN_INFO("bambu_network_connect_server -> %d", rc);
     return rc;
+#endif
 }
 
 OBN_ABI bool bambu_network_is_server_connected(void* agent)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent;
+    return false;
+#else
     auto* a = as_agent(agent);
     if (!a) return false;
     return a->cloud_connected();
+#endif
 }
 
 OBN_ABI int bambu_network_refresh_connection(void* agent)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     if (obn::config::current().block_cloud) return BAMBU_NETWORK_SUCCESS;
     OBN_DEBUG("bambu_network_refresh_connection");
     return a->cloud_refresh();
+#endif
 }
 
 // Topic subscriptions -------------------------------------------------------
@@ -61,18 +76,28 @@ OBN_ABI int bambu_network_stop_subscribe(void* /*agent*/, std::string module)
 
 OBN_ABI int bambu_network_add_subscribe(void* agent, std::vector<std::string> dev_list)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)dev_list;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OBN_INFO("bambu_network_add_subscribe(%zu devs)", dev_list.size());
     return a->cloud_add_subscribe(dev_list);
+#endif
 }
 
 OBN_ABI int bambu_network_del_subscribe(void* agent, std::vector<std::string> dev_list)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)dev_list;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OBN_INFO("bambu_network_del_subscribe(%zu devs)", dev_list.size());
     return a->cloud_del_subscribe(dev_list);
+#endif
 }
 
 OBN_ABI void bambu_network_enable_multi_machine(void* /*agent*/, bool /*enable*/)
@@ -98,9 +123,14 @@ OBN_ABI int bambu_network_send_message(void* agent,
     // through to cloud (unless blocked).
     int rc = a->send_message_to_printer(dev_id, json_str, qos);
     if (rc != BAMBU_NETWORK_ERR_INVALID_HANDLE) return rc;
+#ifndef OBN_LAN_ONLY
     if (obn::config::current().block_cloud) {
         OBN_DEBUG("bambu_network_send_message: cloud fallback blocked");
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
     return a->cloud_send_message(dev_id, json_str, qos);
+#else
+    OBN_DEBUG("bambu_network_send_message: cloud fallback not available (LAN-only build)");
+    return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+#endif
 }

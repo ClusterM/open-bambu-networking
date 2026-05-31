@@ -9,8 +9,10 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
+#ifndef OBN_LAN_ONLY
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
+#endif
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
 #include "obn/json_lite.hpp"
@@ -41,7 +43,9 @@ Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent()
 {
     if (discovery_) discovery_->stop();
+#ifndef OBN_LAN_ONLY
     if (cloud_session_) cloud_session_->stop();
+#endif
 }
 
 int Agent::connect_printer(std::string dev_id,
@@ -607,8 +611,12 @@ std::string Agent::render_firmware_json(const std::string& dev_id) const
         if (product.find("N7") != std::string::npos) return "n7";
         return "all";
     }();
+#ifndef OBN_LAN_ONLY
     std::string notes_url =
         "https://bambulab.com/en/support/firmware-download/" + product_slug;
+#else
+    std::string notes_url;
+#endif
 
     std::string body;
     body.reserve(512);
@@ -703,7 +711,9 @@ void Agent::set_config_dir(std::string dir)
         obn::lan_tls::registry_set_config_dir(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
+#ifndef OBN_LAN_ONLY
         hydrate_session();
+#endif
     }
 }
 
@@ -969,12 +979,14 @@ OBN_SETTER(set_server_callback,         server_err_,           BBL::OnServerErrF
 // Cloud user session.
 // --------------------------------------------------------------------------
 
+#ifndef OBN_LAN_ONLY
 std::string Agent::cloud_region() const
 {
     std::string cc = country_code();
     return cc == "CN" ? "CN" : "GLOBAL";
 }
 
+#endif
 void Agent::cache_ssdp_json_for_bind(const std::string& json)
 {
     std::string perr;
@@ -1060,6 +1072,7 @@ std::string Agent::device_display_name_for_ip(const std::string& dev_ip) const
     return root->find("dev_name").as_string();
 }
 
+#ifndef OBN_LAN_ONLY
 std::map<std::string, std::string> Agent::cloud_api_http_headers() const
 {
     std::map<std::string, std::string> h;
@@ -1074,13 +1087,16 @@ std::map<std::string, std::string> Agent::cloud_api_http_headers() const
     h["Content-Type"]  = "application/json";
     return h;
 }
+#endif
 
+#ifndef OBN_LAN_ONLY
 std::string Agent::cloud_user_id() const
 {
     std::lock_guard<std::mutex> lk(mu_);
     return auth_store_ ? auth_store_->snapshot().user_id : std::string{};
 }
 
+#endif
 void Agent::preset_cache_reset()
 {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1176,7 +1192,9 @@ int Agent::apply_login_info(const std::string& login_info_json)
     }
 
     obn::auth::Session s = auth_store_->snapshot();
+#ifndef OBN_LAN_ONLY
     s.region        = cloud_region();
+#endif
     s.access_token  = access_token;
     if (!refresh_token.empty()) s.refresh_token = refresh_token;
     if (!account.empty())       s.account       = account;
@@ -1194,6 +1212,7 @@ int Agent::apply_login_info(const std::string& login_info_json)
                  user_name.empty() ? nick_name.c_str() : user_name.c_str(),
                  user_id.c_str());
     } else {
+#ifndef OBN_LAN_ONLY
         auto prof = obn::cloud::get_profile(s.region, s.access_token);
         if (prof.ok) {
             auth_store_->update_profile(prof.user_id, prof.user_name,
@@ -1204,6 +1223,9 @@ int Agent::apply_login_info(const std::string& login_info_json)
         } else {
             OBN_WARN("change_user: profile fetch failed: %s", prof.error_message.c_str());
         }
+#else
+        OBN_WARN("change_user: profile fetch disabled in LAN-only build");
+#endif
     }
 
     if (auto cb = [this]() { std::lock_guard<std::mutex> lk(mu_); return on_user_login_; }())
@@ -1218,6 +1240,7 @@ void Agent::clear_session()
         cb(1, "logout");
 }
 
+#ifndef OBN_LAN_ONLY
 // --------------------------------------------------------------------------
 // Cloud MQTT plumbing.
 // --------------------------------------------------------------------------
@@ -1458,5 +1481,7 @@ void Agent::hydrate_session()
                                std::chrono::seconds(r.expires_in > 0 ? r.expires_in : 3 * 30 * 24 * 3600));
     OBN_INFO("cloud: access_token refreshed for %s", s.account.c_str());
 }
+
+#endif // OBN_LAN_ONLY
 
 } // namespace obn

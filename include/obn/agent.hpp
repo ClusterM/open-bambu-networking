@@ -17,7 +17,9 @@ namespace obn {
 namespace mqtt { class Client; }
 namespace ssdp { class Discovery; }
 namespace cover_server { class Server; }
+#ifndef OBN_LAN_ONLY
 class CloudSession;
+#endif
 
 // Per-printer LAN MQTT session. Studio only holds one such connection at a
 // time (multi-printer LAN view is a future extension), so Agent owns a single
@@ -183,10 +185,13 @@ public:
     //  11.  MQTT publish project_file:
     //         - LAN channel: via LanSession, url=ftp://<name>
     //         - cloud channel: via CloudSession, url=<S3 presigned>
+    // Not available in OBN_LAN_ONLY builds.
+#ifndef OBN_LAN_ONLY
     int run_cloud_print_job(const BBL::PrintParams& params,
                             BBL::OnUpdateStatusFn   update_fn,
                             BBL::WasCancelledFn     cancel_fn,
                             bool                    use_lan_channel);
+#endif
 
     // -----------------------------
     // Accessors used by stub returns.
@@ -263,6 +268,8 @@ public:
     // using the currently-stored access token. Idempotent: safe to
     // call repeatedly, subsequent calls are no-ops while already
     // connected. Returns BAMBU_NETWORK_* code.
+    // Not available in OBN_LAN_ONLY builds.
+#ifndef OBN_LAN_ONLY
     int  connect_cloud();
     int  disconnect_cloud();
     bool cloud_connected() const;
@@ -272,6 +279,7 @@ public:
     int  cloud_send_message(const std::string& dev_id,
                             const std::string& json_str,
                             int qos);
+#endif
 
     // -----------------------------
     // Cloud user session.
@@ -296,7 +304,10 @@ public:
     }
 
     // Human-readable region identifier used by cloud endpoints.
+    // Not available in OBN_LAN_ONLY builds.
+#ifndef OBN_LAN_ONLY
     std::string cloud_region() const;
+#endif
 
     // ------------------------------------------------------------------
     // Cloud bind (bambu_network_bind / ping_bind / …)
@@ -316,8 +327,11 @@ public:
     std::string lan_access_code_for(const std::string& dev_id) const;
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
-    // Bearer + optional Studio certification headers for api.bambulab.com.
+    // ****** optional Studio certification headers for api.bambulab.com.
+    // Not available in OBN_LAN_ONLY builds.
+#ifndef OBN_LAN_ONLY
     std::map<std::string, std::string> cloud_api_http_headers() const;
+#endif
 
     // ------------------------------------------------------------------
     // User preset cache (bambu_network_get_setting_list2 -> get_user_presets).
@@ -338,7 +352,10 @@ public:
     // Cloud user_id of the authenticated session (stringified), or "".
     // Preset-sync includes this in every values_map it builds for
     // Studio's load_user_preset().
+    // Not available in OBN_LAN_ONLY builds.
+#ifndef OBN_LAN_ONLY
     std::string cloud_user_id() const;
+#endif
 
 private:
     mutable std::mutex mu_;
@@ -352,7 +369,9 @@ private:
 
     std::unique_ptr<LanSession> lan_session_;
     std::unique_ptr<ssdp::Discovery> discovery_;
+#ifndef OBN_LAN_ONLY
     std::unique_ptr<CloudSession>   cloud_session_;
+#endif
     // Lazy localhost HTTP server that hands cover PNGs to Studio's
     // wxWebRequest. Only spun up when we first mint a synthetic
     // subtask id; destructor joins its accept loop.
@@ -386,7 +405,9 @@ private:
     // triggers the one-shot on_printer_connected("tunnel/<id>")
     // notification. Cleared on disconnect/resubscribe so reconnects
     // re-fire the notification.
+#ifndef OBN_LAN_ONLY
     std::set<std::string> cloud_connected_devs_;
+#endif
 
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.

@@ -46,7 +46,12 @@ OBN_ABI int bambu_network_start_publish(void* /*agent*/,
 
 OBN_ABI int bambu_network_get_model_publish_url(void* /*agent*/, std::string* url)
 {
-    if (url) *url = "https://makerworld.com/";
+    if (url) *url =
+#ifndef OBN_LAN_ONLY
+        "https://makerworld.com/";
+#else
+        {};
+#endif
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -65,7 +70,12 @@ OBN_ABI int bambu_network_get_subtask(void*          /*agent*/,
 
 OBN_ABI int bambu_network_get_model_mall_home_url(void* /*agent*/, std::string* url)
 {
-    if (url) *url = "https://makerworld.com/";
+    if (url) *url =
+#ifndef OBN_LAN_ONLY
+        "https://makerworld.com/";
+#else
+        {};
+#endif
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -73,7 +83,12 @@ OBN_ABI int bambu_network_get_model_mall_detail_url(void* /*agent*/,
                                                     std::string* url,
                                                     std::string  id)
 {
+#ifndef OBN_LAN_ONLY
     if (url) *url = std::string("https://makerworld.com/models/") + id;
+#else
+    (void)id;
+    if (url) url->clear();
+#endif
     return BAMBU_NETWORK_SUCCESS;
 }
 

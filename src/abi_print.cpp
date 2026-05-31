@@ -24,11 +24,16 @@ OBN_ABI int bambu_network_start_print(void* agent,
                                       BBL::WasCancelledFn   cancel_fn,
                                       BBL::OnWaitFn         /*wait_fn*/)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)params; (void)update_fn; (void)cancel_fn;
+    return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+#else
     log_print_params("start_print", params);
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     return a->run_cloud_print_job(params, update_fn, cancel_fn,
                                   /*use_lan_channel=*/false);
+#endif
 }
 
 OBN_ABI int bambu_network_start_local_print_with_record(void* agent,
@@ -40,8 +45,13 @@ OBN_ABI int bambu_network_start_local_print_with_record(void* agent,
     log_print_params("start_local_print_with_record", params);
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+#ifdef OBN_LAN_ONLY
+    // No cloud session available; use the pure-LAN path instead.
+    return a->run_local_print_job(params, update_fn, cancel_fn);
+#else
     return a->run_cloud_print_job(params, update_fn, cancel_fn,
                                   /*use_lan_channel=*/true);
+#endif
 }
 
 OBN_ABI int bambu_network_start_send_gcode_to_sdcard(void* agent,

@@ -6,11 +6,14 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#ifndef OBN_LAN_ONLY
 #include "obn/cloud_presets.hpp"
+#endif
 #include "obn/log.hpp"
 
 using obn::as_agent;
 
+#ifndef OBN_LAN_ONLY
 namespace {
 
 // Studio inspects exactly four fields on the metadata map the CheckFn
@@ -92,7 +95,11 @@ int sync_user_presets(obn::Agent*          a,
     int              n_chk_skipped  = 0;
     int              n_get_fail     = 0;
     int              n_empty_body   = 0;
+#ifndef OBN_LAN_ONLY
     const std::string user_id       = a->cloud_user_id();
+#else
+    const std::string user_id;
+#endif
     for (const auto& m : metas) {
         if (cancel_fn && cancel_fn()) {
             OBN_WARN("preset sync cancelled at %d/%d (full_cached=%d "
@@ -173,6 +180,7 @@ int sync_user_presets(obn::Agent*          a,
 }
 
 } // namespace
+#endif // OBN_LAN_ONLY
 
 // Studio calls this from reload_settings() right after
 // get_setting_list2 finishes, so we just hand back everything our
@@ -213,9 +221,14 @@ OBN_ABI std::string bambu_network_request_setting_id(
     unsigned int* http_code)
 {
     if (http_code) *http_code = 0;
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)name; (void)values_map;
+    return {};
+#else
     auto* a = as_agent(agent);
     if (!a || !values_map) return {};
     return obn::cloud_presets::create(a, name, *values_map, http_code);
+#endif
 }
 OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END
 
@@ -228,9 +241,14 @@ OBN_ABI int bambu_network_put_setting(void*         agent,
                                       unsigned int* http_code)
 {
     if (http_code) *http_code = 0;
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)setting_id; (void)name; (void)values_map;
+    return BAMBU_NETWORK_ERR_PUT_SETTING_FAILED;
+#else
     auto* a = as_agent(agent);
     if (!a || !values_map) return BAMBU_NETWORK_ERR_PUT_SETTING_FAILED;
     return obn::cloud_presets::update(a, setting_id, name, *values_map, http_code);
+#endif
 }
 
 // Older ABI: list and download every user preset unconditionally.
@@ -241,9 +259,14 @@ OBN_ABI int bambu_network_get_setting_list(void* agent,
                                            BBL::ProgressFn     pro_fn,
                                            BBL::WasCancelledFn cancel_fn)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)bundle_version; (void)pro_fn; (void)cancel_fn;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     OBN_INFO("bambu_network_get_setting_list(version=%s)", bundle_version.c_str());
     return sync_user_presets(as_agent(agent), bundle_version,
                              /*chk_fn=*/{}, pro_fn, cancel_fn);
+#endif
 }
 
 // Studio's preferred variant: lists user presets, asks us back via
@@ -255,14 +278,24 @@ OBN_ABI int bambu_network_get_setting_list2(void*               agent,
                                             BBL::ProgressFn     pro_fn,
                                             BBL::WasCancelledFn cancel_fn)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)bundle_version; (void)chk_fn; (void)pro_fn; (void)cancel_fn;
+    return BAMBU_NETWORK_SUCCESS;
+#else
     OBN_INFO("bambu_network_get_setting_list2(version=%s)", bundle_version.c_str());
     return sync_user_presets(as_agent(agent), bundle_version,
                              chk_fn, pro_fn, cancel_fn);
+#endif
 }
 
 OBN_ABI int bambu_network_delete_setting(void* agent, std::string setting_id)
 {
+#ifdef OBN_LAN_ONLY
+    (void)agent; (void)setting_id;
+    return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+#else
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     return obn::cloud_presets::del(a, setting_id);
+#endif
 }
